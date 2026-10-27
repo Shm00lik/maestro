@@ -28,7 +28,9 @@ export const TERMINAL_MISSION_STATES: ReadonlySet<MissionState> = new Set<Missio
 ]);
 
 export function nextMissionState(from: MissionState, event: MissionEvent): MissionState {
-  const to = TABLE[from]?.[event];
-  if (!to) throw new InvalidTransition(from, event);
+  // Own-property checks only: inherited keys such as 'toString' must not pass the table.
+  const row = Object.hasOwn(TABLE, from) ? TABLE[from] : undefined;
+  const to = row && Object.hasOwn(row, event) ? row[event] : undefined;
+  if (!to) throw new InvalidTransition(String(from), String(event));
   return to;
 }

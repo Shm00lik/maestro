@@ -68,6 +68,17 @@ describe('store', () => {
     expect(missions.get(db, m.id)!.state).toBe('understanding');
   });
 
+  it('rejects inherited keys as task events and leaves row and events unchanged', () => {
+    const { db, m, rows } = seedPlan();
+    const before = tasks.listByMission(db, m.id).find(x => x.id === rows[0].id)!;
+    const nEvents = events.list(db, m.id).length;
+    expect(() => tasks.transition(db, rows[0].id, 'toString' as any)).toThrow(InvalidTransition);
+    expect(() => missions.transition(db, m.id, 'constructor' as any)).toThrow(InvalidTransition);
+    expect(tasks.listByMission(db, m.id).find(x => x.id === rows[0].id)).toEqual(before);
+    expect(missions.get(db, m.id)!.state).toBe('draft');
+    expect(events.list(db, m.id)).toHaveLength(nEvents);
+  });
+
   it('throws a clear error on an unknown stored state', () => {
     const { db, m } = setup();
     db.prepare('UPDATE missions SET state = ? WHERE id = ?').run('bogus', m.id);

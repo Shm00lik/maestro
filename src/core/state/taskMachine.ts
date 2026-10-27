@@ -22,7 +22,9 @@ const TABLE: Record<TaskState, Partial<Record<TaskEvent, TaskState>>> = {
 export const TERMINAL_TASK_STATES: ReadonlySet<TaskState> = new Set<TaskState>(['done', 'cancelled']);
 
 export function nextTaskState(from: TaskState, event: TaskEvent): TaskState {
-  const to = TABLE[from]?.[event];
-  if (!to) throw new InvalidTransition(from, event);
+  // Own-property checks only: inherited keys such as 'toString' must not pass the table.
+  const row = Object.hasOwn(TABLE, from) ? TABLE[from] : undefined;
+  const to = row && Object.hasOwn(row, event) ? row[event] : undefined;
+  if (!to) throw new InvalidTransition(String(from), String(event));
   return to;
 }

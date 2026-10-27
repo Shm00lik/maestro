@@ -50,4 +50,11 @@ describe('missionMachine', () => {
       if (!allowed.has(`${s}:${e}`)) expect(() => nextMissionState(s, e)).toThrow(InvalidTransition);
     }
   });
+
+  it('rejects inherited Object.prototype keys as events or states', () => {
+    for (const e of ['toString', 'constructor', 'hasOwnProperty', '__proto__']) {
+      expect(() => nextMissionState('draft', e as any)).toThrow(InvalidTransition);
+    }
+    expect(() => nextMissionState('toString' as any, 'stop')).toThrow(InvalidTransition);
+  });
 });

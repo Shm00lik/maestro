@@ -53,10 +53,19 @@ describe('taskMachine', () => {
   });
 
   it('InvalidTransition carries a useful message', () => {
+    expect.assertions(3);
     try { nextTaskState('done', 'start'); } catch (err) {
       expect(err).toBeInstanceOf(InvalidTransition);
       expect((err as Error).name).toBe('InvalidTransition');
       expect((err as Error).message).toBe('Invalid transition: start from done');
     }
+  });
+
+  it('rejects inherited Object.prototype keys as events or states', () => {
+    for (const e of ['toString', 'constructor', 'hasOwnProperty', '__proto__']) {
+      expect(() => nextTaskState('waiting', e as any)).toThrow(InvalidTransition);
+    }
+    expect(() => nextTaskState('toString' as any, 'cancel')).toThrow(InvalidTransition);
+    expect(() => nextTaskState('constructor' as any, 'toString' as any)).toThrow(InvalidTransition);
   });
 });
