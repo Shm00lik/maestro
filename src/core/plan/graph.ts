@@ -1,4 +1,4 @@
-import type { PlanTask } from '../types.js';
+import { compareTaskKeys, type PlanTask } from '../types.js';
 
 export interface PlanGraph {
   depth: Record<string, number>;
@@ -7,23 +7,20 @@ export interface PlanGraph {
   children: Record<string, string[]>;
 }
 
-const num = (k: string) => parseInt(k.replace(/\D+/g, ''), 10);
-const byKey = (a: string, b: string) => num(a) - num(b);
-
 export function buildGraph(tasks: PlanTask[]): PlanGraph {
-  const keys = tasks.map(t => t.key).sort(byKey);
+  const keys = tasks.map(t => t.key).sort(compareTaskKeys);
   const task = new Map(tasks.map(t => [t.key, t]));
   const children: Record<string, string[]> = {};
   for (const k of keys) children[k] = [];
   for (const t of tasks) for (const d of t.dependsOn) children[d]?.push(t.key);
-  for (const k of keys) children[k].sort(byKey);
+  for (const k of keys) children[k].sort(compareTaskKeys);
 
   // Kahn topological order (ties by key)
   const indeg = new Map(keys.map(k => [k, task.get(k)!.dependsOn.length]));
   const ready = keys.filter(k => indeg.get(k) === 0);
   const order: string[] = [];
   while (ready.length) {
-    ready.sort(byKey);
+    ready.sort(compareTaskKeys);
     const k = ready.shift()!;
     order.push(k);
     for (const c of children[k]) {
@@ -38,7 +35,7 @@ export function buildGraph(tasks: PlanTask[]): PlanGraph {
   for (const k of order) {
     const t = task.get(k)!;
     let d = 0, p: string | undefined, pb = -Infinity;
-    for (const dep of [...t.dependsOn].sort(byKey)) {
+    for (const dep of [...t.dependsOn].sort(compareTaskKeys)) {
       d = Math.max(d, depth[dep]);
       if (best[dep] > pb) { pb = best[dep]; p = dep; }
     }

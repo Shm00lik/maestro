@@ -54,4 +54,17 @@ describe('validatePlan', () => {
     const md = task(1, { deps: 'T2', owns: 'src/**' }) + task(2, { deps: 'T1', owns: 'src/**' });
     expect(codes(plan(md))).toEqual(['cycle']);
   });
+  it('does not flag overlapping owns for tasks related only transitively', () => {
+    const md = task(1, { owns: 'src/**' }) + task(2, { deps: 'T1', owns: 'docs/**' }) + task(3, { deps: 'T2', owns: 'src/api/**' });
+    expect(validatePlan(plan(md))).toEqual([]);
+  });
+  it('compares ownership case-insensitively and ignores a leading ./', () => {
+    expect(overlap('Src/**', 'src/api/**').map(e => e.code)).toEqual(['ownership-overlap']);
+    expect(overlap('./src/**', 'src/api/x.ts').map(e => e.code)).toEqual(['ownership-overlap']);
+    expect(overlap('./SRC/api/**', 'src/API/x.ts').map(e => e.code)).toEqual(['ownership-overlap']);
+  });
+  it('sorts cycle members with the natural key comparator', () => {
+    const e = validatePlan(plan(cycleOf('T10', 'T2', 'T1'))).find(e => e.code === 'cycle')!;
+    expect(e.taskKeys).toEqual(['T1', 'T2', 'T10']);
+  });
 });

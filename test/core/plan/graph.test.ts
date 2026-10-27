@@ -2,6 +2,7 @@ import { readFileSync } from 'node:fs';
 import { describe, it, expect } from 'vitest';
 import { parsePlan } from '../../../src/core/plan/parsePlan.js';
 import { buildGraph, ancestors, descendants } from '../../../src/core/plan/graph.js';
+import type { PlanTask } from '../../../src/core/types.js';
 
 const read = (name: string) =>
   readFileSync(new URL(`../../fixtures/plans/${name}`, import.meta.url), 'utf8').replace(/\r\n/g, '\n');
@@ -30,5 +31,18 @@ describe('graph', () => {
     const cyc = parsePlan('### Task 1: A\nDepends on: T2\nAgent: qa\n### Task 2: B\nDepends on: T1\nAgent: qa\n');
     expect([...ancestors(cyc, 'T1')].sort()).toEqual(['T1','T2']);
     expect([...descendants(cyc, 'T1')].sort()).toEqual(['T1','T2']);
+  });
+  it('orders non-T<n> keys naturally', () => {
+    const t = (key: string, dependsOn: string[] = [], estimate = 1): PlanTask =>
+      ({ key, title: key, body: '', dependsOn, agent: 'qa', owns: [], acceptance: 'ok', estimate });
+    const g = buildGraph([
+      t('setup'), t('final-review', ['T10', 'T1-review']), t('T10', ['T2']), t('T2', ['T1']),
+      t('T1-review', ['T1', 'setup']), t('T1'),
+    ]);
+    expect(g.waves).toEqual([['T1', 'setup'], ['T1-review', 'T2'], ['T10'], ['final-review']]);
+    expect(g.children.T1).toEqual(['T1-review', 'T2']);
+    expect(g.children.setup).toEqual(['T1-review']);
+    expect(g.depth['final-review']).toBe(4);
+    expect(g.criticalPath).toEqual(['T1', 'T2', 'T10', 'final-review']);
   });
 });

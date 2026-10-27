@@ -1,14 +1,14 @@
 import picomatch from 'picomatch';
-import { AGENT_ROLES, type PlanTask } from '../types.js';
+import { AGENT_ROLES, compareTaskKeys, type PlanTask } from '../types.js';
 import { ancestors } from './graph.js';
 
 export type PlanErrorCode = 'empty-plan'|'duplicate-key'|'unknown-dependency'|'self-dependency'|'cycle'|'unknown-agent'|'missing-acceptance'|'ownership-overlap';
 export interface PlanError { code: PlanErrorCode; taskKeys: string[]; message: string }
 
 const CODE_ORDER: PlanErrorCode[] = ['empty-plan','duplicate-key','unknown-dependency','self-dependency','cycle','unknown-agent','missing-acceptance','ownership-overlap'];
-const num = (k: string) => parseInt(k.replace(/\D+/g, ''), 10);
 
-const norm = (g: string) => g.split(String.fromCharCode(92)).join('/');
+/** Backslashes to '/', drop a leading './', lowercase (ownership is compared case-insensitively). */
+const norm = (g: string) => g.split(String.fromCharCode(92)).join('/').replace(/^(\.\/)+/, '').toLowerCase();
 const staticPrefix = (g: string) => {
   const i = g.search(/[*?[{]/);
   return i === -1 ? g : g.slice(0, i);
@@ -70,7 +70,7 @@ export function validatePlan(tasks: PlanTask[]): PlanError[] {
   const inCycle = new Set<string>();
   for (const comp of cycles(keys, edges)) {
     comp.forEach(k => inCycle.add(k));
-    const sorted = comp.sort((a, b) => num(a) - num(b));
+    const sorted = comp.sort(compareTaskKeys);
     add('cycle', sorted, `Dependency cycle: ${sorted.join(' -> ')}.`);
   }
 
@@ -93,6 +93,6 @@ export function validatePlan(tasks: PlanTask[]): PlanError[] {
     .map((e, i) => ({ e, i }))
     .sort((x, y) =>
       CODE_ORDER.indexOf(x.e.code) - CODE_ORDER.indexOf(y.e.code) ||
-      num(x.e.taskKeys[0] ?? '0') - num(y.e.taskKeys[0] ?? '0') || x.i - y.i)
+      compareTaskKeys(x.e.taskKeys[0] ?? '', y.e.taskKeys[0] ?? '') || x.i - y.i)
     .map(x => x.e);
 }
