@@ -1,0 +1,21 @@
+// Throwaway spike R3 option B: --permission-prompt-tool mcp__spike__approve. Usage: npx tsx b.ts <allow|deny>
+import { spawn, spawnSync } from 'node:child_process';
+import * as path from 'node:path';
+import * as os from 'node:os';
+import * as fs from 'node:fs';
+const decision = process.argv[2] ?? 'allow';
+const REPO = path.join(os.tmpdir(), 'maestro-spike-repo');
+const EXE = path.join(process.env.APPDATA!, 'npm', 'node_modules', '@anthropic-ai', 'claude-code', 'bin', 'claude.exe');
+const t0 = Date.now();
+const log = (...a: unknown[]) => console.log(`[+${((Date.now() - t0) / 1000).toFixed(1)}s]`, ...a);
+const mlog = path.join(REPO, 'mcp.log');
+fs.rmSync(mlog, { force: true });
+const cfg = path.join(import.meta.dirname, 'mcp-config.json');
+fs.writeFileSync(cfg, JSON.stringify({ mcpServers: { spike: { command: 'node', args: [path.join(import.meta.dirname, 'mcp-server.mjs')], env: { MCP_LOG: mlog, MCP_DECISION: decision } } } }));
+const args = ['-p', 'Use the Bash tool to run exactly: npm --version . Then reply with the version only.', '--output-format', 'stream-json', '--verbose', '--permission-mode', 'default', '--mcp-config', cfg, '--permission-prompt-tool', 'mcp__spike__approve', '--model', 'haiku'];
+const child = spawn(EXE, args, { cwd: REPO, shell: false, stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true });
+let buf = '';
+child.stdout!.on('data', (d) => { buf += d; let i; while ((i = buf.indexOf('\n')) >= 0) { const l = buf.slice(0, i); buf = buf.slice(i + 1); if (!l.trim()) continue; const e = JSON.parse(l); log('event', e.type, e.subtype ?? '', e.type === 'assistant' || e.type === 'user' ? JSON.stringify(e.message.content).slice(0, 250) : ''); if (e.type === 'system' && e.subtype === 'init') log('mcp_servers', JSON.stringify(e.mcp_servers.filter((m: any) => m.name === 'spike'))); } });
+child.stderr!.on('data', (d) => log('stderr', d.toString().slice(0, 500)));
+child.on('exit', (c, s) => { log('exit', c, s); log('mcp.log:\n' + (fs.existsSync(mlog) ? fs.readFileSync(mlog, 'utf8') : '(none)')); process.exit(0); });
+setTimeout(() => { log('GIVE UP'); spawnSync('taskkill', ['/PID', String(child.pid), '/T', '/F']); process.exit(1); }, 90000);

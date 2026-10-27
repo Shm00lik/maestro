@@ -1,0 +1,23 @@
+// Throwaway spike R3 option A: PermissionRequest hook. Usage: npx tsx a.ts <delaySeconds>
+import { spawn, spawnSync } from 'node:child_process';
+import * as path from 'node:path';
+import * as os from 'node:os';
+import * as fs from 'node:fs';
+const delay = Number(process.argv[2] ?? 10);
+const REPO = path.join(os.tmpdir(), 'maestro-spike-repo');
+const EXE = path.join(process.env.APPDATA!, 'npm', 'node_modules', '@anthropic-ai', 'claude-code', 'bin', 'claude.exe');
+const t0 = Date.now();
+const log = (...a: unknown[]) => console.log(`[+${((Date.now() - t0) / 1000).toFixed(1)}s]`, ...a);
+fs.mkdirSync(path.join(REPO, '.claude'), { recursive: true });
+for (const f of ['allow.flag', 'deny.flag', 'perm.log']) fs.rmSync(path.join(REPO, f), { force: true });
+const hookCmd = 'node ' + path.join(import.meta.dirname, 'hook.mjs').split(path.sep).join('/');
+fs.writeFileSync(path.join(REPO, '.claude', 'settings.json'), JSON.stringify({ hooks: { PermissionRequest: [{ matcher: '', hooks: [{ type: 'command', command: hookCmd }] }] } }, null, 2));
+const args = ['-p', 'Use the Bash tool to run exactly: npm --version . Then reply with the version only.', '--output-format', 'stream-json', '--verbose', '--permission-mode', 'default', '--model', 'haiku'];
+const child = spawn(EXE, args, { cwd: REPO, shell: false, stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true });
+log('pid', child.pid);
+let buf = '';
+child.stdout!.on('data', (d) => { buf += d; let i; while ((i = buf.indexOf('\n')) >= 0) { const l = buf.slice(0, i); buf = buf.slice(i + 1); if (!l.trim()) continue; const e = JSON.parse(l); log('event', e.type, e.subtype ?? '', e.type === 'assistant' || e.type === 'user' ? JSON.stringify(e.message.content).slice(0, 200) : ''); } });
+child.stderr!.on('data', (d) => log('stderr', d.toString().slice(0, 500)));
+child.on('exit', (c, s) => { log('exit', c, s); log('perm.log:\n' + fs.readFileSync(path.join(REPO, 'perm.log'), 'utf8')); fs.rmSync(path.join(REPO, '.claude', 'settings.json')); log('hook settings removed'); process.exit(0); });
+setTimeout(() => { fs.writeFileSync(path.join(REPO, 'allow.flag'), '1'); log('allow.flag written'); }, delay * 1000);
+setTimeout(() => { log('GIVE UP'); spawnSync('taskkill', ['/PID', String(child.pid), '/T', '/F']); fs.rmSync(path.join(REPO, '.claude', 'settings.json'), { force: true }); process.exit(1); }, (delay + 90) * 1000);
