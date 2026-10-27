@@ -1,5 +1,7 @@
 // Throwaway spike R5: Windows process control. Usage: npx tsx run.ts <mode>
-// modes: spawncmd | sigint | taskkill | hardkill | longpath
+// modes: spawncmd | shim | sigint | taskkill | hardkill | longpath [longpaths|nolp] [claude] (env WT_LEN=target path length) | cleanup
+// NOTE: child stdin is closed immediately (-p needs none), so SIGINT with stdin open was never tested.
+// Early-finish repro of the original "count to 50" prompt: mode earlyfinish (1 claude call).
 import { spawn, spawnSync, execSync, ChildProcess } from 'node:child_process';
 import * as path from 'node:path';
 import * as os from 'node:os';
@@ -9,7 +11,6 @@ const REPO = path.join(os.tmpdir(), 'maestro-spike-repo');
 const NPM = path.join(process.env.APPDATA!, 'npm');
 const EXE = path.join(NPM, 'node_modules', '@anthropic-ai', 'claude-code', 'bin', 'claude.exe');
 const CMD = path.join(NPM, 'claude.cmd');
-const PROMPT = 'count to 50 slowly, one number per line';
 const TOOLPROMPT = 'Use the Bash tool to run exactly this command: ping -n 60 127.0.0.1 . Then reply done.';
 const ARGS = ['-p', TOOLPROMPT, '--allowedTools', 'Bash', '--output-format', 'stream-json', '--verbose', '--model', 'haiku'];
 const t0 = Date.now();
@@ -78,6 +79,15 @@ const claudeProcs = () => procs().filter((p) => /claude/i.test(p.name));
 async function main() {
   const mode = process.argv[2];
   log('mode', mode, 'node', process.version);
+  if (mode === 'shim') { log('claude.cmd exe line:', fs.readFileSync(CMD, 'utf8').split('\n').filter((l) => l.includes('claude.exe')).join(' | ')); return; }
+  if (mode === 'earlyfinish') {
+    const r = start(EXE, ['-p', 'count to 50 slowly, one number per line', '--output-format', 'stream-json', '--verbose', '--model', 'haiku']);
+    await waitForAssistant(r, 1);
+    await sleep(1500);
+    log('child.kill(SIGINT) ->', r.child.kill('SIGINT'));
+    log('exit', JSON.stringify(await Promise.race([r.exit, sleep(10000).then(() => 'TIMEOUT')])), 'result events:', r.events.filter((e) => e.type === 'result').length);
+    return;
+  }
   if (mode === 'spawncmd') {
     // no claude invocation: just see what spawning .cmd / shim does
     for (const [label, file, opts] of [
@@ -140,6 +150,7 @@ async function main() {
     };
     g(['config', '--local', '--get', 'core.longpaths']);
     if (process.argv[3] === 'longpaths') g(['config', 'core.longpaths', 'true']);
+    if (process.argv[3] === 'nolp') g(['config', '--unset', 'core.longpaths']);
     fs.mkdirSync(path.dirname(long), { recursive: true });
     g(['worktree', 'add', '-b', 'spike-long', long]);
     if (fs.existsSync(long)) {
@@ -163,6 +174,7 @@ async function main() {
     g(['worktree', 'remove', '--force', long]);
     g(['branch', '-D', 'spike-long']);
     g(['worktree', 'prune']);
+    g(['config', '--unset', 'core.longpaths']);
     fs.rmSync(base, { recursive: true, force: true });
     log('base exists', fs.existsSync(base));
   }
