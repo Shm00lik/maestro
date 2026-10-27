@@ -27,7 +27,7 @@ describe('parsePlan', () => {
     expect(parsePlan(md.replace(/\n/g, '\r\n'))).toEqual(parsePlan(md));
   });
   it('treats none/dash/empty/missing as no dependencies', () => {
-    for (const v of ['none', 'None', '-', '—', '']) expect(parsePlan(`### Task 1: A\nDepends on: ${v}\nAgent: qa\n`)[0].dependsOn).toEqual([]);
+    for (const v of ['none', 'None', '-', '\u2014', '']) expect(parsePlan(`### Task 1: A\nDepends on: ${v}\nAgent: qa\n`)[0].dependsOn).toEqual([]);
     expect(parsePlan('### Task 1: A\nAgent: qa\n')[0].dependsOn).toEqual([]);
   });
   it('normalises dependency ids', () => {
@@ -36,5 +36,27 @@ describe('parsePlan', () => {
   it('reads Estimate as a number and ignores non-task headings', () => {
     const t = parsePlan('# Plan\n## Context\ntext\n### Task 1: A\nAgent: qa\nEstimate: 3\n');
     expect(t).toHaveLength(1); expect(t[0].estimate).toBe(3);
+  });
+  it('splits dependency tokens without a comma separator', () => {
+    for (const v of ['T1 and T2', 'T1 T2', 'T1–T2', 'T1, T2, T1'])
+      expect(parsePlan(`### Task 3: C\nDepends on: ${v}\nAgent: qa\n`)[0].dependsOn).toEqual(['T1','T2']);
+  });
+  it('strips a leading UTF-8 BOM', () => {
+    const t = parsePlan('\uFEFF### Task 1: A\nAgent: qa\n');
+    expect(t).toHaveLength(1);
+    expect(t[0]).toMatchObject({ key: 'T1', agent: 'qa' });
+  });
+  it('keeps fenced code blocks in the body', () => {
+    for (const f of ['```', '~~~']) {
+      const fence = `${f}md\n## Not a heading\nOwns: nope\n### Task 9: Fake\n${f}`;
+      const t = parsePlan(`### Task 1: A\nAgent: qa\nSee:\n${fence}\nOwns: src/real/**\nAcceptance: ok\n`);
+      expect(t).toHaveLength(1);
+      expect(t[0].owns).toEqual(['src/real/**']);
+      expect(t[0].acceptance).toBe('ok');
+      expect(t[0].body).toBe(`See:\n${fence}`);
+    }
+  });
+  it('ignores task headings inside a fence outside any task', () => {
+    expect(parsePlan('```\n### Task 1: A\nAgent: qa\n```\n### Task 2: B\nAgent: qa\n').map(t => t.key)).toEqual(['T2']);
   });
 });

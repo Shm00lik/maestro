@@ -8,18 +8,22 @@ function splitList(value: string): string[] {
   return value.split(',').map(s => s.trim()).filter(s => s.length > 0);
 }
 
+const NO_DEPS = /^(none|-|\u2014)?$/i;
+const FENCE = /^ {0,3}(`{3,}|~{3,})/;
+
+/** Every digit run in the value becomes T<n>, de-duplicated, in order of appearance. */
 function parseDeps(value: string): string[] {
+  if (NO_DEPS.test(value)) return [];
   const out: string[] = [];
-  for (const token of splitList(value)) {
-    const digits = token.replace(/\D/g, '');
-    if (digits === '') continue; // none, -, — and other non-numeric tokens
-    out.push(`T${Number(digits)}`);
+  for (const m of value.matchAll(/\d+/g)) {
+    const key = `T${Number(m[0])}`;
+    if (!out.includes(key)) out.push(key);
   }
   return out;
 }
 
 export function parsePlan(markdown: string): PlanTask[] {
-  const lines = markdown.replace(/\r\n/g, '\n').split('\n');
+  const lines = markdown.replace(/^\uFEFF/, '').replace(/\r\n/g, '\n').split('\n');
   const tasks: PlanTask[] = [];
   let current: PlanTask | null = null;
   let body: string[] = [];
@@ -33,7 +37,22 @@ export function parsePlan(markdown: string): PlanTask[] {
     body = [];
   };
 
+  let fence: string | null = null; // opening fence run (e.g. "```") while inside a fenced block
+
   for (const line of lines) {
+    if (fence !== null) {
+      // Inside a fence: everything is body; close on the same char with at least the same length.
+      const close = FENCE.exec(line);
+      if (close && close[1][0] === fence[0] && close[1].length >= fence.length && line.trim() === close[1]) fence = null;
+      if (current) body.push(line);
+      continue;
+    }
+    const open = FENCE.exec(line);
+    if (open) {
+      fence = open[1];
+      if (current) body.push(line);
+      continue;
+    }
     const heading = TASK_HEADING.exec(line);
     if (heading) {
       finish();
