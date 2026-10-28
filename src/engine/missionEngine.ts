@@ -1076,7 +1076,10 @@ export class MissionEngine extends EventEmitter implements BridgeHandlers {
   /**
    * Aborts a merge of this mission's branch left in progress: in the main checkout only when it is on the base
    * branch and MERGE_HEAD is the mission branch tip (a merge of the user's own stays untouched), and in this
-   * mission's temporary merge worktrees (which are then removed).
+   * mission's temporary merge worktrees, which are then removed. A temp merge worktree is identified by BOTH its
+   * folder name (`<mission8>-merge-<6 chars>`, as mergeIntoBase makes it) and its checked-out branch being the base
+   * branch, so a task worktree whose key starts with "merge-" (on its own task branch) is never touched.
+   * Stops before any changing command once shutdown has begun.
    */
   private async abortHalfMerges(c: MissionCtx, m: Mission): Promise<void> {
     const root = c.projectRoot;
@@ -1084,14 +1087,28 @@ export class MissionEngine extends EventEmitter implements BridgeHandlers {
     const mergeHead = (cwd: string): Promise<string> => git(cwd, ['rev-parse', '-q', '--verify', 'MERGE_HEAD']).catch(() => '');
     const head = await git(root, ['rev-parse', '--abbrev-ref', 'HEAD']).catch(() => '');
     if (tip && head === m.baseBranch && (await mergeHead(root)) === tip) {
+      if (this.closed) return;
       await git(root, ['merge', '--abort']).catch(e => this.warn(`merge --abort: ${(e as Error).message}`));
     }
-    const prefix = `${mission8(c.id)}-merge-`.toLowerCase();
+    const namePattern = new RegExp(`^${mission8(c.id)}-merge-[A-Za-z0-9-]{6}$`, 'i');
+    const baseRef = `branch refs/heads/${m.baseBranch}`;
     const list = await git(root, ['worktree', 'list', '--porcelain']).catch(() => '');
-    const temps = list.split(/\r?\n/).filter(l => l.startsWith('worktree ')).map(l => l.slice(9).trim())
-      .filter(p => (p.split(/[\\/]/).pop() ?? '').toLowerCase().startsWith(prefix));
+    const temps: string[] = [];
+    for (const block of list.split(/\r?\n\r?\n/)) {
+      const lines = block.split(/\r?\n/).map(l => l.trim());
+      const wt = lines.find(l => l.startsWith('worktree '));
+      if (!wt) continue;
+      const dir = wt.slice(9).trim();
+      const name = dir.split(/[\\/]/).pop() ?? '';
+      if (namePattern.test(name) && lines.includes(baseRef)) temps.push(dir);
+    }
     for (const dir of temps) {
-      if (await mergeHead(dir)) await git(dir, ['merge', '--abort']).catch(() => undefined);
+      if (this.closed) return;
+      if (await mergeHead(dir)) {
+        if (this.closed) return;
+        await git(dir, ['merge', '--abort']).catch(() => undefined);
+      }
+      if (this.closed) return;
       try { await removeWorktree(root, dir); } catch (e) { this.warn(`remove merge worktree: ${(e as Error).message}`); }
     }
   }

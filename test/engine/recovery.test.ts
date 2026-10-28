@@ -10,6 +10,7 @@ import { openDb, type Db } from '../../src/store/db.js';
 import { events, inbox, missions, projects, sessions, tasks, type InboxEntry, type Mission } from '../../src/store/repos.js';
 import { KEEP, MERGE, MissionEngine } from '../../src/engine/missionEngine.js';
 import { RESUME_MESSAGE } from '../../src/engine/taskRunner.js';
+import { worktreeDirFor } from '../../src/git/worktrees.js';
 import { checkStuck } from '../../src/engine/recovery.js';
 
 const FAKE = fileURLToPath(new URL('../fake-claude/fake-claude.ts', import.meta.url));
@@ -485,5 +486,24 @@ describe('recovery', () => {
     expect(t.failureReason).toBeNull();
     expect(mission(m.id).state).toBe('running');
     expect(sessions.listLive(db)).toHaveLength(0);
+  }, T);
+
+  it('keeps a task worktree whose name looks like a temp merge worktree', async () => {
+    const { m } = await finishingWithoutEntry();
+    // A task with id merge-api: its worktree folder starts with "<mission8>-merge-" but it is on its task branch.
+    const wt = worktreeDirFor(root, m.id, 'merge-api');
+    git(root, 'worktree', 'add', '-b', 'maestro/fix-login--merge-api', wt, 'maestro/fix-login');
+    writeFileSync(join(wt, 'precious.txt'), 'uncommitted work\n');
+    // A real temp merge worktree (base branch checked out there, as mergeIntoBase does) with a half-done merge.
+    git(root, 'switch', '-c', 'elsewhere');
+    const temp = worktreeDirFor(root, m.id, 'merge-a1b2c3');
+    git(root, 'worktree', 'add', temp, 'main');
+    git(temp, 'merge', '--no-ff', '--no-commit', 'refs/heads/maestro/fix-login');
+    const e2 = makeEngine('2', TASK_DONE);
+    await e2.recover(() => false);
+    expect(openEntries(m.id, 'merge_decision')).toHaveLength(1);
+    expect(existsSync(join(wt, 'precious.txt'))).toBe(true);
+    expect(git(root, 'worktree', 'list')).toContain('merge-api');
+    expect(git(root, 'worktree', 'list')).not.toContain('merge-a1b2c3'); // the temp one is aborted and removed
   }, T);
 });
