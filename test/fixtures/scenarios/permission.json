@@ -1,0 +1,143 @@
+{
+ "steps": [
+  {
+   "emit": {
+    "type": "system",
+    "subtype": "init",
+    "cwd": "C:\\Users\\yoavl\\AppData\\Local\\Temp\\maestro-spike-repo",
+    "session_id": "fake-session-1",
+    "tools": [
+     "Task",
+     "Artifact",
+     "Bash",
+     "Glob",
+     "Read",
+     "Write"
+    ],
+    "mcp_servers": [
+     {
+      "name": "plugin:engineering:slack",
+      "status": "needs-auth",
+      "source": "plugin"
+     }
+    ],
+    "model": "claude-haiku-5-5",
+    "permissionMode": "default",
+    "slash_commands": [
+     "animate"
+    ],
+    "claude_code_version": "2.1.312",
+    "uuid": "f903282e-0000-4000-8000-000000000001"
+   }
+  },
+  {
+   "emit": {
+    "type": "control_request",
+    "request_id": "3cc5aaf3-b82f-4fdd-8799-f1f21a4c99f0",
+    "request": {
+     "subtype": "can_use_tool",
+     "tool_name": "Bash",
+     "display_name": "Bash",
+     "input": {
+      "command": "npm --version",
+      "description": "Print npm version"
+     },
+     "description": "Print npm version",
+     "permission_suggestions": [
+      {
+       "type": "addRules",
+       "rules": [
+        {
+         "toolName": "Bash",
+         "ruleContent": "npm --version"
+        }
+       ],
+       "behavior": "allow",
+       "destination": "localSettings"
+      }
+     ],
+     "decision_reason": "This command requires approval",
+     "decision_reason_type": "other",
+     "tool_use_id": "toolu_011KaH6NJWkFfeMdWytcaQp3"
+    }
+   }
+  },
+  {
+   "waitFor": "permission-answer"
+  },
+  {
+   "emit": {
+    "type": "result",
+    "subtype": "success",
+    "is_error": false,
+    "duration_ms": 12000,
+    "duration_api_ms": 10228,
+    "num_turns": 3,
+    "stop_reason": "end_turn",
+    "terminal_reason": "completed",
+    "session_id": "$SESSION",
+    "total_cost_usd": 0.0117,
+    "usage": {
+     "input_tokens": 6,
+     "cache_creation_input_tokens": 50579,
+     "cache_read_input_tokens": 96237,
+     "output_tokens": 1348,
+     "service_tier": "standard",
+     "iterations": [
+      {
+       "input_tokens": 2,
+       "output_tokens": 113,
+       "cache_read_input_tokens": 48357,
+       "cache_creation_input_tokens": 585,
+       "type": "message"
+      }
+     ]
+    },
+    "modelUsage": {
+     "claude-haiku-5-5": {
+      "inputTokens": 100,
+      "outputTokens": 200,
+      "cacheReadInputTokens": 300,
+      "cacheCreationInputTokens": 400,
+      "webSearchRequests": 0,
+      "costUSD": 0.5,
+      "contextWindow": 1000000,
+      "maxOutputTokens": 128000,
+      "canonicalModel": "claude-haiku-5-5"
+     }
+    },
+    "permission_denials": [],
+    "result": "Line counts for all 29 files.\n\n## Handoff\nDone.",
+    "uuid": "r1",
+    "model_usage_since_last_result": {
+     "claude-haiku-5-5": {
+      "inputTokens": 5,
+      "outputTokens": 1000,
+      "cacheReadInputTokens": 90000,
+      "cacheCreationInputTokens": 40000,
+      "webSearchRequests": 0,
+      "costUSD": 0.01,
+      "contextWindow": 1000000,
+      "maxOutputTokens": 128000,
+      "canonicalModel": "claude-haiku-5-5"
+     },
+     "claude-sonnet-5-5": {
+      "inputTokens": 1,
+      "outputTokens": 348,
+      "cacheReadInputTokens": 6237,
+      "cacheCreationInputTokens": 10579,
+      "webSearchRequests": 0,
+      "costUSD": 0.002,
+      "contextWindow": 1000000,
+      "maxOutputTokens": 128000,
+      "canonicalModel": "claude-haiku-5-5"
+     }
+    }
+   },
+   "templated": true
+  },
+  {
+   "waitFor": "stdin-close"
+  }
+ ]
+}
