@@ -200,9 +200,9 @@ describe('maestro run', () => {
       { op: 'ask_user', question: 'Name it' },
       { op: 'finish', summary: 'Nothing to merge.' },
     ];
-    // Plan: '' (re-prompt), then a re-plan note, then y on the resubmitted plan. Options: 9, x (re-prompt), 2.
-    // Free text: '' (re-prompt), then an answer. Merge: z (re-prompt), then k.
-    const answers = ['', 'Split part A', 'y', '9', 'x', '2', '', 'Widget', 'z', 'k', ''].join('\n');
+    // Plan: '' (re-prompt), then a re-plan note confirmed with y, then y on the resubmitted plan. Options: 9, x
+    // (re-prompt), 2. Free text: '' (re-prompt), then an answer. Merge: z (re-prompt), then k.
+    const answers = ['', 'Split part A', 'y', 'y', '9', 'x', '2', '', 'Widget', 'z', 'k', ''].join('\n');
     const r = await runCli({ taskSteps: TASK_HANG, script, answers });
     const all = r.out + r.err;
     expect(r.code, all).toBe(0);

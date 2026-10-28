@@ -24,13 +24,15 @@ export interface PrompterOptions {
 }
 
 const MAX_TRIES = 3;
+/** Plan approval answers that approve (case-insensitive). */
+const APPROVE_WORDS: readonly string[] = ['y', 'yes', 'ok'];
 const GONE: unique symbol = Symbol('gone');
 
 const short = (s: string, n = 300): string => (s.length > n ? `${s.slice(0, n - 1)}…` : s);
 
 export function describeInput(toolName: string, input: unknown): string {
   const o = (typeof input === 'object' && input !== null ? input : {}) as Record<string, unknown>;
-  if (toolName === 'Bash' && typeof o.command === 'string') return o.command;
+  if ((toolName === 'Bash' || toolName === 'PowerShell') && typeof o.command === 'string') return o.command;
   for (const k of ['file_path', 'path', 'notebook_path', 'url', 'pattern']) {
     if (typeof o[k] === 'string') return String(o[k]);
   }
@@ -160,9 +162,14 @@ export class Prompter {
     const p = e.payload as { toolName: string; input: unknown; description: string | null };
     this.o.out(`#${n} Permission request from ${this.who(e)} — ${p.toolName}: ${describeInput(p.toolName, p.input)}`);
     if (p.description) this.o.out(`   ${p.description}`);
-    if (p.toolName !== 'Bash') this.o.out(`   input: ${short(JSON.stringify(p.input ?? null), 1000)}`);
-    const a = await this.ask(e.id, 'Allow? [y] once, [a] always for this mission, [n] deny:', 'type y, a or n',
-      l => (['y', 'a', 'n'].includes(l.toLowerCase()) ? l.toLowerCase() : undefined));
+    if (p.toolName !== 'Bash' && p.toolName !== 'PowerShell') this.o.out(`   input: ${short(JSON.stringify(p.input ?? null), 1000)}`);
+    // Always-allow rules cover task sessions only: the conductor's requests are answered one by one.
+    const conductor = e.taskId === null;
+    const choices = conductor ? ['y', 'n'] : ['y', 'a', 'n'];
+    const a = await this.ask(e.id,
+      conductor ? 'Allow? [y] once, [n] deny:' : 'Allow? [y] once, [a] always for this mission, [n] deny:',
+      conductor ? 'type y or n' : 'type y, a or n',
+      l => (choices.includes(l.toLowerCase()) ? l.toLowerCase() : undefined));
     if (a === GONE) return;
     if (a === 'n') {
       const reason = await this.ask(e.id, 'Reason (optional, Enter to skip):', '', l => l);
@@ -217,15 +224,23 @@ export class Prompter {
     if (p.runningUnplanned && p.runningUnplanned.length > 0) {
       this.o.out(`   Running but not in this plan: ${p.runningUnplanned.join(', ')}`);
     }
-    const a = await this.ask(e.id, 'Approve? [y] approve, or type a note to re-plan:', 'type y, or a note for the conductor',
-      l => (l ? l : undefined));
-    if (a === GONE) return;
-    if (a.toLowerCase() === 'y') {
-      this.o.engine.approvePlan(e.missionId);
-      this.o.out('  Plan approved.');
-    } else {
+    for (;;) {
+      const a = await this.ask(e.id, 'Approve? [y] approve, or type a note to re-plan:', 'type y, or a note for the conductor',
+        l => (l ? l : undefined));
+      if (a === GONE) return;
+      if (APPROVE_WORDS.includes(a.toLowerCase())) {
+        this.o.engine.approvePlan(e.missionId);
+        this.o.out('  Plan approved.');
+        return;
+      }
+      // Anything else could be a typo of "yes": confirm before it goes to the conductor as a note.
+      const send = await this.ask(e.id, 'Send this as a re-plan note? (y/n)', 'type y or n',
+        l => (['y', 'n'].includes(l.toLowerCase()) ? l.toLowerCase() : undefined));
+      if (send === GONE) return;
+      if (send === 'n') continue;
       this.o.engine.replan(e.missionId, a);
       this.o.out('  Sent back to the conductor for a re-plan.');
+      return;
     }
   }
 
