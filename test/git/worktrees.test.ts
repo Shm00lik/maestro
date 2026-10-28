@@ -151,6 +151,18 @@ describe('worktrees', () => {
       .rejects.toThrow('the mission branch mission/m1 is checked out in another worktree; switch that checkout to another branch');
   });
 
+  it('recognises a registered integration worktree given a differently written project path', async () => {
+    const root = makeRepo();
+    await ensureMissionBranch(root, 'main', 'mission/m1');
+    const dir = worktreeDirFor(root, MID, 'T1');
+    await createTaskWorktree(root, 'mission/m1', 'task/T1', dir);
+    commitIn(dir, 'b.txt', 'b\n', 'add b');
+    expect((await mergeTaskBranch(root, 'mission/m1', 'task/T1', 'one', MID)).ok).toBe(true);
+    const alt = root.replace(/\\/g, '/').toUpperCase();
+    commitIn(dir, 'c.txt', 'c\n', 'add c');
+    expect((await mergeTaskBranch(alt, 'mission/m1', 'task/T1', 'two', MID)).ok).toBe(true);
+  });
+
   it('sets core.longpaths only in the repo config', async () => {
     const root = makeRepo();
     const globalBefore = gitOr(root, '', 'config', '--global', '--get', 'core.longpaths');

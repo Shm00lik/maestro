@@ -1,7 +1,7 @@
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { createHash } from 'node:crypto';
-import { resolve, dirname, basename, isAbsolute } from 'node:path';
+import { resolve, dirname, isAbsolute } from 'node:path';
 import { mkdirSync, existsSync, realpathSync, readFileSync, appendFileSync } from 'node:fs';
 
 const execFileP = promisify(execFile);
@@ -79,7 +79,11 @@ async function listWorktrees(projectRoot: string): Promise<string[]> {
   return out.split(/\r?\n/).filter((l) => l.startsWith('worktree ')).map((l) => l.slice(9).trim());
 }
 
-const norm = (p: string) => resolve(p).replace(/\\/g, '/').toLowerCase();
+function norm(p: string): string {
+  let r = resolve(p);
+  try { r = realpathSync.native(r); } catch { /* does not exist: keep resolved path */ }
+  return r.replace(/\\/g, '/').toLowerCase();
+}
 
 async function ensureIntegrationWorktree(
   projectRoot: string, missionBranch: string, missionId: string,
