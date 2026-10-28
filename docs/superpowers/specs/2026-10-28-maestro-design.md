@@ -1,8 +1,21 @@
 # Maestro — Design Spec
 
-- **Date:** 2026-10-28
-- **Status:** Draft, waiting for review
+- **Date:** 2026-10-28 · **v2:** 2026-10-28, updated with what the Plan 1 spikes found
+- **Status:** v1 approved. v2 changes are waiting for review. Product choices Claude made on the user's behalf are marked **[Claude's call — review]**.
 - **Mockups:** [Maestro UI Concepts v2](https://claude.ai/artifact/MkiLHvsCJoP6ZphxbWFkFA) (7 screens)
+- **Evidence:** `docs/superpowers/spikes/2026-10-28-{r1-conductor,r2-stream,r3-permissions,r5-windows}.md`
+
+## What changed in v2
+- **Talking to Claude (§3, §8):** Maestro drives one long-lived `claude.exe` per session over stream-json. It interrupts through a stdin control message, with a forced kill of the process tree as the fallback. SIGINT is gone (on Windows it orphans child processes).
+- **Permissions (§9):** permission requests now go through `--permission-prompt-tool stdio`, not hooks or an MCP tool.
+- **Usage (§3, §11):** the 5-hour and 7-day usage windows are available from `rate_limit_event`, so Home shows "5-hr usage left".
+- **Rate limits (§8.2):** throttling uses `resetsAt` from that event. Backoff is only the fallback.
+- **New task states (§5.2):** `planned` (in the plan, not dispatched yet) and `interrupted` (paused).
+- **Mission endings and new tool (§5.1, §7.2):** a mission can now finish without merging, and there is a new bridge tool, `finish_mission`.
+- **Ad-hoc tasks (§6):** task keys are no longer only `T<n>`. The conductor creates tasks such as `T1-review`.
+- **Tool lists (§8.1):** role tool lists use `--disallowedTools`, because `--allowedTools` did not restrict tools.
+- **Data model (§10):** schema migrations, constraints, cache-token columns, inbox `expired` state, and mission-scoped "always allow" rules.
+- **Risks (§15):** R1–R6 are resolved; R7–R11 are new.
 
 ## 1. Summary
 
@@ -22,7 +35,7 @@ Maestro does no AI work itself. It is an orchestrator and a window onto Claude C
 - No AI calls of Maestro's own. All model work goes through the `claude` CLI.
 - No custom `maestro:*` skills. The existing superpowers and engineering skills are used.
 - No driving the Claude Desktop app. It has no automation interface.
-- No cross-machine sync, no mobile UI, no team sharing.
+- No cross-machine sync, mobile UI or team sharing.
 
 ## 2. Terms
 
@@ -31,93 +44,109 @@ Maestro does no AI work itself. It is an orchestrator and a window onto Claude C
 | **Project** | A local folder (normally a git repo) that Maestro has been told about. |
 | **Mission** | One user brief in one project. Owns one conductor session, one mission branch, and its tasks. |
 | **Conductor** | The long-running Claude Code session that runs the superpowers workflow for a mission. |
-| **Task** | One unit of work the conductor sends out. It runs as its own Claude Code session, with its own agent role and its own worktree. |
-| **Agent role** | A named setup (model, tools, skills, instructions) a task runs as, e.g. Implementer or Spec reviewer. |
+| **Task** | One unit of work. A *plan task* comes from the approved plan (`T<n>`). An *ad-hoc task* is dispatched by the conductor during the run (e.g. `T1-review`, `final-review`, `T3-fix`). Each runs as its own Claude Code session with its own agent role and worktree. |
+| **Task key** | A task's ID within a mission: `T<n>` for plan tasks, or any `[A-Za-z0-9-]{1,24}` for ad-hoc tasks. Keys sort naturally (`T1`, `T1-review`, `T2`, `T10`, `final-review`). |
+| **Agent role** | A named setup (model, tools, skills, instructions) a task runs as, e.g. implementer or spec-reviewer. |
 | **Wave** | Tasks with the same dependency depth. Everything in a wave can run at the same time. Used for display only, never for scheduling. |
 | **Critical path** | The longest chain of dependent tasks. It sets the earliest possible finish time. |
-| **Handoff note** | A short summary a task writes when it finishes. Later tasks read it. |
+| **Turn** | One request/response cycle inside a session. It ends with a `result` event. A session lives across many turns. |
+| **Handoff note** | A `## Handoff` section a task writes at the end. Later tasks and the conductor read it. |
 | **Inbox ("Needs you")** | Every question, approval and permission request waiting for the user, across all missions. |
 
 ## 3. Constraints and verified facts
 
-These were checked against the Claude Code docs on 2026-10-27 (research agent, sources in the session):
+Checked against the Claude Code docs (2026-10-27) and in the Plan 1 spikes (claude 2.1.312, superpowers 6.4.2, Windows 11):
 
-- **The Desktop app can't be automated.** Maestro must drive the `claude` CLI.
-- **Headless mode:** `claude -p` with `--output-format stream-json --input-format stream-json --verbose` streams every event. In streaming input mode the session can receive more user messages while it runs.
-- **Useful flags:** `--resume <id>` / `--session-id <uuid>`, `--model`, `--permission-mode`, `--allowedTools`, `--append-system-prompt-file`, `--mcp-config`, `--agents`, `--max-turns`.
-- **Plugins load in headless runs.** User and project settings, installed plugins (superpowers) and CLAUDE.md load in `-p` sessions unless `--bare` is passed.
-- **Auth:** the Agent SDK docs say third-party products should use API keys, not claude.ai login. **Decision:** Maestro starts the user's own installed `claude` CLI, which is already logged in to their subscription. Maestro never handles credentials. The Agent SDK is out of scope for v1.
-- **Usage data:** each session's final `result` event reports token usage and estimated cost. The 5-hour and 7-day usage windows are documented only for the status line; no headless API for them was found (see risk R4).
-- **Rate limits:** `api_retry` events with category `rate_limit` show when the account is being throttled.
+- **The Desktop app can't be automated.** Maestro drives the `claude` CLI.
+- **Use the native binary, not the npm shim.** Maestro spawns `claude.exe` with `shell:false`. It finds the exe by reading the npm `claude.cmd` shim, then falls back to `where claude.exe`, and fails with a clear message if neither works. Never spawn `claude.cmd` with `shell:false`. (R5)
+- **One process per session, kept alive between turns.** Every session uses:
+  `-p --input-format stream-json --output-format stream-json --verbose --replay-user-messages --permission-prompt-tool stdio`
+  - **Messages in:** user messages go to stdin as JSON lines.
+  - **Messages out:** events come back as JSON lines on stdout.
+  - **One result per turn:** a `result` event ends a turn, not the process.
+  - **Follow-ups:** a message sent mid-turn may be folded into the same turn. (R2)
+- **Auth:** Maestro starts the user's own logged-in `claude` CLI and never handles credentials. The Agent SDK is out of scope, because its policy asks third-party products to use API keys.
+- **Plugins and skills load in headless runs.** User and project settings, installed plugins (superpowers) and CLAUDE.md all load, which `system/init` confirms. (R1)
+- **Usage window:** the undocumented `rate_limit_event.rate_limit_info.unifiedWindows.{five_hour,seven_day}` carries `{utilization (0..1), resetsAt, status}`. It is only emitted during turns. (R2/R4)
+- **Tool restriction:** `--allowedTools` did **not** stop other tools from running (Glob ran under `--allowedTools Bash`). Role tool lists use `--disallowedTools` instead, which is to be verified first (R7).
+- **Long tool calls:** MCP tool calls can block for 30 min or more. `MCP_TOOL_TIMEOUT` must be set explicitly, because an inherited small value would apply. (R6)
 
 ## 4. Architecture
 
 ```
 ┌──────────────────────── Maestro (one local process) ─────────────────────────┐
-│                                                                               │
 │  Web UI (React) ◄── WebSocket events ── Core ── SQLite (maestro.db)           │
-│        │                                  │                                   │
 │        └──── HTTP commands ──────────────►│                                   │
 │                                           ├── Mission engine (state machines) │
 │                                           ├── Plan parser + graph             │
 │                                           ├── Scheduler                       │
-│                                           ├── Session runner ──► claude -p (conductor)
-│                                           │                  └─► claude -p (task × N)
+│                                           ├── Session runner ──► claude.exe (conductor)
+│                                           │                  └─► claude.exe (task × N)
 │                                           ├── Worktree manager ──► git        │
-│                                           └── Bridge MCP server ◄── conductor │
+│                                           └── Bridge MCP server ◄── sessions  │
 └───────────────────────────────────────────────────────────────────────────────┘
 ```
 
 ### 4.1 Components
 
-Each component has one job and talks to the others through a narrow interface.
-
 | Component | Responsibility | Depends on |
 |---|---|---|
 | **Web UI** | The screens from the mockups. Read-only view of state, plus commands. | Core HTTP + WebSocket |
-| **Core API** | HTTP commands (create mission, approve plan, answer, message task, pause/stop) and a WebSocket event feed. | Mission engine, Store |
+| **Core API** | HTTP commands (create mission, approve plan, answer, message task, pause/stop/retry) and a WebSocket event feed. Untrusted input is validated before it reaches the state machines. | Mission engine, Store |
 | **Mission engine** | Mission and task state machines (§5). Records each change and publishes it as an event. | Store, Scheduler, Session runner |
-| **Plan parser + graph** | Turns the conductor's plan markdown into tasks and dependencies. Checks it, computes waves and the critical path. Pure functions. | — |
-| **Scheduler** | Decides which ready tasks start, respecting the parallel limit and rate-limit backoff. Pure decision logic plus a tick loop. | Mission engine |
-| **Session runner** | Starts and supervises `claude` processes, parses their stream-json output into typed events, writes user messages to their input, handles interrupt and kill. | OS processes |
-| **Worktree manager** | Creates and removes worktrees and branches, and merges task branches into the mission branch. | git CLI |
-| **Bridge MCP server** | The local tools the conductor calls: `dispatch_task`, `wait_for_tasks`, `ask_user`, `submit_plan`. Maps each call to a Mission engine command. | Mission engine |
-| **Store** | SQLite tables (§9) plus the raw event log per session. | — |
+| **Plan parser + graph** | Plan markdown → tasks; validation; waves; critical path. Pure functions. *(Built in Plan 1.)* | — |
+| **Scheduler** | Picks which dispatched, ready tasks start, within the parallel limits and throttle. Pure. *(Built in Plan 1.)* | — |
+| **Stream protocol** | Pure parse and serialise of stream-json events and control messages (§8.4). Tolerates unknown types, subtypes and keys. | — |
+| **Session runner** | Spawns and supervises `claude.exe` processes; feeds the stream protocol; sends messages, interrupts and permission answers; kills process trees. | OS, Stream protocol |
+| **Worktree manager** | Creates and removes worktrees and branches (with a path-length guard), and merges task branches into the mission branch. | git CLI |
+| **Bridge MCP server** | The conductor's tools (`submit_plan`, `dispatch_task`, `wait_for_tasks`, `ask_user`, `finish_mission`) and the task sessions' `ask_user`. Maps each call to a Mission engine command. | Mission engine |
+| **Store** | SQLite with versioned migrations (§10) plus raw session logs. *(Built in Plan 1, extended in Plan 2.)* | — |
 
-### 4.2 Technology (proposed, for review)
-
-- **Language:** Node.js + TypeScript for everything. One process.
-- **UI:** React, served by the same process on `127.0.0.1:<port>`, opened in the user's browser. Wrapping it in Electron or Tauri later stays possible.
-- **Storage:** SQLite (`better-sqlite3`) in `%APPDATA%\Maestro\maestro.db`. Raw session logs go to `…\Maestro\logs\<session>.jsonl`.
-- **MCP:** the official MCP TypeScript SDK, over stdio. Maestro writes a per-mission `bridge.json` MCP config that starts a small stdio helper, which forwards calls to Core over localhost HTTP.
-- **Why:** one language end to end, the MCP SDK is first-class in TypeScript, and the mockups are already HTML and React-shaped.
+### 4.2 Technology
+- Node.js (≥22; the dev machine runs 25) and TypeScript 7, all in one process. Tests use Vitest 4.
+- The UI is React, served on `127.0.0.1:<port>` and opened in the browser (decided 2026-10-28).
+- Storage is better-sqlite3 in `%APPDATA%\Maestro\maestro.db`, with migrations through `PRAGMA user_version`. Raw session logs go to `…\Maestro\logs\<session>.jsonl`. The schema SQL ships with any build output.
+- MCP uses the official TypeScript SDK over stdio. A per-mission `bridge.json` starts a small stdio helper that forwards calls to Core over localhost HTTP.
 
 ## 5. Lifecycles
 
 ### 5.1 Mission states
 
-```
-Draft ─► Understanding ─► Planning ─► AwaitingApproval ─► Running ─► Finishing ─► Done
-            │  ▲             │  ▲            │   │           │  ▲         │
-            ▼  │             ▼  │            │   └─(re-plan)─┘  │         ▼
-         NeedsYou         NeedsYou           └──► Planning     Paused   NeedsYou
-Any state ─► Stopped (user) │ Failed (conductor exits non-zero and can't be resumed)
-```
+`draft → understanding → planning → awaiting_approval → running → finishing → done`, plus `paused`, `stopped`, `failed`.
 
-- **Understanding:** the conductor runs `superpowers:brainstorming`. Its questions go to the inbox through `ask_user`. In Quick depth this step is minimal.
-- **Planning:** the conductor runs `superpowers:writing-plans` with the plan-format rule (§6), then calls `submit_plan`.
-- **AwaitingApproval:** the Plan review screen. The user can approve, edit tasks, or send a re-plan note, which goes back to the conductor as a user message.
-- **Running:** the conductor runs `subagent-driven-development` / `dispatching-parallel-agents`, sending tasks through `dispatch_task`.
-- **Finishing:** the conductor runs requesting-code-review, verification-before-completion and finishing-a-development-branch. The merge into the base branch always goes to the user as a `merge_decision` inbox entry.
+| From | Event | To |
+|---|---|---|
+| draft | `start` / `start_quick` | understanding / planning |
+| understanding | `understood` | planning |
+| planning | `plan_submitted` | awaiting_approval |
+| awaiting_approval | `approve` | running |
+| awaiting_approval, running | `replan` | planning |
+| running | `pause` / paused `resume` | paused / running |
+| running | `finish_requested` (the conductor called `finish_mission`) | finishing |
+| finishing | `merged` | done (outcome `merged`) |
+| finishing | `kept` | done (outcome `kept`) — the branch is left for the user **[Claude's call — review]** |
+| any non-terminal | `stop` / `fail` | stopped / failed |
+
+- **"Needs you" is not a state.** It is derived from open inbox entries, so a running mission can need the user at the same time.
+- **Finishing starts on a signal from the conductor, not when all tasks are done.** The conductor adds ad-hoc review and fix tasks after the plan's tasks complete, so "all plan tasks done" is the wrong trigger.
 
 ### 5.2 Task states
 
-`Waiting → Ready → Running → (NeedsYou ⇄ Running) → Done | Failed | Cancelled`
+| From | Event | To | Notes |
+|---|---|---|---|
+| — | plan approved | `planned` | Plan tasks exist but the conductor hasn't dispatched them. |
+| planned | `dispatch` | waiting | The conductor called `dispatch_task`. Ad-hoc tasks are created straight into `waiting`. |
+| waiting | `deps_met` | ready | Every dependency is `done`. |
+| ready | `start` | running | The scheduler gave it a slot. |
+| running | `needs_user` / needs_you `answered` | needs_you / running | Entered when the task has ≥1 open inbox entry; left when the last one is answered. |
+| running, needs_you | `interrupt` | interrupted | Pause now. The process stays alive and idle (§8.3). |
+| interrupted | `resume` | running | Maestro sends "Continue." as a user message. |
+| running | `complete` | done | Ended with a valid handoff (§8.1). |
+| running, needs_you, interrupted | `fail` | failed | |
+| failed | `retry` | waiting | |
+| planned, waiting, ready, running, needs_you, interrupted | `cancel` | cancelled | |
 
-- **Waiting:** some dependency is not Done.
-- **Ready:** every dependency is Done, but no parallel slot is free.
-- **NeedsYou:** an `ask_user` call or a permission request is open.
-- **Failed:** the process exited with an error, or the task reported it couldn't meet its acceptance criteria. The conductor is told and decides: retry, send a Debugger, or re-plan.
+Terminal states are `done` and `cancelled`. `failed` is not terminal, because it can be retried.
 
 ## 6. Plan format and graph
 
@@ -131,160 +160,229 @@ Owns: src/api/**, test/api/**
 Acceptance: all contract tests in test/contract pass; new unit tests pass
 ```
 
-`submit_plan(path)` hands the plan file to Maestro. The parser:
-1. Pulls out the tasks (`id`, title, body, `dependsOn[]`, `agent`, `owns[]` globs, `acceptance`).
-2. **Checks** for: unknown dependency IDs, cycles, unknown agent roles, and parallel tasks (no dependency path between them) whose `owns` globs overlap. Any error goes back to the conductor as the tool result, and it fixes the plan. The user never sees an invalid plan.
-3. Computes `depth` (longest path from a root) to group tasks into **waves**, and the **critical path** (longest chain). Each task counts as 1 unless the plan gives an estimate.
+The parser (Plan 1):
+- strips a BOM and normalises CRLF;
+- ignores headings and field lines inside fenced code;
+- accepts `none`, `-`, `—` or an empty value for "no dependencies";
+- takes every number in the `Depends on:` value.
 
-The approved plan is a snapshot. Re-plans create a new plan version, and tasks that are already Done stay Done.
+Validation returns these errors to the conductor through `submit_plan`, so the user never sees an invalid plan:
+
+| Error | Meaning |
+|---|---|
+| `empty-plan` | The plan has no tasks. |
+| `duplicate-key` | Two tasks share a key. |
+| `unknown-dependency` | A task depends on a key that doesn't exist. |
+| `self-dependency` | A task depends on itself. |
+| `cycle` | Tasks depend on each other in a loop. |
+| `unknown-agent` | The agent role isn't one of the defined roles. |
+| `missing-acceptance` | A task has no acceptance criteria. |
+| `ownership-overlap` | Two parallel tasks own the same files. The check is case-insensitive, ignores `./`, and leans cautious. |
+
+**Waves** come from the longest dependency path. The **critical path** is the longest path by estimate (default 1).
+
+- **Ad-hoc tasks:** `dispatch_task` may create tasks that aren't in the plan, depending on any existing key. Maestro adds them to the graph, recomputes waves and the critical path, and checks their `owns` against the tasks running at that moment. An overlap is returned as a tool error, so the conductor adds a dependency or narrows `owns`.
+- **Re-plans:** a re-plan creates a new plan version. Tasks already `done` carry over by key and stay `done`.
+  - A `planned`, `waiting` or `ready` task with the same key is updated in place, to the new body, dependencies and plan version.
+  - A task whose key is no longer in the plan becomes `cancelled`, unless it is running. A running task is left alone and reported to the conductor.
+  - Keys are unique per mission, so rows are never duplicated.
 
 ## 7. Conductor and bridge
 
 ### 7.1 Conductor session
 ```
-claude -p "<mission brief + settings>" --model opus
+claude.exe -p "<mission brief + settings>" --model opus
   --mcp-config <mission>/bridge.json
   --append-system-prompt-file <maestro>/prompts/conductor.md
-  --output-format stream-json --input-format stream-json --verbose
-  --permission-mode default
-cwd = <project root>
+  --input-format stream-json --output-format stream-json --verbose --replay-user-messages
+  --permission-prompt-tool stdio --permission-mode default
+cwd = <project root>; env MCP_TOOL_TIMEOUT=86400000
 ```
-`conductor.md` tells it to:
-- use the superpowers workflow;
-- use the plan format in §6;
-- call `ask_user` for every question to the user;
-- **call `dispatch_task` wherever a skill says to start a subagent, and never use the built-in Task tool to implement anything** (read-only search subagents are allowed);
-- make sure every task ends with a handoff note.
+- `prompts/conductor.md` starts from `spikes/r1-conductor/conductor.md`. That is the version that passed 4 of 4 compliance runs.
+- The conductor's permission requests go to the inbox like any task's, with `task_id` NULL.
+- A built-in `Task`/`Agent` tool_use in the conductor stream is counted and shown in the UI as a warning.
 
 ### 7.2 Bridge tools
 
+**The tool descriptions in `spikes/r1-conductor/bridge.ts` are part of the tested design and ship verbatim.** Changing them, or `conductor.md`, requires re-running the 3-run compliance check (R1).
+
 | Tool | Input | Result |
 |---|---|---|
-| `submit_plan` | `{ plan_path }` | `{ ok, errors[] }` — `ok` moves the mission to AwaitingApproval. The tool call blocks until the user approves or sends a re-plan note, and returns that decision. |
-| `dispatch_task` | `{ task_id, agent, prompt, depends_on[], owns[] }` (`task_id` from the plan, or a new ad-hoc ID) | `{ task_ref }` straight away. The task goes Waiting or Ready. |
-| `wait_for_tasks` | `{ task_refs[], mode: "all" \| "any" }` | Blocks until done. Returns each task's status, handoff note, branch, and test evidence summary. |
-| `ask_user` | `{ question, options[]?, context?, blocking: bool }` | Blocks when `blocking` is true. Returns the user's answer. |
+| `submit_plan` | `{ plan_path }` | Validation errors right away, or it blocks until the user approves (→ `{approved:true}`) or sends a re-plan note (→ `{approved:false, note}`). **Idempotent:** after a timeout, calling again with the same plan resumes the wait. |
+| `dispatch_task` | `{ task_id, agent, prompt, depends_on[], owns[] }` | `{ task_ref }` straight away. A plan task moves from `planned` to `waiting` and uses the dispatched `prompt`; the plan body becomes the task's "Plan" tab. A new ID creates an ad-hoc task. Re-dispatching a task that is not failed returns its existing `task_ref`. |
+| `wait_for_tasks` | `{ task_refs[], mode: "all" \| "any" }` | Blocks, sending an MCP progress notification about every 60 s. Returns each task's status, handoff note, branch, commits and test-evidence summary. **Idempotent:** a re-call after a timeout keeps waiting. Tasks keep running regardless. |
+| `ask_user` | `{ question, options[]?, context? }` | Blocks until the user answers. With `options`, the answer is always exactly one of them (the UI enforces it). |
+| `finish_mission` | `{ summary }` | Moves the mission to `finishing` and creates a `merge_decision` inbox entry (Merge / Keep branch). Returns the user's choice. |
 
-Review passes from subagent-driven-development (spec review, then code review) are dispatched as tasks with agent `spec-reviewer` / `code-reviewer`, depending on the implementation task they review. They appear in the graph the same way.
+**Task sessions get a bridge with `ask_user` only** **[Claude's call — review]**, so a task can ask the user a question directly (→ `needs_you`) instead of failing or guessing.
 
 ## 8. Task execution
 
-### 8.1 Starting a task
+### 8.1 Starting and completing a task
 ```
-claude -p "<task prompt + upstream handoff notes + acceptance criteria>"
-  --model <role.model>
-  --allowedTools <role.tools>
+claude.exe -p "<prompt + upstream handoff notes + acceptance criteria + handoff instructions>"
+  --model <role.model> --disallowedTools <role.denied>
   --append-system-prompt-file <maestro>/agents/<role>.md
-  --output-format stream-json --input-format stream-json --verbose
-  --permission-mode acceptEdits
-cwd = <project>/.claude/worktrees/<mission-slug>-<task-id>
+  --mcp-config <task>/bridge-ask.json
+  --input-format stream-json --output-format stream-json --verbose --replay-user-messages
+  --permission-prompt-tool stdio --permission-mode acceptEdits
+cwd = <project>/.claude/worktrees/<mission8>-<key>   env MCP_TOOL_TIMEOUT=86400000
 ```
-- **Worktree and branch:** `maestro/<mission-slug>/<task-id>`, branched from the **mission branch** `maestro/<mission-slug>` at its current tip. Upstream work is already merged into the mission branch when a dependent task starts.
-- **Agent role files:** `<maestro>/agents/*.md`, one per role from screen 7: researcher, architect, designer, implementer, test-author, debugger, spec-reviewer, code-reviewer, qa. Each names its model, tools and the skills to use. These ship with Maestro and the user can edit them.
-- **When a task finishes:** Maestro reads the handoff note (the final `## Handoff` section of the last assistant message), records the `result` event's usage, and merges the task branch into the mission branch with `git merge --no-ff`. If the merge conflicts, the merge is aborted, the task is marked Failed (reason: conflict), and the conductor decides, usually by sending a task to resolve it.
+- **Worktree and branch:** branch `maestro/<mission-slug>/<key>`, cut from the mission branch tip.
+  - The worktree folder is `<first 8 chars of mission id>-<key>`.
+  - Before `git worktree add`, the full path is checked against a 200-character limit. If it is longer, the folder becomes a short hash.
+  - `core.longpaths=true` is set in the project repo only. It is never set globally.
+- **Read-only roles** (researcher, spec-reviewer, code-reviewer) deny `Edit`, `Write` and `NotebookEdit` through `--disallowedTools`. This must be verified first (R7).
+- **Completion.** When a turn ends with `result.subtype = success`:
+  1. If the last assistant message has a `## Handoff` section, Maestro closes stdin, which ends the process cleanly. The task becomes `done`, and Maestro merges its branch into the mission branch with `--no-ff`.
+  2. If there is no handoff, Maestro sends one follow-up: "Finish with a ## Handoff section." If that turn also ends without one, the task becomes `failed` with reason `no-handoff`.
+  3. **Merge conflict:** the merge is aborted, the task becomes `failed` with reason `conflict`, and the conductor decides what to do.
+- **Usage:** recorded from each `result.usage`, split into input, output, cache-read and cache-write tokens. Whether `usage` is cumulative over a long-lived process is unknown (R8). Until then Maestro stores per-result values and reports per-turn sums. The parser drops every cost field.
 
 ### 8.2 Scheduling
-- A task becomes Ready when every dependency is Done. Ready tasks start oldest first, critical-path tasks first.
-- The **parallel limit** is per mission (default 3, range 1–8), plus a global limit (default 6) across all missions.
-- **Rate limits:** on an `api_retry` / `rate_limit` event, the scheduler pauses new starts globally for a backoff that grows exponentially (1, 2, 4… minutes, capped at 30). Running sessions are left alone. The Home screen shows "Throttled — resuming in N min".
+- A dispatched task becomes `ready` once every dependency is `done`. Ready tasks start critical-path first, then oldest first.
+- **Parallel limits:** per mission (default 3, range 1–8) plus a global limit (default 6).
+- **Throttling:** on a `rate_limit_event` with `status` ≠ `allowed`, new starts pause globally until `resetsAt`. If no `resetsAt` is available, Maestro falls back to exponential backoff of 1, 2, 4 … minutes, capped at 30. Running sessions are left alone. Home shows "Throttled — resuming at HH:MM".
 
 ### 8.3 Talking to running sessions
-- **Messages from the user** (the "Message this task" box, inbox answers that are not `ask_user` replies) are written to the session's input as stream-json user messages.
-- **Pause:** stop scheduling new tasks for the mission. Running tasks continue unless the user picks "Pause now", which interrupts them (SIGINT). They are resumed later with `--resume`.
-- **Stop:** interrupt, then kill after 10 s, and mark Cancelled. Worktrees are kept until the user cleans them up.
+- **Messages:** the user's messages go to the session's stdin as JSON lines. A message sent mid-turn may be answered in the same turn, so Maestro never assumes one `result` per message.
+- **Pause** (mission level) stops new starts. **Pause now** interrupts running tasks:
+  1. Maestro writes a `control_request` interrupt to stdin and waits up to 5 s for a `result` with `terminal_reason:"aborted_tools"`.
+  2. The task becomes `interrupted`. Its process stays alive and idle. Maestro then checks its own process tree and kills any leftover tool processes.
+  3. If no `result` arrives within 5 s, Maestro runs `taskkill /PID <pid> /T /F` and the task becomes `interrupted` with no live process.
+  4. **Resume:** if the process is alive, Maestro sends "Continue." Otherwise it starts a new process with `--resume <session_id>`. Maestro re-reads `session_id` from `system/init` after every resume.
+- **Stop:** interrupt as above, then close stdin. If the process is still alive 5 s later, Maestro force-kills the tree. The task becomes `cancelled`, and worktrees are kept until the user cleans them up.
+- **Never use SIGINT or `child.kill()`.** On Windows they kill only the root process and orphan its tool processes (R5).
+
+### 8.4 Stream protocol
+- Events are dispatched on `type`, then `subtype`. Unknown types, subtypes and keys are ignored and logged, never fatal.
+- **Handled events:** `system/init` (may repeat), `assistant`, `user` (`isReplay` echoes, `tool_result`, interrupt marker), `result`, `control_request/can_use_tool`, `control_response`, `rate_limit_event`.
+- **`api_retry`:** optional, because it was never observed.
+- The exact shapes are in `docs/superpowers/spikes/2026-10-28-r2-stream.md`. Fixtures recorded from the spikes become the parser's tests and the fake CLI's script.
 
 ## 9. Permissions and the inbox
 
-- **Task sessions** run in `acceptEdits` inside their own worktree. Any other tool call that needs approval is sent to Maestro (through a `PermissionRequest` hook or `--permission-prompt-tool`, see R3). It shows up in the inbox as "T6 wants to run `npm install pg`" with Allow once / Always allow for this mission / Deny.
-- **Inbox entries** are typed: `question`, `plan_approval`, `permission`, `review_decision`, `merge_decision`. Each one links to its mission and task. Answering one resumes the waiting session. Snooze hides an entry for 1 hour.
-- **The Home screen** sorts the inbox by age, with critical-path items first, because those block the finish.
+- **Requests:** permission requests arrive as `control_request` with `subtype:"can_use_tool"`, carrying `request_id`, `tool_name`, `input`, `tool_use_id` and `description`. Each becomes a `permission` inbox entry, and the session stays blocked until it is answered.
+  - **Allow:** `{"behavior":"allow","updatedInput":<input>}`
+  - **Deny:** `{"behavior":"deny","message":"<text>"}`
+  - Both go back on stdin as a `control_response` with the same `request_id`. (R3)
+- **"Always allow for this mission"** **[Claude's call — review]** stores a rule in Maestro (tool name plus an exact command prefix for Bash) and auto-answers matching requests in that mission. Maestro never answers with `permission_suggestions`, because that could write settings files into a worktree, which would then be merged.
+- **Inbox entry types:** `question`, `plan_approval`, `permission`, `review_decision`, `merge_decision`.
+- **Inbox states:** `open`, `answered`, `expired`. An entry expires when its task is cancelled or its process dies, or when its request no longer applies.
+- **Answering:** an answer applies exactly once (a second click gets `AlreadyAnswered`). A task can have several open entries at once, for example parallel tool calls.
+- **Snooze** hides an entry for 1 hour.
+- **Sort order:** Home sorts the inbox by age, with critical-path items first.
 
-## 10. Data model (SQLite)
+## 10. Data model (SQLite, versioned migrations)
+
+Plan 1's baseline (migration 1) plus Plan 2's migration 2:
 
 ```
-projects(id, name, path, created_at, last_used_at)
-missions(id, project_id, title, brief, state, depth, base_branch, mission_branch,
-         isolation, max_parallel, conductor_session_id, settings_json, created_at, ended_at)
-plan_versions(id, mission_id, version, plan_path, plan_md, approved_at)
-tasks(id, mission_id, plan_version_id, task_key, title, agent, prompt, state,
-      depends_on_json, owns_json, acceptance, depth, on_critical_path,
-      session_id, worktree_path, branch, handoff_md, failure_reason,
-      started_at, ended_at, tokens_in, tokens_out)
-inbox(id, mission_id, task_id NULL, kind, payload_json, state, answer_json,
-      created_at, answered_at, snoozed_until)
-sessions(id, mission_id, task_id NULL, role, claude_session_id, pid, state,
-         log_path, started_at, ended_at)
-events(id, mission_id, task_id NULL, ts, type, data_json)   -- what the UI's activity log reads
+projects(id, name, path UNIQUE(normalised), created_at, last_used_at)
+missions(id, project_id→, title, brief, state CHECK, outcome NULL CHECK('merged','kept'), depth, base_branch,
+         mission_branch, isolation, max_parallel, conductor_session_id, settings_json, created_at, ended_at)
+plan_versions(id, mission_id→, version, plan_path, plan_md, approved_at, UNIQUE(mission_id, version))
+tasks(id, mission_id→, plan_version_id→ NULL (ad-hoc), task_key, title, agent, prompt, plan_body, state CHECK,
+      depends_on_json, owns_json, acceptance, depth, on_critical_path, dispatched_at,
+      session_id, worktree_path, branch, handoff_md, failure_reason, started_at, ended_at,
+      tokens_in, tokens_out, tokens_cache_read, tokens_cache_write, UNIQUE(mission_id, task_key))
+inbox(id, mission_id→, task_id→ NULL, kind CHECK, request_id NULL, payload_json, state CHECK('open','answered','expired'),
+      answer_json, created_at, answered_at, snoozed_until)
+permission_rules(id, mission_id→, tool_name, input_prefix, created_at)
+sessions(id, mission_id→, task_id→ NULL, role, claude_session_id, pid, state, log_path, started_at, ended_at)
+usage_window(id=1, five_hour_utilization, five_hour_resets_at, seven_day_utilization, seven_day_resets_at, seen_at)
+events(id, mission_id→, task_id→ NULL, ts, type, data_json)
 ```
+
+Task keys are unique per mission, rather than per plan version, so ad-hoc tasks and re-plans share one key space.
 
 ## 11. Screens (from the mockups)
 
 | # | Screen | Shows / does |
 |---|---|---|
-| 1 | **Home** | Inbox first; running missions with a per-task progress bar and each mission's own outline; recently finished missions; usage. |
-| 2 | **New mission** | Project cards, brief, optional "always require" constraints, planning depth, models, base branch, isolation, parallel limit, when to stop and ask. |
-| 3 | **Plan review** | Tasks grouped by wave; the mission's outline; why this shape; quality gates; the conductor's questions; re-plan note; approve. |
-| 4 | **Task graph** | Dependency graph with live status; click to trace what a task waits for and unblocks; critical-path toggle. |
-| 5 | **Mission live** | Wave view with live status; selected task's activity / tests / changes / handoff; message box; pause and stop. |
-| 6 | **Tasks board** | Every task across missions in Waiting / Ready / Running / Needs you / Done columns; filters; "only what needs me". |
-| 7 | **Team & skills** | Agent roles and their skills; edit role files. |
+| 1 | **Home** | The inbox first. Running missions, each with a per-task progress bar and its own outline. Recently finished missions. **5-hr usage left** (last value with its age) and tokens today. |
+| 2 | **New mission** | Project cards, the brief, optional "always require" constraints, planning depth, models, base branch, isolation, parallel limit, and when to stop and ask. |
+| 3 | **Plan review** | Tasks grouped by wave. The mission's outline, why this shape, the quality gates, the conductor's questions, a re-plan note, and approve. |
+| 4 | **Task graph** | The dependency graph with live status, including ad-hoc tasks. Click a task to trace what it waits for and unblocks. Critical-path toggle. |
+| 5 | **Mission live** | The wave view with live status. The selected task's activity, tests, changes, plan and handoff. A message box, and pause, pause-now, resume and stop. |
+| 6 | **Tasks board** | All tasks across missions in Planned / Waiting / Ready / Running / Needs you / Interrupted / Done columns. |
+| 7 | **Team & skills** | The agent roles and their skills. The role files can be edited. |
 
-The Stats page is out of scope for v1. Basic numbers (tasks in flight, average parallelism, tokens per mission) appear on Home. The New mission screen drops the "before merging" checkbox, since merging always asks.
+The Stats page is out of scope for v1.
 
 ## 12. Error handling and recovery
 
 | Failure | Behaviour |
 |---|---|
-| A task process exits with an error | Task → Failed with the last 50 log lines. The conductor sees it in `wait_for_tasks` and decides (retry, debugger, re-plan). |
-| A task makes no progress for N minutes (default 20 with no events) | Inbox entry: "T6 seems stuck", with Interrupt / Keep waiting. |
-| The conductor exits unexpectedly | Restart with `--resume <conductor_session_id>` once. If that fails, the mission → Failed. The tasks and worktrees are kept for manual recovery. |
-| Maestro restarts | On boot, Running sessions whose PID is gone are resumed with `--resume`. Tasks are never restarted from scratch silently. |
+| A task process exits unexpectedly | The task becomes `failed` with the last 50 log lines. Its open inbox entries expire. The conductor sees the failure in `wait_for_tasks` and decides what to do. |
+| No events for N minutes (default 20) | An inbox entry, "T6 seems stuck", with Interrupt / Keep waiting. |
+| An interrupt gets no `result` within 5 s | Force-kill the tree (§8.3). |
+| The conductor exits unexpectedly | Restart it with `--resume <conductor_session_id>` once. If that fails, the mission becomes `failed`, and its tasks and worktrees are kept. |
+| A bridge call times out | The conductor gets a timeout error and calls again. Tasks are unaffected, because the calls are idempotent. |
+| Maestro restarts | Live sessions whose PID is gone are resumed with `--resume`. Nothing restarts silently from scratch. |
 | A merge conflict into the mission branch | See §8.1. |
-| An invalid plan | Errors are returned to the conductor through `submit_plan`, never shown to the user as a broken plan. |
-| `claude` CLI missing or logged out | Blocking banner with the exact command to fix it (`npm i -g @anthropic-ai/claude-code`, `claude` to log in). |
-| Disk or worktree errors | Task → Failed with reason. The worktree path is shown so the user can inspect it. |
+| An invalid plan, or an ad-hoc overlap | Returned to the conductor as a tool error. |
+| `claude.exe` not found, or logged out | A blocking banner with the fix. |
+| A worktree path is too long | A hashed short folder name (§8.1). |
 
 ## 13. Security and safety
-
-- The HTTP server binds to `127.0.0.1` only, with a random per-run token required on every request. The Bridge helper gets the token through an environment variable.
-- Maestro never reads, stores or sends credentials. Auth is whatever the user's `claude` CLI already has.
-- Task sessions are limited to their worktree (cwd) and their role's tool list. Anything outside is a permission request to the user.
-- Merging into the user's **base** branch only happens when the user clicks Merge. There is no automatic merge in v1.
+- The HTTP server binds to `127.0.0.1` only, with a random per-run token on every request. The Bridge helper gets the token through an environment variable.
+- Maestro never reads, stores or sends credentials.
+- Task sessions are confined by their cwd (the worktree), the tools their role denies, and stdio permission prompts for anything else.
+- `permission_suggestions` are never used, so no settings files are written into worktrees.
+- Merging into the base branch only happens when the user clicks Merge.
 
 ## 14. Testing strategy
-
-- **Unit:** plan parser (valid plans, cycles, overlapping ownership, unknown roles), wave and critical-path maths, scheduler decisions, state-machine transitions. Pure functions, written test-first.
-- **Integration with a fake CLI:** a `fake-claude` script that replays recorded stream-json transcripts, including a question, a permission request, a rate-limit retry and a failure. It covers the session runner, the bridge, inbox round trips and recovery without spending usage.
-- **Contract tests for the bridge:** each MCP tool's schema and blocking behaviour.
-- **End-to-end:** one scripted real run against a tiny sample repo (a 3-task mission), run by hand before releases because it uses real usage.
+- **Unit:**
+  - the plan parser, validation and graph, the state machines, the scheduler and the store (Plan 1, 67 tests);
+  - the stream protocol, against fixtures recorded from the spikes;
+  - the worktree-path guard.
+- **Integration with a fake CLI:** a `fake-claude` script that replays recorded stream-json. It covers init, turns, a mid-turn message, an interrupt, `can_use_tool`, a rate-limit event, a crash and resume. Runner, bridge, inbox and recovery are tested without spending usage.
+- **Bridge contract tests:** each tool's schema, blocking, idempotency and progress pings.
+- **End-to-end:** one real 3-task mission on a scratch repo, run by hand before each release. It also re-runs the R1 compliance check.
 - **UI:** component tests for the graph and the inbox, and Playwright smoke tests over the fake CLI.
 
-## 15. Risks and spikes (do first)
+## 15. Risks
 
-| # | Risk | Spike to settle it |
+| # | Risk | Status |
 |---|---|---|
-| R1 | The conductor uses the built-in Task tool instead of `dispatch_task`. | Run subagent-driven-development on a sample plan with `conductor.md`; measure how often it complies. Fallback: let it use Task and observe the subagents through SubagentStart/Stop hooks, shown as tasks without worktrees. |
-| R2 | The exact stream-json input format for follow-up messages to a `-p` session. | Send a mid-run message and an interrupt; record the wire format. |
-| R3 | Routing permission prompts from headless sessions to Maestro. | Try a `PermissionRequest` hook versus `--permission-prompt-tool` pointing at a Bridge tool. |
-| R4 | No headless source for the 5-hour / 7-day usage window. | Check whether `-p` sessions expose `rate_limits` anywhere; otherwise show only Maestro's own usage totals and throttle events. |
-| R5 | Windows process control: SIGINT equivalents, killing process trees, long paths in worktrees. | Spike the session runner on Windows first. |
-| R6 | Blocking MCP tool calls (`wait_for_tasks`, `submit_plan`) may time out after hours. | Test long blocking calls. Fallback: return "still running" every N minutes and let the conductor call again. |
+| R1 | The conductor uses the built-in Task tool instead of `dispatch_task` | **Resolved: GO.** 4 of 4 runs used `dispatch_task`, with no Task/Agent calls. Re-check when the bridge returns real handoffs. |
+| R2 | Stream-json follow-ups and interrupts | **Resolved.** stdin messages and the `control_request` interrupt both work. |
+| R3 | Routing permission prompts | **Resolved.** `--permission-prompt-tool stdio` works. |
+| R4 | Usage window | **Resolved.** Use `rate_limit_event`. |
+| R5 | Windows process control | **Resolved.** Spawn `claude.exe`, force-kill with `taskkill /T /F`, keep paths under 200 characters. |
+| R6 | Long blocking MCP calls | **Resolved.** Calls of 30 min or more work; set `MCP_TOOL_TIMEOUT`. |
+| R7 | `--disallowedTools` really restricts read-only roles | **Open.** Verify first in Plan 2. Fallback: run read-only roles with `--permission-mode default` and deny edits in the stdio prompt handler. |
+| R8 | Whether `result.usage` is cumulative over a long-lived process | **Open.** Verify with two turns in one process. |
+| R9 | stdio permission prompts combined with `acceptEdits`, and an interrupt while a request is pending | **Open.** Verify early in Plan 2. |
+| R10 | Behaviour changes in undocumented events (`rate_limit_event`, `can_use_tool`) across CLI versions | **Open.** Record the CLI version in every session, and keep the parser tolerant. |
+| R11 | Spawn environment differs from the desktop app (e.g. `MCP_CONNECTION_NONBLOCKING`) | **Open.** Maestro sets its own explicit env and re-checks deferred-tool loading. |
 
-## 16. Build order (for the implementation plan)
+## 16. Build order
+- **Plan 1 (done):** the pure core, the store, spikes R1–R6.
+- **Plan 2:**
+  1. verify R7–R9;
+  2. the stream protocol and fake CLI;
+  3. the session runner;
+  4. the worktree manager;
+  5. migration 2 and the new states;
+  6. the bridge (verbatim descriptions);
+  7. inbox and permissions;
+  8. scheduling and throttling;
+  9. recovery;
+  10. a command-line driver that runs a real mission end to end, with the R1 re-check.
+- **Plan 3:** the HTTP and WebSocket API, then the React UI (7 screens).
 
-1. Spikes R1, R2, R3, R5. Go or no-go on the conductor bridge.
-2. Session runner, stream-json parser, fake CLI.
-3. Store, mission and task state machines.
-4. Plan parser and graph.
-5. Bridge MCP server, conductor prompt.
-6. Worktree manager and scheduler.
-7. Inbox and permissions.
-8. UI: Home, New mission, Plan review, Mission live.
-9. UI: Task graph, Tasks board, Team & skills.
-10. Recovery, throttling, polish.
+## 17. Decisions
+**Made by the user (2026-10-28):**
+1. A local web page, opened in the browser.
+2. The final merge into the base branch always asks first.
+3. Usage is shown in tokens only, with no dollar figures. (v2 adds the 5-hour usage window, a percentage that comes from Claude itself.)
 
-## 17. Decisions (answered 2026-10-28)
-
-1. **App shell:** a local web page (Node + TypeScript + React on `127.0.0.1`, opened in the browser). A desktop window can wrap it later.
-2. **Final merge into the base branch:** always ask the user first. Maestro shows the summary and diff, and merges only when the user clicks Merge.
-3. **Usage display:** tokens only, per task and per mission. No dollar estimates anywhere in the UI.
+**Claude's calls in v2, for review:**
+4. **Pause now** keeps the task's process alive and idle (`interrupted`) and resumes with "Continue.", rather than killing it and resuming later. It is faster, and context stays warm.
+5. **A mission can end with "Keep branch"** (`done`, outcome `kept`) as well as Merge.
+6. **Task sessions can ask the user questions** through a bridge that has only `ask_user`.
+7. **"Always allow" is mission-scoped**, stored in Maestro, and limited to the tool name plus an exact command prefix.
+8. **The interrupt fallback is 5 s**, then a forced kill. In the spike the interrupt answered in about 0.1 s.
+9. **A missing handoff gets one reminder**, then the task fails with reason `no-handoff`.
