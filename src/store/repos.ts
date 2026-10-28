@@ -195,6 +195,10 @@ const getTask = (db: Db, id: string): Task => toTask(db.prepare('SELECT * FROM t
 const isPreRun = (s: TaskState): boolean => s === 'planned' || s === 'waiting' || s === 'ready';
 
 export const tasks = {
+  get(db: Db, id: string): Task | undefined {
+    const r = db.prepare('SELECT * FROM tasks WHERE id = ?').get(id) as Row | undefined;
+    return r && toTask(r);
+  },
   insertPlan(db: Db, missionId: string, planVersionId: string, planTasks: PlanTask[], graph: PlanGraph): Task[] {
     const critical = new Set(graph.criticalPath);
     const ins = db.prepare(`INSERT INTO tasks (id, mission_id, plan_version_id, task_key, title, agent, prompt, plan_body,
@@ -438,6 +442,10 @@ export const sessions = {
   },
   end(db: Db, id: string, state: 'ended' | 'failed'): void {
     const res = db.prepare('UPDATE sessions SET state = ?, ended_at = ? WHERE id = ?').run(state, Date.now(), id);
+    if (res.changes === 0) throw new Error(`Session not found: ${id}`);
+  },
+  setClaudeSessionId(db: Db, id: string, claudeSessionId: string): void {
+    const res = db.prepare('UPDATE sessions SET claude_session_id = ? WHERE id = ?').run(claudeSessionId, id);
     if (res.changes === 0) throw new Error(`Session not found: ${id}`);
   },
   listLive(db: Db): SessionRow[] {
