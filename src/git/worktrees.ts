@@ -49,7 +49,7 @@ export async function branchExists(projectRoot: string, branch: string): Promise
 
 export async function ensureMissionBranch(projectRoot: string, baseBranch: string, missionBranch: string): Promise<void> {
   if (await branchExists(projectRoot, missionBranch)) return;
-  await git(projectRoot, ['branch', missionBranch, baseBranch]);
+  await git(projectRoot, ['branch', missionBranch, `refs/heads/${baseBranch}`]);
 }
 
 async function ensureExcluded(projectRoot: string): Promise<void> {

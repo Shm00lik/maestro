@@ -35,4 +35,18 @@ describe('Throttle', () => {
     t.onRateLimitedWithoutReset(now);
     expect(t.throttledUntil(now)).toBe(now + 60_000);
   });
+
+  it('allowed_warning does not throttle and a past resetsAt falls back to backoff', () => {
+    const t = new Throttle();
+    const now = 1_800_000_000_000;
+    t.onRateLimit(ev('allowed_warning', 1_800_000_600), now);
+    expect(t.throttledUntil(now)).toBeNull();
+    t.onRateLimit(ev('rejected', 1_799_999_000), now); // resetsAt already passed
+    expect(t.throttledUntil(now)).toBe(now + 60_000);
+    t.onRateLimit(ev('rejected', 1_799_999_000), now);
+    expect(t.throttledUntil(now)).toBe(now + 120_000);
+    // A warning while throttled leaves the throttle alone.
+    t.onRateLimit(ev('allowed_warning', 1_800_000_600), now);
+    expect(t.throttledUntil(now)).toBe(now + 120_000);
+  });
 });

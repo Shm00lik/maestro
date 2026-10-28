@@ -4,7 +4,7 @@
 import { EventEmitter } from 'node:events';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { mkdirSync, readFileSync } from 'node:fs';
 import { isAbsolute, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -61,6 +61,8 @@ export interface MissionEngineOptions {
   globalMaxParallel?: number;
   /** wait_for_tasks progress interval (default 60 s). */
   progressMs?: number;
+  /** Test hook: awaited right before the base-branch merge starts. */
+  beforeBaseMerge?: () => Promise<void>;
 }
 
 export type StartMissionInput = Omit<NewMission, 'missionBranch'> & {
@@ -71,7 +73,9 @@ export type StartMissionInput = Omit<NewMission, 'missionBranch'> & {
 
 export type MergeDecisionResult =
   | { outcome: 'merged' | 'kept' }
-  | { outcome: 'retry'; reason: string };
+  | { outcome: 'retry'; reason: string }
+  /** The mission was stopped while the merge was starting; the base branch is untouched. */
+  | { outcome: 'stopped' };
 
 type PlanResult = { errors: PlanError[] } | { approved: true } | { approved: false; note: string };
 
@@ -84,8 +88,12 @@ function deferred<T>(): Deferred<T> {
   return { promise, resolve, reject };
 }
 
-interface PlanWait { planPath: string; md: string; versionId: string; entryId: string; d: Deferred<PlanResult> }
-interface MergeWait { entryId: string; summary: string; busy: boolean; d: Deferred<'merge' | 'keep'> }
+interface PlanWait { planPath: string; hash: string; versionId: string; entryId: string; d: Deferred<PlanResult> }
+interface MergeWait {
+  entryId: string; summary: string; d: Deferred<'merge' | 'keep'>;
+  /** The base merge in flight (stop() waits for it). */
+  merging: Promise<MergeDecisionResult> | null;
+}
 
 interface MissionCtx {
   id: string;
@@ -96,13 +104,15 @@ interface MissionCtx {
   subagentUses: number;
   planWait: PlanWait | null;
   /** The last approved plan, so a re-call that raced the approval gets `{approved:true}` instead of a re-plan. */
-  lastPlan: { planPath: string; md: string; result: PlanResult } | null;
+  lastPlan: { planPath: string; hash: string; result: PlanResult } | null;
   mergeWait: MergeWait | null;
   stopPromise: Promise<void> | null;
   lingerTimer: NodeJS.Timeout | null;
+  /** Set by shutdown(): the conductor's exit must not touch the database. */
+  detached: boolean;
 }
 
-interface Waiter { check(): void }
+interface Waiter { check(): void; fail(err: Error): void }
 
 /** Calls `onSession` for every session the runner registers, so the engine sees each task's rate-limit events. */
 class EngineRegistry extends LiveSessionRegistry {
@@ -119,6 +129,7 @@ export function missionSlug(title: string): string {
   return s || 'mission';
 }
 
+const sha256 = (s: string): string => createHash('sha256').update(s).digest('hex');
 const mission8 = (id: string): string => id.replace(/[^A-Za-z0-9]/g, '').slice(0, 8);
 
 async function git(cwd: string, args: string[]): Promise<string> {
@@ -129,6 +140,15 @@ async function git(cwd: string, args: string[]): Promise<string> {
     const err = e as Error & { stderr?: string };
     throw new Error(`git ${args.join(' ')} failed in ${cwd}: ${(err.stderr ?? '').toString().trim() || err.message}`);
   }
+}
+
+/** Rejects empty names, a leading '-', '@{' and anything `git check-ref-format --branch` refuses. */
+async function checkBranchName(root: string, name: string, kind: 'base' | 'mission'): Promise<void> {
+  const bad = (why: string): Error => new Error(`Invalid ${kind} branch name "${name}": ${why}`);
+  if (!name || name.startsWith('-')) throw bad('it must not be empty or start with "-"');
+  if (name.includes('@{')) throw bad('it must not contain "@{"');
+  try { await git(root, ['check-ref-format', '--branch', name]); }
+  catch { throw bad('git check-ref-format rejects it'); }
 }
 
 export class MissionEngine extends EventEmitter implements BridgeHandlers {
@@ -144,6 +164,7 @@ export class MissionEngine extends EventEmitter implements BridgeHandlers {
   private scheduling = false;
   private scheduleAgain = false;
   private closed = false;
+  private shutdownPromise: Promise<void> | null = null;
   private hooked = new WeakSet<ClaudeSession>();
 
   constructor(private o: MissionEngineOptions) {
@@ -234,6 +255,14 @@ export class MissionEngine extends EventEmitter implements BridgeHandlers {
     const root = project.path;
 
     let branch = givenBranch || `maestro/${missionSlug(input.title)}`;
+    await checkBranchName(root, input.baseBranch, 'base');
+    await checkBranchName(root, branch, 'mission');
+    if (branch === input.baseBranch) {
+      throw new Error(`The mission branch is the same as the base branch (${branch}); choose another mission branch`);
+    }
+    if (!(await branchExists(root, input.baseBranch))) {
+      throw new Error(`Base branch ${input.baseBranch} does not exist in ${root}`);
+    }
     let m = missions.create(this.db, { ...rest, missionBranch: branch });
     try {
       if (!givenBranch && await branchExists(root, branch)) {
@@ -256,7 +285,7 @@ export class MissionEngine extends EventEmitter implements BridgeHandlers {
       });
       const c: MissionCtx = {
         id: m.id, projectRoot: root, runner, conductor: null, conductorRowId: null, subagentUses: 0,
-        planWait: null, lastPlan: null, mergeWait: null, stopPromise: null, lingerTimer: null,
+        planWait: null, lastPlan: null, mergeWait: null, stopPromise: null, lingerTimer: null, detached: false,
       };
       this.ctxs.set(m.id, c);
       runner.on('state', () => { this.flushEvents(); this.kick(); });
@@ -351,6 +380,7 @@ export class MissionEngine extends EventEmitter implements BridgeHandlers {
   }
 
   private onConductorExit(c: MissionCtx, code: number | null): void {
+    if (c.detached) return; // shutdown() ended the row itself and changes nothing else
     if (c.conductorRowId) {
       this.registry.delete(c.conductorRowId);
       try { sessions.end(this.db, c.conductorRowId, code === 0 ? 'ended' : 'failed'); } catch { /* already ended */ }
@@ -403,53 +433,67 @@ export class MissionEngine extends EventEmitter implements BridgeHandlers {
 
   async submitPlan(missionId: string, planPath: string): Promise<PlanResult> {
     const c = this.ctx(missionId);
+    if (c.stopPromise) throw new Error('The mission is stopping');
     const abs = this.resolvePlanPath(c, planPath);
-    // Idempotent: the same plan while its approval is pending re-attaches to the same wait.
-    if (c.planWait && c.planWait.planPath.toLowerCase() === abs.toLowerCase()) return c.planWait.d.promise;
+    let md: string;
+    try { md = readFileSync(abs, 'utf8'); } catch (e) { throw new Error(`Cannot read the plan file ${abs}: ${(e as Error).message}`); }
+    const hash = sha256(md);
+    const same = (x: { planPath: string; hash: string } | null): boolean =>
+      x !== null && x.planPath.toLowerCase() === abs.toLowerCase() && x.hash === hash;
+    // Idempotent: the same plan (path and content) while its approval is pending re-attaches to the same wait.
+    if (same(c.planWait)) return c.planWait!.d.promise;
+    // ...and a re-call that raced the approval gets the approval.
+    if (same(c.lastPlan)) return c.lastPlan!.result;
 
     const m = this.mission(missionId);
     if (!['understanding', 'planning', 'awaiting_approval', 'running'].includes(m.state)) {
       throw new Error(`Cannot submit a plan while the mission is ${m.state}`);
     }
-    let md: string;
-    try { md = readFileSync(abs, 'utf8'); } catch (e) { throw new Error(`Cannot read the plan file ${abs}: ${(e as Error).message}`); }
-    const last = c.lastPlan;
-    if (last && last.planPath.toLowerCase() === abs.toLowerCase() && last.md === md) return last.result;
     const planTasks = parsePlan(md);
     const errors = validatePlan(planTasks);
     if (errors.length > 0) return { errors };
 
+    const conflictErrors = (keys: string[]): { errors: PlanError[] } => ({
+      errors: keys.map(k => ({ code: 'duplicate-key' as const, taskKeys: [k], message: `${k} conflicts with an existing task; rename it` })),
+    });
     const existing = tasks.listByMission(this.db, missionId);
     const byKey = new Map(existing.map(t => [t.taskKey, t]));
     const conflicts = planTasks.filter(t => {
       const cur = byKey.get(t.key);
       return cur !== undefined && (cur.planVersionId === null || cur.state === 'cancelled');
     }).map(t => t.key);
-    if (conflicts.length > 0) {
-      return { errors: conflicts.map(k => ({ code: 'duplicate-key' as const, taskKeys: [k], message: `${k} conflicts with an existing task; rename it` })) };
+    if (conflicts.length > 0) return conflictErrors(conflicts);
+
+    // Plan version and tasks in one transaction: a conflict rolls both back, so no orphan version remains.
+    const graph = buildGraph(planTasks);
+    class Conflict extends Error { constructor(public keys: string[]) { super('conflict'); } }
+    let applied: { pvId: string; version: number; cancelled: string[]; runningUnplanned: string[] };
+    try {
+      applied = this.db.transaction(() => {
+        const max = (this.db.prepare('SELECT COALESCE(MAX(version), 0) AS v FROM plan_versions WHERE mission_id = ?')
+          .get(missionId) as { v: number }).v;
+        const pv = planVersions.create(this.db, { missionId, version: max + 1, planPath: abs, planMd: md });
+        if (max === 0 && existing.length === 0) {
+          tasks.insertPlan(this.db, missionId, pv.id, planTasks, graph);
+          return { pvId: pv.id, version: max + 1, cancelled: [], runningUnplanned: [] };
+        }
+        const r = tasks.applyReplan(this.db, missionId, pv.id, planTasks, graph);
+        if (r.conflicts.length > 0) throw new Conflict(r.conflicts);
+        return { pvId: pv.id, version: max + 1, cancelled: r.cancelled, runningUnplanned: r.runningUnplanned };
+      })();
+    } catch (e) {
+      if (e instanceof Conflict) return conflictErrors(e.keys);
+      throw e;
     }
 
-    // A different plan while one is pending supersedes it.
+    // A different plan (or the same file with new content) while one is pending supersedes it.
     if (c.planWait) {
       const old = c.planWait;
       c.planWait = null;
       inboxRepo.expire(this.db, old.entryId);
       old.d.resolve({ approved: false, note: 'Superseded by a newer submit_plan call.' });
     }
-
-    const graph = buildGraph(planTasks);
-    const max = (this.db.prepare('SELECT COALESCE(MAX(version), 0) AS v FROM plan_versions WHERE mission_id = ?')
-      .get(missionId) as { v: number }).v;
-    const pv = planVersions.create(this.db, { missionId, version: max + 1, planPath: abs, planMd: md });
-    let replan: { cancelled: string[]; runningUnplanned: string[] } = { cancelled: [], runningUnplanned: [] };
-    if (max === 0 && existing.length === 0) tasks.insertPlan(this.db, missionId, pv.id, planTasks, graph);
-    else {
-      const r = tasks.applyReplan(this.db, missionId, pv.id, planTasks, graph);
-      if (r.conflicts.length > 0) {
-        return { errors: r.conflicts.map(k => ({ code: 'duplicate-key' as const, taskKeys: [k], message: `${k} conflicts with an existing task; rename it` })) };
-      }
-      replan = r;
-    }
+    c.lastPlan = null;
 
     if (m.state === 'understanding') this.transition(missionId, 'understood');
     if (m.state === 'running') this.transition(missionId, 'replan');
@@ -457,11 +501,12 @@ export class MissionEngine extends EventEmitter implements BridgeHandlers {
     this.flushEvents();
 
     const entry = this.addEntry(missionId, 'plan_approval', {
-      planVersionId: pv.id, version: max + 1, planPath: abs, taskKeys: planTasks.map(t => t.key),
-      waves: graph.waves, criticalPath: graph.criticalPath, ...replan,
+      planVersionId: applied.pvId, version: applied.version, planPath: abs, taskKeys: planTasks.map(t => t.key),
+      waves: graph.waves, criticalPath: graph.criticalPath,
+      cancelled: applied.cancelled, runningUnplanned: applied.runningUnplanned,
     });
     const d = deferred<PlanResult>();
-    c.planWait = { planPath: abs, md, versionId: pv.id, entryId: entry.id, d };
+    c.planWait = { planPath: abs, hash, versionId: applied.pvId, entryId: entry.id, d };
     this.kick();
     return d.promise;
   }
@@ -470,11 +515,11 @@ export class MissionEngine extends EventEmitter implements BridgeHandlers {
     const c = this.ctx(missionId);
     const w = c.planWait;
     if (!w) throw new Error(`Mission ${missionId} has no plan waiting for approval`);
+    this.transition(missionId, 'approve'); // first: an illegal transition leaves the entry open
     inboxRepo.answer(this.db, w.entryId, { approved: true });
     planVersions.approve(this.db, w.versionId);
     c.planWait = null;
-    c.lastPlan = { planPath: w.planPath, md: w.md, result: { approved: true } };
-    this.transition(missionId, 'approve');
+    c.lastPlan = { planPath: w.planPath, hash: w.hash, result: { approved: true } };
     this.emit('inbox');
     w.d.resolve({ approved: true });
     this.kick();
@@ -484,10 +529,10 @@ export class MissionEngine extends EventEmitter implements BridgeHandlers {
     const c = this.ctx(missionId);
     const w = c.planWait;
     if (!w) throw new Error(`Mission ${missionId} has no plan waiting for approval`);
+    this.transition(missionId, 'replan');
     inboxRepo.answer(this.db, w.entryId, { approved: false, note });
     c.planWait = null;
     c.lastPlan = null; // an unchanged plan resubmitted after a note goes back to the user
-    this.transition(missionId, 'replan');
     this.emit('inbox');
     w.d.resolve({ approved: false, note });
   }
@@ -504,7 +549,10 @@ export class MissionEngine extends EventEmitter implements BridgeHandlers {
     }
     if (c.stopPromise) throw new Error('The mission is stopping');
     const cur = tasks.getByKey(this.db, missionId, d.task_id);
-    if (cur && cur.state !== 'planned' && cur.state !== 'failed') return { task_ref: cur.id }; // re-dispatch
+    if (cur && (cur.state === 'done' || cur.state === 'cancelled')) {
+      throw new Error(`Task ${d.task_id} is ${cur.state}; use a new task id for more work`);
+    }
+    if (cur && cur.state !== 'planned' && cur.state !== 'failed') return { task_ref: cur.id }; // re-dispatch (failed = retry)
     this.checkOwnership(missionId, d);
     const { task } = tasks.dispatch(this.db, missionId, {
       key: d.task_id, agent: d.agent, prompt: d.prompt, dependsOn: d.depends_on, owns: d.owns,
@@ -565,7 +613,8 @@ export class MissionEngine extends EventEmitter implements BridgeHandlers {
       if (!m) continue;
       const list = tasks.listByMission(this.db, c.id);
       runningByMission[c.id] = list.filter(t => t.state === 'running' || t.state === 'needs_you').length;
-      if (TERMINAL_MISSION_STATES.has(m.state) || c.stopPromise) continue;
+      // Only running missions start tasks (not while re-planning, finishing, stopping or ended).
+      if (m.state !== 'running' || c.stopPromise) continue;
       maxParallelByMission[c.id] = m.maxParallel;
       const done = new Set(list.filter(t => t.state === 'done').map(t => t.taskKey));
       for (const t of list) {
@@ -606,16 +655,14 @@ export class MissionEngine extends EventEmitter implements BridgeHandlers {
       return mode === 'any' ? states.some(s => WAIT_TERMINAL.has(s)) : states.every(s => WAIT_TERMINAL.has(s));
     };
     if (!isDone()) {
-      await new Promise<void>(res => {
+      if (this.closed) throw new Error('Maestro is shutting down');
+      await new Promise<void>((res, rej) => {
         const progress = setInterval(() => { try { onProgress(); } catch { /* ignore */ } }, this.o.progressMs ?? PROGRESS_MS);
         progress.unref();
+        const end = (): void => { clearInterval(progress); this.waiters.delete(w); };
         const w: Waiter = {
-          check: () => {
-            if (!isDone() && !this.closed) return;
-            clearInterval(progress);
-            this.waiters.delete(w);
-            res();
-          },
+          check: () => { if (isDone()) { end(); res(); } },
+          fail: (err: Error) => { end(); rej(err); },
         };
         this.waiters.add(w);
       });
@@ -656,13 +703,20 @@ export class MissionEngine extends EventEmitter implements BridgeHandlers {
 
   async finishMission(missionId: string, summary: string): Promise<'merge' | 'keep'> {
     const c = this.ctx(missionId);
+    if (c.stopPromise) throw new Error('The mission is stopping');
     if (c.mergeWait) return c.mergeWait.d.promise; // idempotent re-call
     const m = this.mission(missionId);
     if (m.state !== 'running') throw new Error(`Cannot finish the mission while it is ${m.state}`);
+    const active = tasks.listByMission(this.db, missionId).filter(t =>
+      ACTIVE_TASK_STATES.has(t.state) || (t.state === 'planned' && t.dispatchedAt !== null));
+    if (active.length > 0) {
+      throw new Error(`${active.length} tasks are still active: ${active.map(t => t.taskKey).join(', ')}; wait for them or stop them first`);
+    }
     this.transition(missionId, 'finish_requested');
     const d = deferred<'merge' | 'keep'>();
-    c.mergeWait = { entryId: '', summary, busy: false, d };
-    c.mergeWait.entryId = this.mergeEntry(m, summary).id;
+    const w: MergeWait = { entryId: '', summary, merging: null, d };
+    c.mergeWait = w;
+    w.entryId = this.mergeEntry(m, summary).id;
     return d.promise;
   }
 
@@ -684,7 +738,8 @@ export class MissionEngine extends EventEmitter implements BridgeHandlers {
       throw new Error(`Merge decision ${entryId} is not the mission's current one`);
     }
     if (answer !== MERGE && answer !== KEEP) throw new Error(`Answer must be one of the options: ${MERGE}, ${KEEP}`);
-    if (w.busy) throw new Error('A merge is already in progress');
+    if (c.stopPromise) throw new Error('The mission is stopping');
+    if (w.merging) throw new Error('A merge is already in progress');
     inboxRepo.answer(this.db, entryId, answer);
     this.emit('inbox');
     const m = this.mission(c.id);
@@ -698,22 +753,31 @@ export class MissionEngine extends EventEmitter implements BridgeHandlers {
       return { outcome: 'kept' };
     }
 
-    w.busy = true;
+    // stop() waits for this promise before it changes anything.
+    const merging = this.runMerge(c, w, m);
+    w.merging = merging;
+    try { return await merging; } finally { w.merging = null; }
+  }
+
+  private async runMerge(c: MissionCtx, w: MergeWait, m: Mission): Promise<MergeDecisionResult> {
     let res: { ok: true } | { ok: false; reason: string; files?: string[] };
     try { res = await this.mergeIntoBase(c, m); }
     catch (e) { res = { ok: false, reason: (e as Error).message }; }
-    finally { w.busy = false; }
 
     if (res.ok) {
-      this.transition(c.id, 'merged');
-      missions.setOutcome(this.db, c.id, 'merged');
-      this.emit('mission', this.mission(c.id));
+      // The base branch now has the work: record it even if a stop arrived meanwhile (stop waits for us).
+      if (this.mission(c.id).state === 'finishing') {
+        this.transition(c.id, 'merged');
+        missions.setOutcome(this.db, c.id, 'merged');
+        this.emit('mission', this.mission(c.id));
+      }
       try { await removeIntegrationWorktree(c.projectRoot, c.id); }
       catch (e) { this.warn(`remove integration worktree: ${(e as Error).message}`); }
       this.endMission(c);
       w.d.resolve('merge');
       return { outcome: 'merged' };
     }
+    if (c.stopPromise || this.mission(c.id).state !== 'finishing') return { outcome: 'stopped' };
     if (res.files) {
       this.appendEvent(c.id, 'merge-conflict', { files: res.files });
       // Informational: the answer itself is not needed (the user acts on the new merge decision).
@@ -730,8 +794,12 @@ export class MissionEngine extends EventEmitter implements BridgeHandlers {
   private async mergeIntoBase(c: MissionCtx, m: Mission): Promise<{ ok: true } | { ok: false; reason: string; files?: string[] }> {
     const root = c.projectRoot;
     const msg = `Maestro: ${m.title}`;
+    const stopped = { ok: false as const, reason: 'The mission is stopping' };
+    if (this.o.beforeBaseMerge) await this.o.beforeBaseMerge();
+    if (c.stopPromise) return stopped;
     const head = await git(root, ['rev-parse', '--abbrev-ref', 'HEAD']).catch(() => '');
     const clean = (await git(root, ['status', '--porcelain'])) === '';
+    if (c.stopPromise) return stopped;
     if (head === m.baseBranch && clean) return this.mergeIn(root, m.missionBranch, msg);
 
     const list = await git(root, ['worktree', 'list', '--porcelain']);
@@ -740,8 +808,9 @@ export class MissionEngine extends EventEmitter implements BridgeHandlers {
       return { ok: false, reason: `Check out ${m.baseBranch} or commit your changes, then choose Merge again` };
     }
     const dir = worktreeDirFor(root, c.id, `merge-${randomUUID().slice(0, 6)}`);
-    await git(root, ['worktree', 'add', dir, m.baseBranch]);
+    await git(root, ['worktree', 'add', '--', dir, m.baseBranch]);
     try {
+      if (c.stopPromise) return stopped;
       return await this.mergeIn(dir, m.missionBranch, msg);
     } finally {
       try { await removeWorktree(root, dir); } catch (e) { this.warn(`remove merge worktree: ${(e as Error).message}`); }
@@ -750,7 +819,7 @@ export class MissionEngine extends EventEmitter implements BridgeHandlers {
 
   private async mergeIn(cwd: string, branch: string, msg: string): Promise<{ ok: true } | { ok: false; reason: string; files?: string[] }> {
     try {
-      await git(cwd, ['merge', '--no-ff', '-m', msg, branch]);
+      await git(cwd, ['merge', '--no-ff', '-m', msg, `refs/heads/${branch}`]);
       return { ok: true };
     } catch (e) {
       const files = (await git(cwd, ['diff', '--name-only', '--diff-filter=U']).catch(() => ''))
@@ -768,17 +837,21 @@ export class MissionEngine extends EventEmitter implements BridgeHandlers {
     this.kick();
   }
 
-  // ---- stop / close ------------------------------------------------------------
+  // ---- stop / shutdown ---------------------------------------------------------
 
   /** Stops every task run and the conductor, expires open entries, mission `stop`. Idempotent. */
   stop(missionId: string): Promise<void> {
     const c = this.ctxs.get(missionId);
     if (!c) return Promise.reject(new Error(`Unknown mission: ${missionId}`));
-    if (!c.stopPromise) c.stopPromise = this.runStop(c);
+    // Set before runStop starts, so every handler sees the stop at once.
+    if (!c.stopPromise) c.stopPromise = Promise.resolve().then(() => this.runStop(c));
     return c.stopPromise;
   }
 
   private async runStop(c: MissionCtx): Promise<void> {
+    // A base merge in flight finishes first: the mission then ends merged, or stops with the base untouched.
+    const merging = c.mergeWait?.merging;
+    if (merging) await merging.catch(() => undefined);
     const stopped = new Error('The mission was stopped');
     if (c.planWait) { const w = c.planWait; c.planWait = null; w.d.reject(stopped); }
     if (c.mergeWait) { const w = c.mergeWait; c.mergeWait = null; w.d.reject(stopped); }
@@ -798,19 +871,48 @@ export class MissionEngine extends EventEmitter implements BridgeHandlers {
     this.flushEvents();
   }
 
-  /** Stops every mission still running, ends lingering conductors and closes the bridge server. */
-  async close(): Promise<void> {
-    if (this.tick) { clearInterval(this.tick); this.tick = null; }
-    const all = [...this.ctxs.values()];
-    await Promise.all(all.map(async c => {
+  /** Stops every mission that has not ended (e.g. for tests). Unlike shutdown(), this changes states. */
+  async stopAll(): Promise<void> {
+    await Promise.all([...this.ctxs.values()].map(async c => {
       const m = missions.get(this.db, c.id);
       if (m && !TERMINAL_MISSION_STATES.has(m.state)) await this.stop(c.id).catch(() => undefined);
+    }));
+  }
+
+  /**
+   * App shutdown. Changes no mission, task or inbox state: pending handler calls are rejected in memory, every live
+   * conductor and task process is killed and only its session row ends ('live' to 'ended'), so recovery can resume
+   * them. Then the runners are disposed and the bridge closes. Idempotent.
+   */
+  shutdown(): Promise<void> {
+    if (!this.shutdownPromise) this.shutdownPromise = this.runShutdown();
+    return this.shutdownPromise;
+  }
+
+  private async runShutdown(): Promise<void> {
+    this.closed = true;
+    if (this.tick) { clearInterval(this.tick); this.tick = null; }
+    const err = new Error('Maestro is shutting down');
+    for (const c of this.ctxs.values()) {
       if (c.lingerTimer) { clearTimeout(c.lingerTimer); c.lingerTimer = null; }
-      if (c.conductor) await c.conductor.stop(this.o.stopTimeoutMs ?? 5000).catch(() => undefined);
+      if (c.planWait) { const w = c.planWait; c.planWait = null; w.d.reject(err); }
+      if (c.mergeWait) { const w = c.mergeWait; c.mergeWait = null; w.d.reject(err); }
+    }
+    for (const w of [...this.waiters]) w.fail(err);
+    this.inbox.detachPending(err);
+    await Promise.all([...this.ctxs.values()].map(async c => {
+      await c.runner.detachAll().catch(e => this.warn(`detach tasks: ${(e as Error).message}`));
+      c.detached = true;
+      const rowId = c.conductorRowId;
+      if (rowId) {
+        this.registry.delete(rowId);
+        if (sessions.listLive(this.db).some(s => s.id === rowId)) sessions.end(this.db, rowId, 'ended');
+      }
+      if (c.conductor && c.conductor.status !== 'exited') {
+        await c.conductor.kill().catch(e => this.warn(`conductor kill: ${(e as Error).message}`));
+      }
       c.runner.dispose();
     }));
-    this.closed = true;
-    for (const w of [...this.waiters]) w.check();
     const b = this.bridge;
     this.bridge = null;
     if (b) await b.then(x => x.close(), () => undefined);

@@ -1,5 +1,6 @@
-// Global start throttle (spec §8.2): after a rate-limit event whose status is not `allowed`, new task starts pause
-// until `resetsAt`, or, without one, for an exponential backoff of 1, 2, 4 ... minutes (capped at 30).
+// Global start throttle (spec §8.2): after a rate-limit event whose status is not `allowed` or `allowed_warning`,
+// new task starts pause until `resetsAt`, or, without one (or with one in the past), for an exponential backoff of
+// 1, 2, 4 ... minutes (capped at 30).
 import type { StreamEvent } from '../claude/protocol.js';
 import { nextBackoffMs } from '../core/scheduler/scheduler.js';
 
@@ -15,8 +16,11 @@ export class Throttle {
       this.lastBackoffMs = null;
       return;
     }
-    if (ev.resetsAt !== null && Number.isFinite(ev.resetsAt)) this.until = ev.resetsAt * 1000; // resetsAt is in seconds
-    else this.onRateLimitedWithoutReset(now);
+    if (ev.status === 'allowed_warning') return; // still allowed: neither throttles nor clears
+    const at = ev.resetsAt !== null && Number.isFinite(ev.resetsAt) ? ev.resetsAt * 1000 : null; // resetsAt is in seconds
+    if (at !== null && at > now) this.until = at;
+    else this.onRateLimitedWithoutReset(now); // no resetsAt, or one already in the past
+
   }
 
   onRateLimitedWithoutReset(now: number): void {

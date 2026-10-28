@@ -148,6 +148,13 @@ export class InboxService extends EventEmitter {
     if (expired.length > 0) this.changed(missionId, null);
   }
 
+  /** Shutdown: rejects every pending ask in memory; the entries stay open in the database. */
+  detachPending(err: Error): void {
+    const all = [...this.pending.values()];
+    this.pending.clear();
+    for (const p of all) p.reject(err);
+  }
+
   private rejectPending(entries: InboxEntry[]): void {
     for (const e of entries) {
       const pend = this.pending.get(e.id);

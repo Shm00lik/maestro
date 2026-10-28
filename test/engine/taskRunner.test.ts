@@ -288,6 +288,26 @@ describe('TaskRunner', () => {
     expect((await finished(c)).outcome).toBe('done');
   }, 15000);
 
+  it('detachAll kills the process without changing task state or expiring its inbox entries', async () => {
+    const c = setup([INIT(), USER, PERM('r1', 'npm test'), { waitFor: 'permission-answer', timeoutMs: 60_000 }, RESULT(HANDOFF), STDIN_CLOSE]);
+    await c.runner.start(c.task.id, []);
+    await waitState(c, 'needs_you');
+    const [row] = sessions.listLive(c.db);
+    expect(alive(row.pid!)).toBe(true);
+    await c.runner.detachAll();
+    await c.runner.detachAll(); // idempotent
+    expect(getTask(c).state).toBe('needs_you');
+    expect(inbox.openCountForTask(c.db, c.task.id)).toBe(1);
+    expect(sessions.listLive(c.db)).toHaveLength(0);
+    expect((c.db.prepare('SELECT state FROM sessions WHERE id = ?').get(row.id) as { state: string }).state).toBe('ended');
+    expect(c.registry.size).toBe(0);
+    for (let i = 0; i < 50 && alive(row.pid!); i++) await sleep(50);
+    expect(alive(row.pid!)).toBe(false);
+    await sleep(200);
+    expect(c.finished).toEqual([]);
+    expect(getTask(c).failureReason).toBeNull();
+  }, 15000);
+
   it('stop is idempotent and expires pending permissions', async () => {
     const c = setup([
       INIT(), USER, PERM('r1', 'npm test'), PERM('r2', 'npm run lint'), { waitFor: 'interrupt' },

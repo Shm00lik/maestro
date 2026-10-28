@@ -318,6 +318,34 @@ export class TaskRunner extends EventEmitter {
     return run.stopPromise;
   }
 
+  /**
+   * App shutdown: kills the task's live process (tree) and ends its session row, with no other change. The task
+   * keeps its state and its inbox entries stay open, so recovery can resume it. No 'finished' is emitted.
+   * Waits for an in-progress start, finish, fail or stop first. Idempotent.
+   */
+  async detach(taskId: string): Promise<void> {
+    const run = this.runs.get(taskId);
+    if (!run) return;
+    run.stopRequested = true; // a start still preparing its worktree spawns nothing
+    await run.ready;
+    if (run.stopPromise) { await run.stopPromise; return; }
+    if (run.finishing) await run.finishing;
+    if (run.failing) await run.failing;
+    if (run.phase === 'ended') return;
+    run.phase = 'ended';
+    run.finished = true;
+    const s = run.session;
+    if (s && s.status !== 'exited') {
+      try { await s.kill(); } catch (e) { this.warn(`detach kill: ${(e as Error).message}`); }
+    }
+    this.safe('end session row', () => this.endSessionRow(run, 'ended'));
+  }
+
+  /** detach() for every run of this runner. */
+  async detachAll(): Promise<void> {
+    await Promise.all([...this.runs.keys()].map(id => this.detach(id)));
+  }
+
   private async runStop(run: Run): Promise<void> {
     await run.ready;
     if (run.finishing) await run.finishing;

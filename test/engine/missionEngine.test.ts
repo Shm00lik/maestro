@@ -8,7 +8,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { openDb, type Db } from '../../src/store/db.js';
-import { events, inbox, missions, projects, tasks, usageWindow, type InboxEntry, type Mission } from '../../src/store/repos.js';
+import { events, inbox, missions, projects, sessions, tasks, usageWindow, type InboxEntry, type Mission } from '../../src/store/repos.js';
 import { Expired } from '../../src/store/repos.js';
 import { MissionEngine } from '../../src/engine/missionEngine.js';
 
@@ -37,6 +37,7 @@ const UNTIL_INTERRUPT = [{ waitFor: 'interrupt', timeoutMs: 120_000 }, ABORTED];
 const CONDUCTOR_IDLE = [INIT, USER, ...UNTIL_INTERRUPT];
 const TASK_DONE = [INIT, USER, { writeFile: 'out-$SESSION.txt', content: 'work\n' }, RESULT('Did it.\n\n## Handoff\nMade a file.'), { waitFor: 'stdin-close' }];
 const TASK_HANG = [INIT, USER, ...UNTIL_INTERRUPT];
+const TASK_SLOW = [INIT, USER, { sleepMs: 1500 }, ...TASK_DONE.slice(2)];
 const ASSISTANT_TASK_TOOL = {
   emit: {
     type: 'assistant', parent_tool_use_id: null,
@@ -125,7 +126,7 @@ beforeEach(() => {
 });
 
 afterEach(async () => {
-  if (engine) { await engine.close(); engine = null; }
+  if (engine) { await engine.shutdown(); engine = null; }
   db.close();
   try {
     const wts = git(root, 'worktree', 'list', '--porcelain').split('\n')
@@ -136,23 +137,28 @@ afterEach(async () => {
   rmSync(dir, { recursive: true, force: true, maxRetries: 3 });
 });
 
-function makeEngine(taskSteps: object[], conductorSteps: object[] = CONDUCTOR_IDLE): MissionEngine {
+function makeEngine(
+  taskSteps: object[], conductorSteps: object[] = CONDUCTOR_IDLE, beforeBaseMerge?: () => Promise<void>,
+): MissionEngine {
   const taskScenario = join(dir, 'task-scenario.json');
   const condScenario = join(dir, 'conductor-scenario.json');
   writeFileSync(taskScenario, JSON.stringify({ steps: taskSteps }));
   writeFileSync(condScenario, JSON.stringify({ steps: conductorSteps }));
   engine = new MissionEngine({
-    db, logDir: join(dir, 'logs'), command, stopTimeoutMs: 1500, progressMs: 100,
+    db, logDir: join(dir, 'logs'), command, stopTimeoutMs: 1500, progressMs: 100, beforeBaseMerge,
     env: { FAKE_CLAUDE_SCENARIO: taskScenario, FAKE_CLAUDE_LOG: join(dir, 'fake.jsonl') },
     conductorEnv: { FAKE_CLAUDE_SCENARIO: condScenario, FAKE_CLAUDE_LOG: join(dir, 'conductor.jsonl') },
   });
   return engine;
 }
 
-const start = (e: MissionEngine, title = 'Fix login'): Promise<Mission> => e.startMission({
-  projectId, title, brief: 'Make login work.', depth: 'thorough', baseBranch: 'main', missionBranch: '',
-  isolation: 'worktree', maxParallel: 3, quick: true,
+const start = (e: MissionEngine, title = 'Fix login', o: { maxParallel?: number; baseBranch?: string; missionBranch?: string } = {}): Promise<Mission> => e.startMission({
+  projectId, title, brief: 'Make login work.', depth: 'thorough', baseBranch: o.baseBranch ?? 'main',
+  missionBranch: o.missionBranch ?? '', isolation: 'worktree', maxParallel: o.maxParallel ?? 3, quick: true,
 });
+const ref = (r: { task_ref: string } | { error: string }): string => (r as { task_ref: string }).task_ref;
+const versions = (missionId: string): number =>
+  (db.prepare('SELECT COUNT(*) AS n FROM plan_versions WHERE mission_id = ?').get(missionId) as { n: number }).n;
 
 const writePlan = (text: string, name = 'plan.md'): string => {
   const p = join(dir, name); // outside the repo, so the main checkout stays clean
@@ -238,6 +244,34 @@ describe('MissionEngine', () => {
     expect(await third).toEqual({ approved: true });
     expect(tasks.listByMission(db, m.id).map(t => [t.taskKey, t.state])).toEqual(
       [['T1', 'planned'], ['T2', 'cancelled'], ['T3', 'cancelled']]);
+
+    // A cancelled key can't be dispatched, and re-introducing it in a plan is an error that leaves no plan version.
+    await expect(e.dispatchTask(m.id, { task_id: 'T2', agent: 'implementer', prompt: 'p', depends_on: [], owns: [] }))
+      .rejects.toThrow(/T2 is cancelled/);
+    const before = versions(m.id);
+    const again = await e.submitPlan(m.id, writePlan(PLAN, 'plan3.md'));
+    expect('errors' in again && again.errors.map(x => x.message)).toEqual(
+      expect.arrayContaining(['T2 conflicts with an existing task; rename it']));
+    expect(versions(m.id)).toBe(before);
+    expect(mission(m.id).state).toBe('running');
+  }, T);
+
+  it('submit_plan with the same path but new content supersedes the pending wait', async () => {
+    const e = makeEngine(TASK_HANG);
+    const m = await start(e);
+    const path = writePlan(PLAN);
+    const first = e.submitPlan(m.id, path);
+    const firstEntry = await until(() => openEntry(m.id, 'plan_approval'));
+    writePlan(PLAN_SRC); // same file, edited
+    const second = e.submitPlan(m.id, path);
+    expect(await first).toEqual({ approved: false, note: expect.stringMatching(/superseded/i) });
+    expect(inbox.get(db, firstEntry.id)!.state).toBe('expired');
+    const entry = await until(() => openEntry(m.id, 'plan_approval'));
+    expect(entry.id).not.toBe(firstEntry.id);
+    expect(versions(m.id)).toBe(2);
+    e.approvePlan(m.id);
+    expect(await second).toEqual({ approved: true });
+    expect(tasks.listByMission(db, m.id).filter(t => t.state === 'planned').map(t => t.taskKey)).toEqual(['T1']);
   }, T);
 
   it('dispatch_task rejects ownership overlap with a running task', async () => {
@@ -407,5 +441,120 @@ describe('MissionEngine', () => {
     expect(tasks.get(db, ref)!.state).toBe('cancelled');
     await until(() => !alive(conductorPid));
     expect(readFileSync(join(dir, 'conductor.jsonl'), 'utf8')).toContain('Make login work.');
+  }, T);
+
+  it('shutdown keeps mission, task and inbox state and leaves no live process', async () => {
+    const e = makeEngine(TASK_HANG);
+    const m = await start(e);
+    await approved(e, m, PLAN_SRC);
+    const r = ref(await e.dispatchTask(m.id, { task_id: 'T1', agent: 'implementer', prompt: 'p', depends_on: [], owns: ['src/**'] }));
+    await until(() => tasks.get(db, r)!.state === 'running');
+    const asked = e.askUser(m.id, null, { question: 'Which DB?' }).catch((x: unknown) => x);
+    const entry = await until(() => openEntry(m.id, 'question'));
+    const waited = e.waitForTasks(m.id, [r], 'all', () => {}).catch((x: unknown) => x);
+    const live = await until(() => { const l = sessions.listLive(db); return l.length === 2 && l; });
+    expect(live.map(s => s.role).sort()).toEqual(['conductor', 'implementer']);
+    const stateEvents = (): number => events.list(db, m.id).filter(x => x.type === 'state').length;
+    const stateBefore = stateEvents();
+
+    await e.shutdown();
+    await e.shutdown(); // idempotent
+    expect(mission(m.id).state).toBe('running');
+    expect(tasks.get(db, r)!.state).toBe('running');
+    expect(inbox.get(db, entry.id)!.state).toBe('open');
+    expect(sessions.listLive(db)).toHaveLength(0);
+    for (const s of live) {
+      expect((db.prepare('SELECT state FROM sessions WHERE id = ?').get(s.id) as { state: string }).state).toBe('ended');
+    }
+    await until(() => live.every(s => !alive(s.pid!)));
+    expect(await asked).toBeInstanceOf(Error);
+    expect(await waited).toBeInstanceOf(Error);
+    await sleep(300);
+    expect(stateEvents()).toBe(stateBefore);
+    expect(mission(m.id).state).toBe('running');
+    expect(tasks.get(db, r)!.state).toBe('running');
+  }, T);
+
+  it('finish_mission is rejected while dispatched tasks are still active', async () => {
+    const e = makeEngine(TASK_HANG);
+    const m = await start(e);
+    await approved(e, m, PLAN);
+    await e.dispatchTask(m.id, { task_id: 'T1', agent: 'implementer', prompt: 'p', depends_on: [], owns: ['a/**'] });
+    // T2 and T3 stay planned (never dispatched) and do not block.
+    await expect(e.finishMission(m.id, 's')).rejects.toThrow('1 tasks are still active: T1; wait for them or stop them first');
+    expect(mission(m.id).state).toBe('running');
+    expect(openEntry(m.id, 'merge_decision')).toBeUndefined();
+  }, T);
+
+  it('does not start ready tasks while the mission is not running', async () => {
+    const e = makeEngine(TASK_SLOW);
+    const m = await start(e, 'Fix login', { maxParallel: 1 });
+    await approved(e, m, PLAN);
+    const r1 = ref(await e.dispatchTask(m.id, { task_id: 'T1', agent: 'implementer', prompt: 'p', depends_on: [], owns: ['a/**'] }));
+    const r2 = ref(await e.dispatchTask(m.id, { task_id: 'T2', agent: 'implementer', prompt: 'p', depends_on: [], owns: ['b/**'] }));
+    await until(() => tasks.get(db, r1)!.state === 'running');
+    expect(tasks.get(db, r2)!.state).toBe('ready'); // the mission allows one at a time
+    const replan = e.submitPlan(m.id, writePlan(PLAN, 'replan.md'));
+    await until(() => openEntry(m.id, 'plan_approval'));
+    expect(mission(m.id).state).toBe('awaiting_approval');
+    await until(() => tasks.get(db, r1)!.state === 'done');
+    await sleep(1500); // at least one scheduler tick
+    expect(tasks.get(db, r2)!.state).toBe('ready');
+    e.approvePlan(m.id);
+    expect(await replan).toEqual({ approved: true });
+    await until(() => tasks.get(db, r2)!.state !== 'ready');
+    expect(['running', 'done']).toContain(tasks.get(db, r2)!.state);
+  }, T);
+
+  it('stop during a slow base merge leaves a consistent state', async () => {
+    let entered!: () => void;
+    const inMerge = new Promise<void>(r => { entered = r; });
+    let release!: () => void;
+    const gate = new Promise<void>(r => { release = r; });
+    const e = makeEngine(TASK_DONE, CONDUCTOR_IDLE, async () => { entered(); await gate; });
+    const m = await start(e);
+    const base = git(root, 'rev-parse', 'main');
+    await approved(e, m, PLAN_SRC);
+    const r = ref(await e.dispatchTask(m.id, { task_id: 'T1', agent: 'implementer', prompt: 'p', depends_on: [], owns: ['src/**'] }));
+    await e.waitForTasks(m.id, [r], 'all', () => {});
+    const fin = e.finishMission(m.id, 'Done.').catch((x: unknown) => x);
+    const entry = await until(() => openEntry(m.id, 'merge_decision'));
+    const answer = e.answerMergeDecision(entry.id, 'Merge').catch((x: unknown) => x);
+    await inMerge;
+    const stopped = e.stop(m.id);
+    expect(await pending(stopped)).toBe(true); // stop waits for the merge in flight
+    release();
+    await stopped;
+    await answer;
+    await fin;
+    const after = mission(m.id);
+    const baseMerged = git(root, 'rev-parse', 'main') !== base;
+    if (baseMerged) expect([after.state, after.outcome]).toEqual(['done', 'merged']);
+    else expect(after.state).toBe('stopped');
+    expect(after.state === 'stopped' && baseMerged).toBe(false);
+    expect(inbox.listOpen(db, Date.now()).filter(x => x.missionId === m.id)).toHaveLength(0);
+  }, T);
+
+  it('submit_plan and finish_mission are rejected while the mission is stopping', async () => {
+    const e = makeEngine(TASK_HANG);
+    const m = await start(e);
+    const stopping = e.stop(m.id);
+    await expect(e.submitPlan(m.id, writePlan(PLAN))).rejects.toThrow(/stopping/);
+    await expect(e.finishMission(m.id, 's')).rejects.toThrow(/stopping/);
+    await expect(e.dispatchTask(m.id, { task_id: 'T1', agent: 'implementer', prompt: 'p', depends_on: [], owns: [] })).rejects.toThrow();
+    await stopping;
+    expect(versions(m.id)).toBe(0);
+  }, T);
+
+  it('startMission validates branch names before creating anything', async () => {
+    const e = makeEngine(TASK_HANG);
+    const count = (): number => (db.prepare('SELECT COUNT(*) AS n FROM missions').get() as { n: number }).n;
+    await expect(start(e, 'x', { missionBranch: 'main' })).rejects.toThrow(/same as the base branch/);
+    await expect(start(e, 'x', { baseBranch: '-main' })).rejects.toThrow(/invalid base branch/i);
+    await expect(start(e, 'x', { missionBranch: '--force' })).rejects.toThrow(/invalid mission branch/i);
+    await expect(start(e, 'x', { missionBranch: 'bad..name' })).rejects.toThrow(/invalid mission branch/i);
+    await expect(start(e, 'x', { baseBranch: 'nope' })).rejects.toThrow(/does not exist/);
+    expect(count()).toBe(0);
+    expect(git(root, 'branch', '--list')).not.toMatch(/bad|force/);
   }, T);
 });
