@@ -1,16 +1,18 @@
-CREATE TABLE IF NOT EXISTS projects (
+-- Migration 1: baseline schema. Applied once by openDb (see MIGRATIONS in db.ts).
+CREATE TABLE projects (
   id TEXT PRIMARY KEY,
   name TEXT NOT NULL,
   path TEXT NOT NULL,
   created_at INTEGER NOT NULL,
   last_used_at INTEGER NOT NULL
 );
-CREATE TABLE IF NOT EXISTS missions (
+CREATE TABLE missions (
   id TEXT PRIMARY KEY,
   project_id TEXT NOT NULL REFERENCES projects(id),
   title TEXT NOT NULL,
   brief TEXT NOT NULL,
-  state TEXT NOT NULL,
+  state TEXT NOT NULL CHECK (state IN ('draft','understanding','planning','awaiting_approval','running',
+    'paused','finishing','done','stopped','failed')),
   depth TEXT NOT NULL,
   base_branch TEXT NOT NULL,
   mission_branch TEXT NOT NULL,
@@ -21,15 +23,16 @@ CREATE TABLE IF NOT EXISTS missions (
   created_at INTEGER NOT NULL,
   ended_at INTEGER
 );
-CREATE TABLE IF NOT EXISTS plan_versions (
+CREATE TABLE plan_versions (
   id TEXT PRIMARY KEY,
   mission_id TEXT NOT NULL REFERENCES missions(id),
   version INTEGER NOT NULL,
   plan_path TEXT NOT NULL,
   plan_md TEXT NOT NULL,
-  approved_at INTEGER
+  approved_at INTEGER,
+  UNIQUE (mission_id, version)
 );
-CREATE TABLE IF NOT EXISTS tasks (
+CREATE TABLE tasks (
   id TEXT PRIMARY KEY,
   mission_id TEXT NOT NULL REFERENCES missions(id),
   plan_version_id TEXT NOT NULL REFERENCES plan_versions(id),
@@ -37,7 +40,7 @@ CREATE TABLE IF NOT EXISTS tasks (
   title TEXT NOT NULL,
   agent TEXT NOT NULL,
   prompt TEXT NOT NULL,
-  state TEXT NOT NULL,
+  state TEXT NOT NULL CHECK (state IN ('waiting','ready','running','needs_you','done','failed','cancelled')),
   depends_on_json TEXT NOT NULL,
   owns_json TEXT NOT NULL,
   acceptance TEXT NOT NULL,
@@ -51,21 +54,22 @@ CREATE TABLE IF NOT EXISTS tasks (
   started_at INTEGER,
   ended_at INTEGER,
   tokens_in INTEGER NOT NULL DEFAULT 0,
-  tokens_out INTEGER NOT NULL DEFAULT 0
+  tokens_out INTEGER NOT NULL DEFAULT 0,
+  UNIQUE (plan_version_id, task_key)
 );
-CREATE TABLE IF NOT EXISTS inbox (
+CREATE TABLE inbox (
   id TEXT PRIMARY KEY,
   mission_id TEXT NOT NULL REFERENCES missions(id),
   task_id TEXT REFERENCES tasks(id),
-  kind TEXT NOT NULL,
+  kind TEXT NOT NULL CHECK (kind IN ('question','plan_approval','permission','review_decision','merge_decision')),
   payload_json TEXT NOT NULL,
-  state TEXT NOT NULL,
+  state TEXT NOT NULL CHECK (state IN ('open','answered')),
   answer_json TEXT,
   created_at INTEGER NOT NULL,
   answered_at INTEGER,
   snoozed_until INTEGER
 );
-CREATE TABLE IF NOT EXISTS sessions (
+CREATE TABLE sessions (
   id TEXT PRIMARY KEY,
   mission_id TEXT NOT NULL REFERENCES missions(id),
   task_id TEXT REFERENCES tasks(id),
@@ -77,7 +81,7 @@ CREATE TABLE IF NOT EXISTS sessions (
   started_at INTEGER NOT NULL,
   ended_at INTEGER
 );
-CREATE TABLE IF NOT EXISTS events (
+CREATE TABLE events (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   mission_id TEXT NOT NULL REFERENCES missions(id),
   task_id TEXT REFERENCES tasks(id),
@@ -85,6 +89,6 @@ CREATE TABLE IF NOT EXISTS events (
   type TEXT NOT NULL,
   data_json TEXT NOT NULL
 );
-CREATE INDEX IF NOT EXISTS idx_tasks_mission ON tasks(mission_id);
-CREATE INDEX IF NOT EXISTS idx_inbox_mission ON inbox(mission_id, state);
-CREATE INDEX IF NOT EXISTS idx_events_mission ON events(mission_id, id);
+CREATE INDEX idx_tasks_mission ON tasks(mission_id);
+CREATE INDEX idx_inbox_mission ON inbox(mission_id, state);
+CREATE INDEX idx_events_mission ON events(mission_id, id);

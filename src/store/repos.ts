@@ -15,6 +15,14 @@ function checkState<T extends string>(kind: string, known: readonly string[], v:
   return v as T;
 }
 
+/** Thrown by inbox.answer when the entry has already been answered. */
+export class AlreadyAnswered extends Error {
+  constructor(public id: string) {
+    super(`Inbox entry already answered: ${id}`);
+    this.name = 'AlreadyAnswered';
+  }
+}
+
 export interface Project { id: string; name: string; path: string; createdAt: number; lastUsedAt: number }
 
 export interface NewMission {
@@ -128,7 +136,8 @@ export const planVersions = {
     return { id };
   },
   approve(db: Db, id: string): void {
-    db.prepare('UPDATE plan_versions SET approved_at = ? WHERE id = ?').run(Date.now(), id);
+    const res = db.prepare('UPDATE plan_versions SET approved_at = ? WHERE id = ?').run(Date.now(), id);
+    if (res.changes === 0) throw new Error(`Plan version not found: ${id}`);
   },
 };
 
@@ -155,7 +164,13 @@ export const tasks = {
       if (!r) throw new Error(`Task not found: ${id}`);
       const from = checkState<TaskState>('task', TASK_STATES, r.state);
       const to = nextTaskState(from, ev);
-      db.prepare('UPDATE tasks SET state = ? WHERE id = ?').run(to, id);
+      // started_at: set on start. ended_at: set on entering done/failed/cancelled, cleared on retry.
+      const now = Date.now();
+      const started = ev === 'start' ? now : null;
+      const ended = to === 'done' || to === 'failed' || to === 'cancelled' ? now : null;
+      db.prepare(`UPDATE tasks SET state = ?, started_at = COALESCE(?, started_at),
+        ended_at = CASE WHEN ? THEN NULL ELSE COALESCE(?, ended_at) END WHERE id = ?`)
+        .run(to, started, ev === 'retry' ? 1 : 0, ended, id);
       appendEvent(db, { missionId: r.mission_id, taskId: id, type: 'state', data: { from, to, event: ev } });
       return toTask(db.prepare('SELECT * FROM tasks WHERE id = ?').get(id) as Row);
     })();
@@ -164,8 +179,9 @@ export const tasks = {
     return (db.prepare('SELECT * FROM tasks WHERE mission_id = ? ORDER BY rowid').all(missionId) as Row[]).map(toTask);
   },
   addUsage(db: Db, id: string, tokensIn: number, tokensOut: number): void {
-    db.prepare('UPDATE tasks SET tokens_in = tokens_in + ?, tokens_out = tokens_out + ? WHERE id = ?')
+    const res = db.prepare('UPDATE tasks SET tokens_in = tokens_in + ?, tokens_out = tokens_out + ? WHERE id = ?')
       .run(tokensIn, tokensOut, id);
+    if (res.changes === 0) throw new Error(`Task not found: ${id}`);
   },
 };
 
@@ -178,10 +194,15 @@ export const inbox = {
     return toInbox(db.prepare('SELECT * FROM inbox WHERE id = ?').get(id) as Row);
   },
   answer(db: Db, id: string, answer: unknown): InboxEntry {
-    const res = db.prepare("UPDATE inbox SET state = 'answered', answer_json = ?, answered_at = ? WHERE id = ?")
-      .run(JSON.stringify(answer ?? null), Date.now(), id);
-    if (res.changes === 0) throw new Error(`Inbox entry not found: ${id}`);
-    return toInbox(db.prepare('SELECT * FROM inbox WHERE id = ?').get(id) as Row);
+    return db.transaction(() => {
+      const res = db.prepare(
+        "UPDATE inbox SET state = 'answered', answer_json = ?, answered_at = ? WHERE id = ? AND state = 'open'",
+      ).run(JSON.stringify(answer ?? null), Date.now(), id);
+      const r = db.prepare('SELECT * FROM inbox WHERE id = ?').get(id) as Row | undefined;
+      if (!r) throw new Error(`Inbox entry not found: ${id}`);
+      if (res.changes === 0) throw new AlreadyAnswered(id);
+      return toInbox(r);
+    })();
   },
   listOpen(db: Db, now: number): InboxEntry[] {
     return (db.prepare(`SELECT * FROM inbox WHERE state = 'open' AND (snoozed_until IS NULL OR snoozed_until <= ?)
@@ -191,11 +212,12 @@ export const inbox = {
 
 export const events = {
   append(db: Db, e: NewEvent): void { appendEvent(db, e); },
-  list(db: Db, missionId: string, opts: { taskId?: string; limit?: number } = {}): EventRow[] {
+  /** Events by id. order 'desc' returns newest first (with limit: the newest N). */
+  list(db: Db, missionId: string, opts: { taskId?: string; limit?: number; order?: 'asc' | 'desc' } = {}): EventRow[] {
     let sql = 'SELECT * FROM events WHERE mission_id = ?';
     const args: unknown[] = [missionId];
     if (opts.taskId) { sql += ' AND task_id = ?'; args.push(opts.taskId); }
-    sql += ' ORDER BY id';
+    sql += opts.order === 'desc' ? ' ORDER BY id DESC' : ' ORDER BY id';
     if (opts.limit) { sql += ' LIMIT ?'; args.push(opts.limit); }
     return (db.prepare(sql).all(...args) as Row[]).map(toEvent);
   },
