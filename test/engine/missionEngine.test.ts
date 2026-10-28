@@ -415,6 +415,27 @@ describe('MissionEngine', () => {
     expect([done.state, done.outcome]).toEqual(['done', 'kept']);
     expect(git(root, 'rev-parse', 'main')).toBe(base);
     expect(git(root, 'rev-parse', 'maestro/fix-login')).not.toBe(base);
+    // The integration worktree is gone, so the user can check the kept branch out.
+    expect(git(root, 'worktree', 'list')).not.toMatch(/integration/);
+    git(root, 'checkout', 'maestro/fix-login');
+    expect(git(root, 'rev-parse', '--abbrev-ref', 'HEAD')).toBe('maestro/fix-login');
+  }, T);
+
+  it('an untracked file in the main checkout does not block the base merge', async () => {
+    const e = makeEngine(TASK_DONE);
+    const m = await start(e);
+    await approved(e, m, PLAN_SRC);
+    const r = ref(await e.dispatchTask(m.id, { task_id: 'T1', agent: 'implementer', prompt: 'Do it.', depends_on: [], owns: ['src/**'] }));
+    await e.waitForTasks(m.id, [r], 'all', () => {});
+    const fin = e.finishMission(m.id, 'Done.');
+    const entry = await until(() => openEntry(m.id, 'merge_decision'));
+    writeFileSync(join(root, 'notes-untracked.txt'), 'mine\n');
+    expect(await e.answerMergeDecision(entry.id, 'Merge')).toEqual({ outcome: 'merged' });
+    expect(await fin).toBe('merge');
+    expect(git(root, 'rev-parse', '--abbrev-ref', 'HEAD')).toBe('main'); // merged in the main checkout itself
+    expect(git(root, 'log', '-1', '--format=%s', 'main')).toBe('Maestro: Fix login');
+    expect(readFileSync(join(root, 'notes-untracked.txt'), 'utf8')).toBe('mine\n');
+    expect(git(root, 'worktree', 'list')).not.toMatch(/merge-/);
   }, T);
 
   it('asks again when the base branch cannot be merged in place, then merges in a temporary worktree', async () => {
@@ -426,7 +447,7 @@ describe('MissionEngine', () => {
     const fin = e.finishMission(m.id, 'Done.');
     const first = await until(() => openEntry(m.id, 'merge_decision'));
 
-    writeFileSync(join(root, 'local-edit.txt'), 'uncommitted\n'); // main is checked out here, and dirty
+    writeFileSync(join(root, 'readme.txt'), 'uncommitted edit\n'); // main is checked out here, with a tracked change
     expect(await e.answerMergeDecision(first.id, 'Merge')).toMatchObject({ outcome: 'retry' });
     const second = await until(() => openEntry(m.id, 'merge_decision'));
     expect(second.id).not.toBe(first.id);

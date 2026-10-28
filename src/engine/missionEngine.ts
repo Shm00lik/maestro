@@ -886,6 +886,9 @@ export class MissionEngine extends EventEmitter implements BridgeHandlers {
       this.emit('mission', this.mission(c.id));
       this.endMission(c);
       w.d.resolve('keep');
+      // The integration worktree holds the mission branch: remove it, so the user can check the kept branch out.
+      try { await removeIntegrationWorktree(c.projectRoot, c.id); }
+      catch (e) { this.warn(`remove integration worktree: ${(e as Error).message}`); }
       return { outcome: 'kept' };
     }
 
@@ -951,7 +954,8 @@ export class MissionEngine extends EventEmitter implements BridgeHandlers {
     let h = this.halt(c);
     if (h) return h;
     const head = await git(root, ['rev-parse', '--abbrev-ref', 'HEAD']).catch(() => '');
-    const clean = (await git(root, ['status', '--porcelain'])) === '';
+    // Untracked files do not block the merge (a merge that would overwrite one fails, and is asked again).
+    const clean = (await git(root, ['status', '--porcelain', '--untracked-files=no'])) === '';
     if ((h = this.halt(c))) return h;
     if (head === m.baseBranch && clean) return this.mergeIn(root, m.missionBranch, msg);
 
