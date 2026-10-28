@@ -6,7 +6,7 @@ import { randomUUID } from 'node:crypto';
 import { appendFileSync, mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { resolveClaudeCommand } from './exe.js';
-import { killTreeAsync, listTreePidsAsync } from './processTree.js';
+import { ASYNC_TIMEOUT_MS, killPidAsync, killTreeAsync, listTreePidsAsync } from './processTree.js';
 import {
   encodeInterrupt, encodePermissionAllow, encodePermissionDeny, encodeUserMessage, parseEvent, type StreamEvent,
 } from './protocol.js';
@@ -27,6 +27,10 @@ export interface SessionOptions {
   /** Test hooks. */
   listTree?: (pid: number) => Promise<number[]>;
   killTree?: (pid: number) => Promise<{ ok: boolean; output: string }>;
+  /** Kills one pid (no /T); used for snapshot survivors. */
+  killPid?: (pid: number) => Promise<{ ok: boolean; output: string }>;
+  /** Upper bound on the stop snapshot, measured from the start of stop(). */
+  snapshotWaitMs?: number;
 }
 export type SessionStatus = 'starting' | 'busy' | 'idle' | 'exited';
 export interface ExitInfo { code: number | null; killed: boolean }
@@ -52,6 +56,8 @@ export class ClaudeSession extends EventEmitter {
   private stopping = false;
   private readonly listTreeFn: (pid: number) => Promise<number[]>;
   private readonly killTreeFn: (pid: number) => Promise<{ ok: boolean; output: string }>;
+  private readonly killPidFn: (pid: number) => Promise<{ ok: boolean; output: string }>;
+  private readonly snapshotWaitMs: number;
   private killPromise: Promise<void> | null = null;
   private stopPromise: Promise<'exited' | 'killed'> | null = null;
 
@@ -62,6 +68,8 @@ export class ClaudeSession extends EventEmitter {
     this.logPath = opts.logPath;
     this.listTreeFn = opts.listTree ?? listTreePidsAsync;
     this.killTreeFn = opts.killTree ?? killTreeAsync;
+    this.killPidFn = opts.killPid ?? killPidAsync;
+    this.snapshotWaitMs = opts.snapshotWaitMs ?? ASYNC_TIMEOUT_MS;
     mkdirSync(dirname(opts.logPath), { recursive: true });
     const command = opts.command ?? resolveClaudeCommand();
     this.child = spawn(command.exe, [...command.prefixArgs, ...BASE_ARGS, ...opts.args], {
@@ -158,9 +166,12 @@ export class ClaudeSession extends EventEmitter {
   }
 
   /**
-   * Stop per spec 8.3: snapshot the tree; if busy write ONE interrupt and wait up to timeoutMs for a result;
-   * end stdin and wait up to timeoutMs for exit; else killTree; then kill snapshot PIDs still alive.
+   * Stop per spec 8.3: snapshot the tree (started, not awaited, so it never delays the interrupt);
+   * if busy write ONE interrupt and wait up to timeoutMs for a result (skipped if the write fails);
+   * end stdin and wait up to timeoutMs for exit; else killTree; then await the snapshot (bounded by
+   * snapshotWaitMs from the start) and kill each snapshot PID still alive (by pid, no /T).
    * Concurrent calls share one run. After this starts, send/answerPermission throw SessionClosed.
+   * Resolves 'killed' exactly when the exit info says killed.
    */
   stop(timeoutMs = 5000): Promise<'exited' | 'killed'> {
     if (this.stopPromise) return this.stopPromise;
@@ -168,6 +179,32 @@ export class ClaudeSession extends EventEmitter {
     this.stopping = true;
     this.stopPromise = this.runStop(timeoutMs);
     return this.stopPromise;
+  }
+
+  /** Descendants of the root (root excluded); [] when listing fails, lacks the root, or exceeds snapshotWaitMs. Never rejects. */
+  private snapshotTree(): Promise<number[]> {
+    if (this.pid <= 0) return Promise.resolve([]);
+    return new Promise<number[]>(resolve => {
+      let settled = false;
+      const settle = (pids: number[], note?: string): void => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        if (note) this.log(`[session] stop: ${note}; skipping snapshot kills`);
+        resolve(pids);
+      };
+      const timer = setTimeout(() => settle([], `tree snapshot timed out after ${this.snapshotWaitMs}ms`), this.snapshotWaitMs);
+      let listing: Promise<number[]>;
+      try { listing = Promise.resolve(this.listTreeFn(this.pid)); }
+      catch (e) { listing = Promise.reject(e); }
+      listing.then(
+        pids => {
+          if (pids.includes(this.pid)) settle(pids.filter(p => p !== this.pid));
+          else settle([], 'tree snapshot failed or missing root');
+        },
+        (e: unknown) => settle([], `tree snapshot threw: ${(e as Error)?.message ?? String(e)}`),
+      );
+    });
   }
 
   private async runStop(timeoutMs: number): Promise<'exited' | 'killed'> {
@@ -188,37 +225,30 @@ export class ClaudeSession extends EventEmitter {
       if (this.finalized) done(true);
     });
 
-    let snapshot: number[] = [];
-    try {
-      const pids = this.pid > 0 ? await this.listTreeFn(this.pid) : [];
-      if (pids.includes(this.pid)) snapshot = pids.filter(p => p !== this.pid);
-      else this.log('[session] stop: tree snapshot failed or missing root; continuing without it');
-    } catch (e) {
-      this.log(`[session] stop: tree snapshot threw: ${(e as Error).message}`);
-    }
+    // Step 1: start the snapshot now; it is only awaited (bounded) before step 5.
+    const snapshot = this.snapshotTree();
 
+    // Step 2: one interrupt if mid-turn. A result can only arrive on a later tick, so waiting after the write is safe.
     if (!hasExited() && this.status === 'busy') {
-      const resultOrExit = waitFor(timeoutMs, e => e.kind === 'result');
-      try { this.write(encodeInterrupt(`maestro-int-${randomUUID()}`), true); }
-      catch { /* stdin gone: fall through to the exit wait */ }
-      await resultOrExit;
+      let wrote = false;
+      try { this.write(encodeInterrupt(`maestro-int-${randomUUID()}`), true); wrote = true; }
+      catch (e) { this.log(`[session] stop: interrupt write failed (${(e as Error).message}); skipping result wait`); }
+      if (wrote) await waitFor(timeoutMs, e => e.kind === 'result');
     }
 
-    let killed = false;
+    // Steps 3-4: end stdin and wait for exit, else kill the tree (bounded).
     if (!hasExited()) {
       if (!this.stdinEnded && !this.child.stdin.destroyed) { this.stdinEnded = true; this.child.stdin.end(); }
-      if (!(await waitFor(timeoutMs))) {
-        killed = true;
-        await this.kill(); // killTree + bounded wait for exit
-      }
+      if (!(await waitFor(timeoutMs))) await this.kill();
     }
 
-    for (const pid of snapshot) {
+    // Step 5: kill snapshot PIDs still alive. Each descendant is in the list, so no /T (limits PID-reuse damage).
+    for (const pid of await snapshot) {
       let up = true;
       try { process.kill(pid, 0); } catch { up = false; }
-      if (up) { try { await this.killTreeFn(pid); } catch { /* never throws */ } }
+      if (up) { try { await this.killPidFn(pid); } catch { /* never throws */ } }
     }
-    return killed ? 'killed' : 'exited';
+    return this.weKilled ? 'killed' : 'exited';
   }
 
   /**

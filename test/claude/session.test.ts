@@ -1,10 +1,11 @@
+import { spawn } from 'node:child_process';
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { BASE_ARGS, ClaudeSession, SessionClosed, type SessionOptions } from '../../src/claude/session.js';
-import { killTree } from '../../src/claude/processTree.js';
+import { killPidAsync, killTree, killTreeAsync } from '../../src/claude/processTree.js';
 import type { StreamEvent } from '../../src/claude/protocol.js';
 
 const FAKE = fileURLToPath(new URL('../fake-claude/fake-claude.ts', import.meta.url));
@@ -192,6 +193,99 @@ describe('ClaudeSession', () => {
     s.send('go');
     expect(await s.stop(5000)).toBe('exited');
     expect(readFileSync(join(dir, 'logs', 's.log'), 'utf8')).toContain('snapshot threw');
+  }, 10000);
+
+  it('stop does not wait for a hung snapshot before interrupting and stays bounded', async () => {
+    const s = start('interrupt', [], { listTree: () => new Promise<number[]>(() => { /* never settles */ }), snapshotWaitMs: 300 });
+    await until(s, 'init');
+    s.send('go');
+    const t0 = Date.now();
+    expect(await s.stop(5000)).toBe('exited');
+    expect(Date.now() - t0).toBeLessThan(4000);
+    expect(s.status).toBe('exited');
+    expect(fakeLogLines().filter(l => l?.request?.subtype === 'interrupt')).toHaveLength(1);
+    expect(readFileSync(join(dir, 'logs', 's.log'), 'utf8')).toContain('snapshot timed out');
+  }, 10000);
+
+  it('stop outcome agrees with exit info when the child exits on its own during the kill path', async () => {
+    const s = start({ steps: [{ emit: INIT }, { waitFor: 'user' }, { sleepMs: 60000 }] }, [], { listTree: async () => [] });
+    await until(s, 'init');
+    s.send('go');
+    const ex = exited(s);
+    const priv = s as unknown as { child: { emit(e: string, code: number): void } };
+    try {
+      const p = s.stop(300);
+      // The process reports 'exit' on its own just before the stdin wait times out ('close' still pending).
+      await new Promise(r => setTimeout(r, 450));
+      priv.child.emit('exit', 0);
+      const outcome = await p;
+      const info = await ex;
+      expect(outcome).toBe(info.killed ? 'killed' : 'exited');
+      expect(outcome).toBe('exited');
+    } finally {
+      killTree(s.pid); // the real fake is still running
+    }
+  }, 10000);
+
+  it('stop skips the result wait when the interrupt write fails', async () => {
+    const s = start({ steps: [{ emit: INIT }, { waitFor: 'user' }, { sleepMs: 60000 }] });
+    await until(s, 'init');
+    s.send('go');
+    (s as unknown as { child: { stdin: { destroy(): void } } }).child.stdin.destroy();
+    const t0 = Date.now();
+    expect(await s.stop(1500)).toBe('killed');
+    // Without the skip: 1500 (result wait) + 1500 (exit wait) + kill. With it: 1500 + kill.
+    expect(Date.now() - t0).toBeLessThan(2700);
+  }, 10000);
+
+  it('stop while a permission request is pending sends one interrupt and resolves', async () => {
+    const s = start({ steps: [
+      { emit: INIT }, { waitFor: 'user' },
+      { emit: { type: 'control_request', request_id: 'perm-1', request: { subtype: 'can_use_tool', tool_name: 'Bash', input: { command: 'ls' }, tool_use_id: 't1' } } },
+      { waitFor: 'interrupt' }, { emit: RESULT }, { waitFor: 'stdin-close' },
+    ] });
+    await until(s, 'init');
+    s.send('go');
+    await until(s, 'permission-request');
+    expect(await s.stop(5000)).toBe('exited');
+    expect(fakeLogLines().filter(l => l?.request?.subtype === 'interrupt')).toHaveLength(1);
+    expect(fakeLogLines().filter(l => l?.type === 'control_response')).toHaveLength(0);
+  }, 10000);
+
+  it('concurrent stops on the kill path kill the root tree exactly once', async () => {
+    const calls: number[] = [];
+    const s = start({ steps: [{ emit: INIT }, { waitFor: 'user' }, { sleepMs: 60000 }] }, [], {
+      killTree: pid => { calls.push(pid); return killTreeAsync(pid); },
+    });
+    await until(s, 'init');
+    s.send('go');
+    const [a, b] = await Promise.all([s.stop(300), s.stop(300)]);
+    expect([a, b]).toEqual(['killed', 'killed']);
+    expect(calls.filter(p => p === s.pid)).toHaveLength(1);
+  }, 10000);
+
+  it('snapshot survivors are killed by pid (no /T), the root by tree', async () => {
+    // A survivor outside the fake's job object (the fake's own children die with it), reported by the snapshot hook.
+    const survivor = spawn('ping', ['-n', '60', '127.0.0.1'], { stdio: 'ignore', windowsHide: true });
+    const spid = survivor.pid!;
+    const treeKills: number[] = [];
+    const pidKills: number[] = [];
+    try {
+      const s = start({ steps: [{ emit: INIT }, { waitFor: 'user' }, { sleepMs: 60000 }] }, [], {
+        listTree: async pid => [pid, spid],
+        killTree: pid => { treeKills.push(pid); return killTreeAsync(pid); },
+        killPid: pid => { pidKills.push(pid); return killPidAsync(pid); },
+      });
+      await until(s, 'init');
+      s.send('go');
+      expect(await s.stop(300)).toBe('killed');
+      expect(treeKills).toEqual([s.pid]);
+      expect(pidKills).toEqual([spid]);
+      await waitUntil(() => !alive(spid), 3000);
+      expect(alive(spid)).toBe(false);
+    } finally {
+      killTree(spid);
+    }
   }, 10000);
 
   it('stdin EPIPE without an error listener does not throw and is logged', async () => {

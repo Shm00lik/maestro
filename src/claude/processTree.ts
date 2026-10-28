@@ -35,11 +35,13 @@ function treeFromJson(stdout: string | undefined | null, pid: number): number[] 
   return result;
 }
 
-/** Async killTree (taskkill /T /F); same ok rules, never rejects. */
-export function killTreeAsync(pid: number): Promise<{ ok: boolean; output: string }> {
+/** Bound for the async helpers: a hung taskkill/PowerShell must not hang its caller (timeout -> error branch). */
+export const ASYNC_TIMEOUT_MS = 10_000;
+
+function taskkillAsync(args: string[], timeoutMs: number): Promise<{ ok: boolean; output: string }> {
   return new Promise(resolve => {
     try {
-      execFile('taskkill', ['/PID', String(pid), '/T', '/F'], { windowsHide: true, encoding: 'utf8' }, (err, stdout, stderr) => {
+      execFile('taskkill', args, { windowsHide: true, encoding: 'utf8', timeout: timeoutMs }, (err, stdout, stderr) => {
         const output = `${stdout ?? ''}${stderr ?? ''}`.trim();
         const code = err ? (typeof err.code === 'number' ? err.code : -1) : 0;
         const gone = code === 128 && /not found/i.test(output);
@@ -49,6 +51,16 @@ export function killTreeAsync(pid: number): Promise<{ ok: boolean; output: strin
   });
 }
 
+/** Async killTree (taskkill /T /F); same ok rules, never rejects; ok:false on timeout. */
+export function killTreeAsync(pid: number, timeoutMs = ASYNC_TIMEOUT_MS): Promise<{ ok: boolean; output: string }> {
+  return taskkillAsync(['/PID', String(pid), '/T', '/F'], timeoutMs);
+}
+
+/** Kills one pid only (taskkill /F, no /T); same ok rules as killTreeAsync. */
+export function killPidAsync(pid: number, timeoutMs = ASYNC_TIMEOUT_MS): Promise<{ ok: boolean; output: string }> {
+  return taskkillAsync(['/PID', String(pid), '/F'], timeoutMs);
+}
+
 /** pid itself (if running) followed by all descendants; [] when pid is not running. */
 export function listTreePids(pid: number): number[] {
   const r = spawnSync('powershell', PS_ARGS, { windowsHide: true, encoding: 'utf8', maxBuffer: 1 << 26 });
@@ -56,11 +68,11 @@ export function listTreePids(pid: number): number[] {
   return treeFromJson(r.stdout, pid);
 }
 
-/** Async variant of listTreePids (does not block the event loop); never rejects. */
-export function listTreePidsAsync(pid: number): Promise<number[]> {
+/** Async variant of listTreePids (does not block the event loop); never rejects; [] on timeout. */
+export function listTreePidsAsync(pid: number, timeoutMs = ASYNC_TIMEOUT_MS): Promise<number[]> {
   return new Promise(resolve => {
     try {
-      execFile('powershell', PS_ARGS, { windowsHide: true, encoding: 'utf8', maxBuffer: 1 << 26 }, (err, stdout) => {
+      execFile('powershell', PS_ARGS, { windowsHide: true, encoding: 'utf8', maxBuffer: 1 << 26, timeout: timeoutMs }, (err, stdout) => {
         resolve(err ? [] : treeFromJson(stdout, pid));
       });
     } catch { resolve([]); }

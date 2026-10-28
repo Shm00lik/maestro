@@ -5,7 +5,7 @@ import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
 import { resolveClaudeCommand } from '../../src/claude/exe.js';
-import { killTree, listTreePids } from '../../src/claude/processTree.js';
+import { killPidAsync, killTree, killTreeAsync, listTreePids, listTreePidsAsync } from '../../src/claude/processTree.js';
 
 const win = process.platform === 'win32';
 const sleep = (ms: number): Promise<void> => new Promise(r => setTimeout(r, ms));
@@ -28,6 +28,29 @@ describe('processTree', () => {
       killTree(pid);
     }
   }, 30000);
+
+  it.runIf(win)('async tree helpers are bounded by a timeout', async () => {
+    expect(await listTreePidsAsync(process.pid, 1)).toEqual([]);
+    expect((await killTreeAsync(2147483644, 1)).ok).toBe(false); // timed out, not "not found"
+    expect((await killTreeAsync(2147483644)).ok).toBe(true); // "not found" counts as ok
+  }, 10000);
+
+  it.runIf(win)('killPidAsync kills only the given pid, not its children', async () => {
+    const child = spawn('cmd', ['/c', 'ping -n 60 127.0.0.1'], { windowsHide: true, stdio: 'ignore' });
+    const pid = child.pid!;
+    let tree: number[] = [];
+    try {
+      for (let i = 0; i < 25 && tree.length < 2; i++) { await sleep(200); tree = listTreePids(pid); }
+      expect(tree.length).toBeGreaterThanOrEqual(2);
+      expect((await killPidAsync(pid)).ok).toBe(true);
+      await sleep(300);
+      expect(listTreePids(pid)).toEqual([]);
+      expect(tree.slice(1).some(p => listTreePids(p).length > 0)).toBe(true); // a descendant (ping) survives
+    } finally {
+      killTree(pid);
+      for (const p of tree) killTree(p);
+    }
+  }, 10000);
 
   it.runIf(win)('spawns in a cwd with spaces and accents', async () => {
     const root = join(tmpdir(), 'maestro test');
