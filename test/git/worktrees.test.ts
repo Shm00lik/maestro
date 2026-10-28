@@ -125,6 +125,30 @@ describe('worktrees', () => {
     commitIn(dir, 'b.txt', 'b\n', 'add b');
     const r = await mergeTaskBranch(root, 'mission/m1', 'task/T1', 'merge', MID);
     expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(git(root, 'merge-base', '--is-ancestor', r.commit, 'mission/m1')).toBe('');
+    expect(git(root, 'rev-parse', 'mission/m1')).toBe(r.commit);
+  });
+
+  it('throws a clear error when the integration worktree is on another branch', async () => {
+    const root = makeRepo();
+    await ensureMissionBranch(root, 'main', 'mission/m1');
+    const dir = worktreeDirFor(root, MID, 'T1');
+    await createTaskWorktree(root, 'mission/m1', 'task/T1', dir);
+    commitIn(dir, 'b.txt', 'b\n', 'add b');
+    await mergeTaskBranch(root, 'mission/m1', 'task/T1', 'merge', MID);
+    git(worktreeDirFor(root, MID, 'integration'), 'checkout', '-b', 'other');
+    await expect(mergeTaskBranch(root, 'mission/m1', 'task/T1', 'again', MID)).rejects.toThrow(/integration worktree.*other.*mission\/m1/);
+  });
+
+  it('hints when the mission branch is checked out in another worktree', async () => {
+    const root = makeRepo();
+    await ensureMissionBranch(root, 'main', 'mission/m1');
+    const dir = worktreeDirFor(root, MID, 'T1');
+    await createTaskWorktree(root, 'mission/m1', 'task/T1', dir);
+    git(root, 'checkout', 'mission/m1');
+    await expect(mergeTaskBranch(root, 'mission/m1', 'task/T1', 'm', MID))
+      .rejects.toThrow('the mission branch mission/m1 is checked out in another worktree; switch that checkout to another branch');
   });
 
   it('sets core.longpaths only in the repo config', async () => {

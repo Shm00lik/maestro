@@ -1,8 +1,8 @@
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { createHash } from 'node:crypto';
-import { resolve, dirname, isAbsolute } from 'node:path';
-import { mkdirSync, existsSync, readFileSync, appendFileSync } from 'node:fs';
+import { resolve, dirname, basename, isAbsolute } from 'node:path';
+import { mkdirSync, existsSync, realpathSync, readFileSync, appendFileSync } from 'node:fs';
 
 const execFileP = promisify(execFile);
 
@@ -86,22 +86,33 @@ async function ensureIntegrationWorktree(
 ): Promise<string> {
   const dir = worktreeDirFor(projectRoot, missionId, 'integration');
   const known = (await listWorktrees(projectRoot)).some((w) => norm(w) === norm(dir));
-  if (known && existsSync(dir)) return dir;
+  if (known && existsSync(dir)) {
+    const head = await git(dir, ['rev-parse', '--abbrev-ref', 'HEAD']);
+    if (head !== missionBranch) {
+      throw new Error(`The integration worktree ${dir} is on branch ${head}, expected ${missionBranch}. Switch it back or remove it.`);
+    }
+    return dir;
+  }
   await prepare(projectRoot);
   mkdirSync(dirname(dir), { recursive: true });
   if (known) await git(projectRoot, ['worktree', 'prune']);
-  await git(projectRoot, ['worktree', 'add', dir, missionBranch]);
+  try {
+    await git(projectRoot, ['worktree', 'add', dir, missionBranch]);
+  } catch (e) {
+    const msg = (e as Error).message;
+    if (/already (checked out|used by worktree)/i.test(msg)) {
+      throw new Error(`the mission branch ${missionBranch} is checked out in another worktree; switch that checkout to another branch (${msg})`);
+    }
+    throw e;
+  }
   return dir;
 }
 
-/**
- * Merges taskBranch into missionBranch with --no-ff inside the mission's integration worktree.
- * `missionId` names that worktree; when omitted it is derived from the mission branch name.
- */
+/** Merges taskBranch into missionBranch with --no-ff inside the mission's integration worktree (named by missionId). */
 export async function mergeTaskBranch(
-  projectRoot: string, missionBranch: string, taskBranch: string, message: string, missionId?: string,
+  projectRoot: string, missionBranch: string, taskBranch: string, message: string, missionId: string,
 ): Promise<{ ok: true; commit: string } | { ok: false; reason: 'conflict'; files: string[] }> {
-  const dir = await ensureIntegrationWorktree(projectRoot, missionBranch, missionId ?? sha1(missionBranch));
+  const dir = await ensureIntegrationWorktree(projectRoot, missionBranch, missionId);
   try {
     await git(dir, ['merge', '--no-ff', '-m', message, taskBranch]);
   } catch (e) {
