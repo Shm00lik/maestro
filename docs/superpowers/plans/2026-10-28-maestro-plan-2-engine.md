@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Make Maestro run a real mission end to end from the command line. A conductor plans the mission, and Maestro runs the dispatched tasks as live `claude.exe` sessions in worktrees, with permissions, questions, pause/resume and recovery, all through an inbox.
+**Goal:** Make Maestro run a real mission end to end from the command line. A conductor plans the mission, and Maestro runs the dispatched tasks as live `claude.exe` sessions in worktrees, with permissions, questions, stop and crash recovery, all through an inbox.
 
 **Architecture:** This plan adds three groups of modules:
 - **Claude I/O** (`src/claude/**`): a pure stream protocol plus a session wrapper around `claude.exe`.
@@ -34,7 +34,7 @@ It also adds a git worktree manager (`src/git/**`) and a CLI driver (`src/cli/**
 
 1. **Claude sends an event type, subtype or key Maestro has never seen.** It must be logged and ignored, never crash a session. Test: Task 2, `ignores unknown types, subtypes and extra keys`.
 2. **The user answers a permission or question after its task was cancelled, or its process died.** The answer must be rejected as expired, and nothing is written to a dead stdin. Test: Task 9, `rejects answers to expired entries without touching the session`.
-3. **The user double-clicks Pause now or Stop, or stops while a permission request is pending.** Maestro must send exactly one interrupt and one kill at most, with no "write after end" errors, and the pending entry expires. Test: Task 10, `stop is idempotent and expires pending permissions`.
+3. **The user double-clicks Stop, or stops while a permission request is pending.** Maestro must send exactly one interrupt and one kill at most, with no "write after end" errors, and the pending entry expires. Test: Task 10, `stop is idempotent and expires pending permissions`.
 4. **Maestro restarts mid-mission.** No task restarts from scratch: live sessions are resumed with `--resume`, and tasks whose session can't be resumed are marked failed with a reason. Test: Task 13, `resumes running tasks after restart and never re-dispatches done ones`.
 5. **The project path contains spaces or non-ASCII characters** (e.g. `C:\Users\Yoav Levy\Projets été`). Spawn, cwd, worktree and merge must all work. Tests: Task 4 `spawns in a cwd with spaces and accents`, Task 8 `creates and merges worktrees under a path with spaces`.
 
@@ -185,7 +185,7 @@ export class ClaudeSession extends EventEmitter {   // events: 'event'(StreamEve
   static start(opts: SessionOptions): ClaudeSession
   readonly pid: number; status: SessionStatus; sessionId: string | null
   send(text: string): void                                   // throws SessionClosed if exited
-  interrupt(timeoutMs = 5000): Promise<'interrupted' | 'killed'>   // one in-flight interrupt; repeats await the same promise
+  stop(timeoutMs = 5000): Promise<'exited' | 'killed'>   // spec §8.3 Stop; one in-flight stop, repeats await the same promise
   answerPermission(requestId: string, decision: { allow: true; input: unknown } | { allow: false; message: string }): void
   close(): void                                              // end stdin when idle
   kill(): Promise<void>                                      // killTree + await exit; idempotent
@@ -196,14 +196,15 @@ Behaviour:
 - Base args are prepended: the Global Constraints session flags plus `MCP_TOOL_TIMEOUT`.
 - Raw stdout lines are appended to `logPath`.
 - `status` becomes `busy` on send and `idle` on `result`.
-- `interrupt` falls back to `kill()` after `timeoutMs` with no `result`. After a successful interrupt, any surviving child PIDs of the root are killed.
+- `stop` follows spec §8.3: snapshot the tree; if busy, write one interrupt and wait ≤ timeoutMs for `result`; end stdin and wait ≤ timeoutMs for exit; else killTree; then kill any snapshot PID still alive. No pause, no keep-alive after interrupt (pause dropped from v1).
 
 - [ ] **Step 1:** Write the failing tests:
   - `emits parsed events and records sessionId from init`
   - `send while exited throws SessionClosed`
-  - `interrupt returns interrupted on aborted_tools result`
-  - `interrupt falls back to kill after timeout` (the scenario ignores the interrupt; use a short timeout of 300 ms)
-  - `concurrent interrupts send one control_request` (check `FAKE_CLAUDE_LOG` count === 1)
+  - `stop on a busy session interrupts, closes stdin and resolves exited`
+  - `stop falls back to kill after timeout` (the scenario ignores the interrupt and stdin end; short timeout)
+  - `concurrent stops send one control_request` (check `FAKE_CLAUDE_LOG` count === 1)
+  - `stop kills a tool child left behind`
   - `kill is idempotent`
   - `answerPermission writes the exact control_response`
 - [ ] **Step 2–4:** RED, implement, GREEN. **Step 5:** Commit: `feat(claude): ClaudeSession`.
@@ -215,12 +216,12 @@ Behaviour:
 **Files:** Modify `src/core/state/taskMachine.ts`, `src/core/state/missionMachine.ts` and their tests.
 
 **Interfaces — Produces:**
-- `TaskState` adds `'planned' | 'interrupted'`.
-- `TaskEvent` adds `'dispatch' | 'interrupt' | 'resume'`.
+- `TaskState` adds `'planned'`.
+- `TaskEvent` adds `'dispatch'`.
 - `MissionEvent` replaces `'all_tasks_done'` with `'finish_requested'`, and adds `'kept'`.
 - Add `export type MissionOutcome = 'merged' | 'kept'`.
 
-- [ ] **Step 1:** Update the table-driven tests to the exact tables in spec §5.1 and §5.2. This includes `planned —dispatch→ waiting`, `running|needs_you —interrupt→ interrupted`, `interrupted —resume→ running`, `interrupted —fail→ failed`, `cancel` from every non-terminal state including `planned` and `interrupted`, `running —finish_requested→ finishing`, and `finishing —kept→ done`. Keep the exhaustive complement test and the inherited-key tests.
+- [ ] **Step 1:** Update the table-driven tests to the exact tables in spec §5.1 and §5.2. This includes `planned —dispatch→ waiting`, `cancel` from every non-terminal state including `planned`, and NO pause/resume/interrupted (dropped from v1; remove `pause`/`resume`/`paused` from the mission machine too), `running —finish_requested→ finishing`, and `finishing —kept→ done`. Keep the exhaustive complement test and the inherited-key tests.
 - [ ] **Step 2–4:** RED, implement, GREEN. **Step 5:** Commit: `feat(core): state machines v2`.
 
 ---
@@ -343,8 +344,7 @@ export class TaskRunner extends EventEmitter {   // events: 'state'(Task), 'fini
   constructor(deps: TaskRunnerDeps)
   start(taskId: string, upstreamHandoffs: { key: string; handoff: string }[]): Promise<void>
   message(taskId: string, text: string): void
-  pauseNow(taskId: string): Promise<void>   // interrupt → 'interrupted'
-  resume(taskId: string): Promise<void>     // 'Continue.' or --resume
+  resumeAfterCrash(taskId: string): Promise<void>   // used by recovery only: new process with --resume <sessionId>
   stop(taskId: string): Promise<void>       // interrupt → close → kill; 'cancelled'; expires inbox
 }
 export function buildTaskArgs(role: RoleConfig, prompt: string, bridgeConfigPath: string, resumeSessionId?: string): string[]
@@ -357,7 +357,7 @@ Behaviour:
 - **Args:** the role's model and `--disallowedTools` (per the Task 1 R7 decision). Permission requests go to `InboxService`.
 - **Usage:** `result.usage` is added per the R8 decision.
 - **Completion** follows spec §8.1: one reminder for a missing handoff, then the task fails with `no-handoff`. A successful merge sets `done`; a conflict sets `failed:conflict`.
-- **Interrupt and stop** follow spec §8.3 and the R9 decision.
+- **Stop** follows spec §8.3 (via `ClaudeSession.stop`) and the R9 decision (a cancelled permission request expires its inbox entry).
 - **Needs you:** when an inbox entry for the task opens, the task fires `needs_user`. When `inbox.openCountForTask` drops to 0, it fires `answered`. InboxService emits `changed` with `{ taskId }`, and the runner listens.
 
 Add these tests: `opening a permission entry moves the task to needs_you and answering it returns it to running`, and `two open entries need two answers before running`.
@@ -365,8 +365,7 @@ Add these tests: `opening a permission entry moves the task to needs_you and ans
 - [ ] **Step 1:** Write the failing tests:
   - `runs to done, stores handoff, usage and merge commit`
   - `sends one handoff reminder then fails with no-handoff`
-  - `pause now interrupts and resume sends Continue.`
-  - `resume of a dead process uses --resume <sessionId>` (check fake-claude's argv log)
+  - `resumeAfterCrash starts a new process with --resume <sessionId>` (check fake-claude's argv log)
   - `stop is idempotent and expires pending permissions`
   - `process crash marks the task failed with the last 50 log lines`
   - `read-only roles get --disallowedTools Edit,Write,NotebookEdit`
@@ -424,7 +423,7 @@ export class MissionEngine extends EventEmitter implements BridgeHandlers {   //
   constructor(o: { db: Db; logDir: string; exe?: string })
   startMission(m: NewMission & { quick?: boolean }): Promise<Mission>   // mission branch, bridge, conductor session
   approvePlan(missionId: string): void; replan(missionId: string, note: string): void
-  pause(missionId: string): void; resume(missionId: string): void; stop(missionId: string): Promise<void>
+  stop(missionId: string): Promise<void>
   readonly inbox: InboxService
 }
 ```
@@ -456,7 +455,7 @@ Behaviour:
 **Interfaces — Produces:**
 ```ts
 export function recoverOnStartup(engine: MissionEngine, db: Db, isPidAlive: (pid: number) => boolean): Promise<{ resumed: string[]; failed: { taskId: string; reason: string }[] }>
-export function checkStuck(db: Db, now: number, stuckAfterMs = 20 * 60_000): string[]   // task ids; engine raises a 'question' inbox entry "T6 seems stuck" with options Interrupt / Keep waiting
+export function checkStuck(db: Db, now: number, stuckAfterMs = 20 * 60_000): string[]   // task ids; engine raises a 'question' inbox entry "T6 seems stuck" with options Stop task / Keep waiting
 ```
 
 - [ ] **Step 1:** Write the failing tests:
