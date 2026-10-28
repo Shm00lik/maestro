@@ -1,0 +1,4 @@
+{"type":"task_summary","detail":"x","session_id":"3b637c25-ffcc-4605-99f5-d6f4c9075042"}
+{"type":"tool_progress","tool_use_id":"toolu_01Ay7ex-heartbeat-0","tool_name":"Bash","elapsed_time_seconds":30,"heartbeat":true,"session_id":"3b637c25-ffcc-4605-99f5-d6f4c9075042"}
+{"type":"system","subtype":"hook_started","hook_id":"8205aa48","hook_name":"SessionStart:startup","hook_event":"SessionStart","uuid":"f903282e","session_id":"3b637c25-ffcc-4605-99f5-d6f4c9075042"}
+{"type":"system","subtype":"thinking_tokens","estimated_tokens":50,"session_id":"3b637c25-ffcc-4605-99f5-d6f4c9075042"}
