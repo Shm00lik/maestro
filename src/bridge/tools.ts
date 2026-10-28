@@ -12,7 +12,8 @@ export interface DispatchInput { task_id: string; agent: string; prompt: string;
 export interface TaskSummary {
   task_ref: string;
   key: string;
-  status: 'done' | 'failed' | 'cancelled' | 'running';
+  /** blocked: waiting on a dependency that failed or was cancelled (failure_reason names it). */
+  status: 'done' | 'failed' | 'cancelled' | 'running' | 'blocked';
   handoff: string | null;
   branch: string | null;
   commits: string[];

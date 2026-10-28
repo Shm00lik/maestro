@@ -132,6 +132,34 @@ function planConflicts(existing: Task[], planTasks: PlanTask[]): string[] {
   }).map(t => t.key);
 }
 
+/**
+ * Spec §5.2 "blocked" (derived, not a state): a waiting task with a dependency that is failed, cancelled or itself
+ * blocked. It cannot start until that dependency is retried. Task id to its reason `dependency <KEY> <state>`.
+ */
+export function blockedTasks(list: Task[]): Map<string, string> {
+  const byKey = new Map(list.map(t => [t.taskKey, t]));
+  const out = new Map<string, string>();
+  const visiting = new Set<string>();
+  const check = (t: Task): string | null => {
+    if (t.state !== 'waiting') return null;
+    if (out.has(t.id)) return out.get(t.id)!;
+    if (visiting.has(t.id)) return null; // a dependency cycle (ad-hoc dispatch forbids it): not blocked here
+    visiting.add(t.id);
+    let reason: string | null = null;
+    for (const k of t.dependsOn) {
+      const d = byKey.get(k);
+      if (!d) continue;
+      if (d.state === 'failed' || d.state === 'cancelled') { reason = `dependency ${k} ${d.state}`; break; }
+      if (check(d) !== null) { reason = `dependency ${k} blocked`; break; }
+    }
+    visiting.delete(t.id);
+    if (reason !== null) out.set(t.id, reason);
+    return reason;
+  };
+  for (const t of list) check(t);
+  return out;
+}
+
 const conflictErrors = (keys: string[]): { errors: PlanError[] } => ({
   errors: keys.map(k => ({ code: 'duplicate-key' as const, taskKeys: [k], message: `${k} conflicts with an existing task; rename it` })),
 });
@@ -784,8 +812,9 @@ export class MissionEngine extends EventEmitter implements BridgeHandlers {
     for (const r of refs) this.ownTask(missionId, r);
     const isDone = (): boolean => {
       if (refs.length === 0) return true;
-      const states = refs.map(r => tasks.get(this.db, r)?.state ?? 'cancelled');
-      return mode === 'any' ? states.some(s => WAIT_TERMINAL.has(s)) : states.every(s => WAIT_TERMINAL.has(s));
+      const blocked = blockedTasks(tasks.listByMission(this.db, missionId));
+      const resolved = refs.map(r => WAIT_TERMINAL.has(tasks.get(this.db, r)?.state ?? 'cancelled') || blocked.has(r));
+      return mode === 'any' ? resolved.some(Boolean) : resolved.every(Boolean);
     };
     if (!isDone()) {
       this.assertOpen();
@@ -814,10 +843,12 @@ export class MissionEngine extends EventEmitter implements BridgeHandlers {
       const base = t.state === 'done' && merged?.data?.commit ? `${merged.data.commit}^1` : m.missionBranch;
       try { commits = await branchCommits(c.projectRoot, base, t.branch); } catch { commits = []; }
     }
-    const status: TaskSummary['status'] = t.state === 'done' || t.state === 'failed' || t.state === 'cancelled' ? t.state : 'running';
+    const blocked = blockedTasks(tasks.listByMission(this.db, c.id)).get(t.id);
+    const status: TaskSummary['status'] = t.state === 'done' || t.state === 'failed' || t.state === 'cancelled' ? t.state
+      : blocked ? 'blocked' : 'running';
     return {
       task_ref: t.id, key: t.taskKey, status, handoff: t.handoffMd, branch: t.branch, commits,
-      failure_reason: t.failureReason,
+      failure_reason: blocked ?? t.failureReason,
     };
   }
 
@@ -842,8 +873,10 @@ export class MissionEngine extends EventEmitter implements BridgeHandlers {
     if (c.mergeWait) return c.mergeWait.d.promise; // idempotent re-call
     const m = this.mission(missionId);
     if (m.state !== 'running') throw new Error(`Cannot finish the mission while it is ${m.state}`);
-    const active = tasks.listByMission(this.db, missionId).filter(t =>
-      ACTIVE_TASK_STATES.has(t.state) || (t.state === 'planned' && t.dispatchedAt !== null));
+    const list = tasks.listByMission(this.db, missionId);
+    const blocked = blockedTasks(list); // blocked tasks never run on their own: they are cancelled when the mission ends
+    const active = list.filter(t => !blocked.has(t.id)
+      && (ACTIVE_TASK_STATES.has(t.state) || (t.state === 'planned' && t.dispatchedAt !== null)));
     if (active.length > 0) {
       throw new Error(`${active.length} tasks are still active: ${active.map(t => t.taskKey).join(', ')}; wait for them or stop them first`);
     }
@@ -989,11 +1022,24 @@ export class MissionEngine extends EventEmitter implements BridgeHandlers {
     }
   }
 
-  /** After merged / kept: the conductor ends once its turn is over; mission-level leftovers expire. */
+  /**
+   * After merged / kept: blocked tasks (their dependency failed or was cancelled) are cancelled, the conductor ends
+   * once its turn is over, and mission-level leftovers expire.
+   */
   private endMission(c: MissionCtx): void {
+    this.cancelBlocked(c);
     this.inbox.expireForMission(c.id);
     this.releaseConductor(c);
     this.kick();
+  }
+
+  /** The mission ended: its blocked tasks can never run, so they are cancelled. */
+  private cancelBlocked(c: MissionCtx): void {
+    for (const id of blockedTasks(tasks.listByMission(this.db, c.id)).keys()) {
+      try { tasks.transition(this.db, id, 'cancel'); } catch (e) { this.warn(`cancel blocked task: ${(e as Error).message}`); }
+      this.inbox.expireForTask(id);
+    }
+    this.flushEvents();
   }
 
   // ---- recovery (spec §12) -------------------------------------------------------
@@ -1098,6 +1144,7 @@ export class MissionEngine extends EventEmitter implements BridgeHandlers {
       this.transition(c.id, 'merged');
       missions.setOutcome(this.db, c.id, 'merged');
       this.emit('mission', this.mission(c.id));
+      this.cancelBlocked(c);
       this.inbox.expireForMission(c.id);
       try { await removeIntegrationWorktree(root, c.id); }
       catch (e) { this.warn(`remove integration worktree: ${(e as Error).message}`); }

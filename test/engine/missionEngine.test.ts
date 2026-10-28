@@ -558,6 +558,33 @@ describe('MissionEngine', () => {
     expect(openEntry(m.id, 'merge_decision')).toBeUndefined();
   }, T);
 
+  it('a task whose dependency failed is blocked: wait_for_tasks returns it and finish_mission is not held up', async () => {
+    const e = makeEngine([INIT, USER, { exit: 1 }]);
+    const m = await start(e);
+    await approved(e, m, PLAN);
+    const r1 = ref(await e.dispatchTask(m.id, { task_id: 'T1', agent: 'implementer', prompt: 'p', depends_on: [], owns: ['a/**'] }));
+    const r3 = ref(await e.dispatchTask(m.id, { task_id: 'T3', agent: 'implementer', prompt: 'p', depends_on: ['T1'], owns: ['c/**'] }));
+    const rv = ref(await e.dispatchTask(m.id, { task_id: 'T3-review', agent: 'code-reviewer', prompt: 'p', depends_on: ['T3'], owns: [] }));
+    const res = await Promise.race([
+      e.waitForTasks(m.id, [r3, rv], 'all', () => {}),
+      sleep(12_000).then(() => 'hung' as const),
+    ]);
+    expect(res).not.toBe('hung');
+    const s = res as Awaited<ReturnType<typeof e.waitForTasks>>;
+    expect(s.map(x => [x.key, x.status, x.failure_reason])).toEqual([
+      ['T3', 'blocked', 'dependency T1 failed'], ['T3-review', 'blocked', 'dependency T3 blocked'],
+    ]);
+    expect(tasks.get(db, r1)!.state).toBe('failed');
+    expect(tasks.get(db, r3)!.state).toBe('waiting'); // blocked is derived, not a state
+
+    const fin = e.finishMission(m.id, 'T1 failed; giving up.');
+    const entry = await until(() => openEntry(m.id, 'merge_decision'));
+    expect(await e.answerMergeDecision(entry.id, 'Keep branch')).toEqual({ outcome: 'kept' });
+    expect(await fin).toBe('keep');
+    expect([tasks.get(db, r3)!.state, tasks.get(db, rv)!.state]).toEqual(['cancelled', 'cancelled']);
+    expect(tasks.get(db, r1)!.state).toBe('failed');
+  }, T);
+
   it('does not start ready tasks while the mission is not running', async () => {
     const e = makeEngine(TASK_SLOW);
     const m = await start(e, 'Fix login', { maxParallel: 1 });
