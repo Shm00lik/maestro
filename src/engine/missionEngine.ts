@@ -588,6 +588,9 @@ export class MissionEngine extends EventEmitter implements BridgeHandlers {
     this.appendEvent(c.id, 'conductor-exited', { code, resumed: c.conductorRestarts > 0 });
     // Spec §12: restart with --resume once; a resume that never confirmed its session, or a second exit, fails it.
     if (!unconfirmed && c.conductorRestarts === 0 && m.conductorSessionId) {
+      // As on restart recovery: the dead process can take no answer, so its questions expire before the resume.
+      this.inbox.expireConductorEntries(c.id);
+      c.idleEntryId = null;
       this.startConductor(c, m, m.conductorSessionId);
       return;
     }

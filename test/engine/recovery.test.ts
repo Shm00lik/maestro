@@ -7,7 +7,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { openDb, type Db } from '../../src/store/db.js';
-import { events, inbox, missions, projects, sessions, tasks, type InboxEntry, type Mission } from '../../src/store/repos.js';
+import { events, Expired, inbox, missions, projects, sessions, tasks, type InboxEntry, type Mission } from '../../src/store/repos.js';
 import { KEEP, MERGE, MissionEngine } from '../../src/engine/missionEngine.js';
 import { RESUME_MESSAGE } from '../../src/engine/taskRunner.js';
 import { worktreeDirFor } from '../../src/git/worktrees.js';
@@ -259,6 +259,21 @@ describe('recovery', () => {
     expect(resumeOf(condArgv[1])).toBe(mission(m.id).conductorSessionId);
     expect(events.list(db, m.id).find(x => x.type === 'mission-failed')?.data).toEqual({ reason: 'conductor-unrecoverable' });
     expect(events.list(db, m.id).filter(x => x.type === 'conductor-exited')).toHaveLength(2);
+  }, T);
+
+  it('a runtime conductor crash expires the old conductor questions before the resume', async () => {
+    const e = makeEngine('1', TASK_HANG, [INIT, USER, { sleepMs: 1500 }, { exit: 1 }]);
+    const m = await start(e);
+    const asked = e.askUser(m.id, null, { question: 'Which DB?' }).catch((x: unknown) => x);
+    const q = await until(() => openEntries(m.id, 'question')[0]);
+    await until(() => mission(m.id).conductorSessionId); // the first process has read its scenario
+    // The resumed process idles (the fake reads its scenario at startup).
+    writeFileSync(join(dir, 'conductor-1.json'), JSON.stringify({ steps: CONDUCTOR_IDLE }));
+    await until(() => argvs('conductor-1.jsonl').length === 2);
+    expect(resumeOf(argvs('conductor-1.jsonl')[1])).toBeTruthy();
+    expect(inbox.get(db, q.id)!.state).toBe('expired');
+    expect(await asked).toBeInstanceOf(Expired);
+    expect(mission(m.id).state).toBe('planning');
   }, T);
 
   it('flags tasks with no events for 20 minutes once', async () => {

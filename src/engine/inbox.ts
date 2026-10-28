@@ -152,6 +152,19 @@ export class InboxService extends EventEmitter {
     if (expired.length > 0) this.changed(missionId, null);
   }
 
+  /**
+   * The conductor process is gone (crash before a resume): its open questions and permission requests (task_id NULL)
+   * expire, as on restart recovery; the resumed conductor asks again. Plan approvals and merge decisions stay.
+   */
+  expireConductorEntries(missionId: string): void {
+    const expired = inbox.listOpenForMission(this.db, missionId)
+      .filter(e => e.taskId === null && (e.kind === 'question' || e.kind === 'permission'))
+      .filter(e => inbox.expire(this.db, e.id))
+      .map(e => ({ ...e, state: 'expired' as const }));
+    this.rejectPending(expired);
+    if (expired.length > 0) this.changed(missionId, null);
+  }
+
   /** Shutdown: rejects every pending ask in memory; the entries stay open in the database. */
   detachPending(err: Error): void {
     const all = [...this.pending.values()];
