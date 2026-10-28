@@ -418,6 +418,35 @@ describe('TaskRunner', () => {
     expect(git(root, 'show', `${MISSION_BRANCH}:b.txt`)).toBe('first attempt');
   }, 15000);
 
+  it('a leftover branch with the task branch name is not reused by a first run: it gets the -<task8> branch', async () => {
+    const c = setup([INIT(), USER, RESULT(HANDOFF), STDIN_CLOSE]);
+    // A foreign leftover: same name, a commit the task never made.
+    const other = join(dir, 'foreign');
+    git(root, 'worktree', 'add', '-b', TASK_BRANCH, other, 'main');
+    writeFileSync(join(other, 'foreign.txt'), 'not mine\n');
+    git(other, 'add', '.');
+    git(other, 'commit', '-m', 'foreign');
+    git(root, 'worktree', 'remove', '--force', other);
+    await c.runner.start(c.task.id, []);
+    const task8 = c.task.id.replace(/[^A-Za-z0-9]/g, '').slice(0, 8);
+    expect(getTask(c).branch).toBe(`${TASK_BRANCH}-${task8}`);
+    expect((await finished(c)).outcome).toBe('done');
+    expect(() => git(root, 'show', `${MISSION_BRANCH}:foreign.txt`)).toThrow();
+    expect(git(root, 'log', '-1', '--format=%s', TASK_BRANCH)).toBe('foreign'); // left untouched
+  }, 15000);
+
+  it('fails clearly when both the task branch and its -<task8> fallback already exist', async () => {
+    const c = setup([INIT(), USER, RESULT(HANDOFF), STDIN_CLOSE]);
+    const task8 = c.task.id.replace(/[^A-Za-z0-9]/g, '').slice(0, 8);
+    git(root, 'branch', TASK_BRANCH, 'main');
+    git(root, 'branch', `${TASK_BRANCH}-${task8}`, 'main');
+    await c.runner.start(c.task.id, []);
+    const f = await finished(c);
+    expect(f.outcome).toBe('failed');
+    expect(f.reason).toMatch(/^worktree: .*already exist/);
+    expect(argvs()).toHaveLength(0);
+  }, 15000);
+
   it('moves aside (never deletes) a worktree folder that is not a registered worktree', async () => {
     const c = setup([INIT(), USER, RESULT(HANDOFF), STDIN_CLOSE]);
     const wt = worktreeDirFor(root, c.missionId, 'T1');

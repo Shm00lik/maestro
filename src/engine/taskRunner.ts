@@ -15,7 +15,7 @@ import { ClaudeSession, SessionClosed } from '../claude/session.js';
 import { lastHandoff, type StreamEvent } from '../claude/protocol.js';
 import {
   addExistingBranchWorktree, branchExists, createTaskWorktree, isRegisteredWorktree, mergeTaskBranch, pruneWorktrees,
-  worktreeDirFor,
+  withRepoLock, worktreeDirFor, worktreeHead,
 } from '../git/worktrees.js';
 import type { InboxChanged, InboxService, SessionRegistry } from './inbox.js';
 
@@ -253,9 +253,9 @@ export class TaskRunner extends EventEmitter {
       try { role = loadRole(task.agent as AgentRole, this.deps.rolesDir); }
       catch (e) { await this.fail(run, `unknown-agent: ${(e as Error).message}`); return; }
       run.role = role;
-      const branch = `${this.deps.missionBranch}--${task.taskKey}`;
       let dir: string;
-      try { dir = await this.ensureWorktree(task, branch); }
+      let branch: string;
+      try { ({ dir, branch } = await this.ensureWorktree(task)); }
       catch (e) { await this.fail(run, `worktree: ${(e as Error).message}`); return; }
       tasks.setRuntime(this.db, taskId, { worktreePath: dir, branch });
       if (run.stopRequested) return; // stop() cancels it once ready settles
@@ -443,21 +443,44 @@ export class TaskRunner extends EventEmitter {
 
   // ---- worktree ------------------------------------------------------------
 
-  /** Reuses a registered worktree; moves a stray folder aside; re-adds an existing branch (retry); else cuts a new branch. */
-  private async ensureWorktree(task: Task, branch: string): Promise<string> {
+  /**
+   * The task's branch and worktree (spec §8.1). A retry (the task already recorded its branch) reuses that branch:
+   * a registered worktree on it is kept, else the branch is re-added. A first run never reuses a branch it did not
+   * make: it cuts `<missionBranch>--<key>`, or `<missionBranch>--<key>-<task8>` when a leftover already has that name,
+   * and fails when both exist. A stray (unregistered) folder is moved aside. Runs under the repository's git lock.
+   */
+  private ensureWorktree(task: Task): Promise<{ dir: string; branch: string }> {
     const root = this.deps.projectRoot;
-    const dir = worktreeDirFor(root, task.missionId, task.taskKey);
-    if (existsSync(dir)) {
-      if (await isRegisteredWorktree(root, dir)) return dir;
-      // Never delete: a path-normalisation mismatch could make real agent work look unregistered.
-      const aside = `${dir}.stale-${Date.now()}`;
-      renameSync(dir, aside);
-      this.warn(`${dir} is not a registered worktree; moved it to ${aside}`);
-    }
-    await pruneWorktrees(root);
-    if (await branchExists(root, branch)) await addExistingBranchWorktree(root, branch, dir);
-    else await createTaskWorktree(root, this.deps.missionBranch, branch, dir);
-    return dir;
+    return withRepoLock(root, async () => {
+      const dir = worktreeDirFor(root, task.missionId, task.taskKey);
+      const retry = task.branch !== null;
+      let branch: string;
+      if (retry) branch = task.branch!;
+      else {
+        const primary = `${this.deps.missionBranch}--${task.taskKey}`;
+        const fallback = `${primary}-${task.id.replace(/[^A-Za-z0-9]/g, '').slice(0, 8)}`;
+        if (!(await branchExists(root, primary))) branch = primary;
+        else if (!(await branchExists(root, fallback))) {
+          branch = fallback;
+          this.warn(`branch ${primary} already exists and is not this task's; using ${fallback}`);
+        } else throw new Error(`branches ${primary} and ${fallback} already exist; delete or rename them, then retry`);
+      }
+      if (existsSync(dir)) {
+        if (await isRegisteredWorktree(root, dir)) {
+          const head = await worktreeHead(dir);
+          if (retry && head === branch) return { dir, branch };
+          throw new Error(`${dir} is a worktree on ${head || 'an unknown branch'}, not this task's branch ${branch}; remove it, then retry`);
+        }
+        // Never delete: a path-normalisation mismatch could make real agent work look unregistered.
+        const aside = `${dir}.stale-${Date.now()}`;
+        renameSync(dir, aside);
+        this.warn(`${dir} is not a registered worktree; moved it to ${aside}`);
+      }
+      await pruneWorktrees(root);
+      if (retry && await branchExists(root, branch)) await addExistingBranchWorktree(root, branch, dir);
+      else await createTaskWorktree(root, this.deps.missionBranch, branch, dir);
+      return { dir, branch };
+    });
   }
 
   // ---- session plumbing ----------------------------------------------------

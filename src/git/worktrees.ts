@@ -177,3 +177,16 @@ export async function removeIntegrationWorktree(projectRoot: string, missionId: 
   if (!(await listWorktrees(projectRoot)).some((w) => norm(w) === norm(dir))) return;
   await removeWorktree(projectRoot, dir);
 }
+
+/**
+ * Runs fn in the repository's git queue (the one task merges use), so worktree setup never races another worktree
+ * setup or a merge in the same repository (`.git/config` and index locks).
+ */
+export function withRepoLock<T>(projectRoot: string, fn: () => Promise<T>): Promise<T> {
+  return serialized(norm(projectRoot), fn);
+}
+
+/** The branch checked out in a worktree ('' when it cannot be read, e.g. a detached HEAD prints 'HEAD'). */
+export async function worktreeHead(dir: string): Promise<string> {
+  try { return await git(dir, ['rev-parse', '--abbrev-ref', 'HEAD']); } catch { return ''; }
+}
