@@ -105,9 +105,10 @@ const toTask = (r: Row): Task => ({
   startedAt: r.started_at, endedAt: r.ended_at, dispatchedAt: r.dispatched_at ?? null,
   tokensIn: r.tokens_in, tokensOut: r.tokens_out, tokensCacheRead: r.tokens_cache_read, tokensCacheWrite: r.tokens_cache_write,
 });
+const INBOX_STATES: readonly string[] = ['open', 'answered', 'expired'];
 const toInbox = (r: Row): InboxEntry => ({
   id: r.id, missionId: r.mission_id, taskId: r.task_id, kind: r.kind, requestId: r.request_id ?? null,
-  payload: parse(r.payload_json), state: r.state, answer: parse(r.answer_json), createdAt: r.created_at,
+  payload: parse(r.payload_json), state: checkState('inbox', INBOX_STATES, r.state), answer: parse(r.answer_json), createdAt: r.created_at,
   answeredAt: r.answered_at, snoozedUntil: r.snoozed_until,
 });
 const toSession = (r: Row): SessionRow => ({
@@ -349,6 +350,21 @@ export const inbox = {
         Date.now(), e.snoozedUntil ?? null);
     return toInbox(db.prepare('SELECT * FROM inbox WHERE id = ?').get(id) as Row);
   },
+  get(db: Db, id: string): InboxEntry | undefined {
+    const r = db.prepare('SELECT * FROM inbox WHERE id = ?').get(id) as Row | undefined;
+    return r ? toInbox(r) : undefined;
+  },
+  /** An answered entry whose answer could not be delivered becomes expired; answer and answered_at stay for audit. */
+  markUndelivered(db: Db, id: string): InboxEntry {
+    return db.transaction(() => {
+      const res = db.prepare("UPDATE inbox SET state = 'expired' WHERE id = ? AND state = 'answered'").run(id);
+      const r = db.prepare('SELECT * FROM inbox WHERE id = ?').get(id) as Row | undefined;
+      if (!r) throw new Error(`Inbox entry not found: ${id}`);
+      if (res.changes === 0) throw new Error(`Inbox entry is not answered (state ${r.state}): ${id}`);
+      appendEvent(db, { missionId: r.mission_id, taskId: r.task_id, type: 'inbox-undelivered', data: { inboxId: id } });
+      return toInbox(r.state === 'expired' ? r : { ...r, state: 'expired' });
+    })();
+  },
   answer(db: Db, id: string, answer: unknown): InboxEntry {
     return db.transaction(() => {
       const res = db.prepare(
@@ -389,7 +405,7 @@ export const inbox = {
 };
 
 /** Commands with chaining, redirection or substitution never match a stored prefix. */
-const UNSAFE_SHELL = /[\n\r;&|`>]|\$\(/;
+export const UNSAFE_SHELL = /[\n\r;&|`>]|\$\(/;
 
 export const permissionRules = {
   add(db: Db, r: { missionId: string; toolName: string; inputPrefix: string }): void {

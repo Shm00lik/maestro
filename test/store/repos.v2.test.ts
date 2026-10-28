@@ -2,7 +2,7 @@ import { describe, it, expect } from 'vitest';
 import Database from 'better-sqlite3';
 import { openDb, MIGRATIONS } from '../../src/store/db.js';
 import {
-  projects, missions, planVersions, tasks, inbox, permissionRules, sessions, usageWindow, Expired, AlreadyAnswered, DuplicateProject,
+  projects, missions, planVersions, tasks, inbox, permissionRules, sessions, usageWindow, events, Expired, AlreadyAnswered, DuplicateProject,
 } from '../../src/store/repos.js';
 import { buildGraph } from '../../src/core/plan/graph.js';
 import type { PlanTask } from '../../src/core/types.js';
@@ -268,5 +268,32 @@ describe('sessions and usage window', () => {
     expect(usageWindow.get(db)).toEqual({ fiveHour: { utilization: 0.4, resetsAt: 100 }, sevenDay: null, seenAt: 5 });
     usageWindow.save(db, { fiveHour: null, sevenDay: { utilization: 0.1, resetsAt: 9 }, seenAt: 6 });
     expect(usageWindow.get(db)).toEqual({ fiveHour: null, sevenDay: { utilization: 0.1, resetsAt: 9 }, seenAt: 6 });
+  });
+});
+
+describe('inbox.get / markUndelivered', () => {
+  it('get returns the entry or undefined', () => {
+    const { db, m } = setup();
+    const e = inbox.add(db, { missionId: m.id, kind: 'question', payload: { q: 1 } });
+    expect(inbox.get(db, e.id)?.payload).toEqual({ q: 1 });
+    expect(inbox.get(db, 'nope')).toBeUndefined();
+  });
+
+  it('markUndelivered expires an answered entry, keeps the answer, logs an event', () => {
+    const { db, m } = setup();
+    const e = inbox.add(db, { missionId: m.id, kind: 'question', payload: {} });
+    inbox.answer(db, e.id, 'yes');
+    const u = inbox.markUndelivered(db, e.id);
+    expect(u.state).toBe('expired');
+    expect(u.answer).toBe('yes');
+    expect(u.answeredAt).not.toBeNull();
+    expect(events.list(db, m.id).map(x => x.type)).toContain('inbox-undelivered');
+  });
+
+  it('markUndelivered throws when the entry is not answered', () => {
+    const { db, m } = setup();
+    const e = inbox.add(db, { missionId: m.id, kind: 'question', payload: {} });
+    expect(() => inbox.markUndelivered(db, e.id)).toThrow(/not.*answered/i);
+    expect(() => inbox.markUndelivered(db, 'nope')).toThrow();
   });
 });

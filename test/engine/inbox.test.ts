@@ -82,14 +82,37 @@ describe('InboxService', () => {
     ]);
   });
 
-  it('does not store a rule for unsafe Bash commands and reports it', () => {
+  it('does not store a rule for unsafe or empty Bash commands and reports why', () => {
+    const cmds = ['npm test && rm x', 'npm test\nrm x', 'echo $(whoami)', 'echo `id`', 'echo hi > f', '   ', ''];
+    for (const command of cmds) {
+      const s = setup();
+      s.svc.onPermissionRequest(s.m.id, s.t.id, 's1', req('r1', 'Bash', { command }));
+      const [e] = inbox.listOpen(s.db, Date.now());
+      const r = s.svc.answerPermission(e.id, { allow: true, always: true });
+      expect(r.ruleStored).toBe(false);
+      if (command.trim() === '') expect(r.ruleSkippedReason).toMatch(/empty/);
+      else expect(r.ruleSkippedReason).toMatch(/shell operators/);
+      expect(s.db.prepare('SELECT COUNT(*) n FROM permission_rules').get()).toEqual({ n: 0 });
+      expect(s.session.calls).toHaveLength(1);
+    }
+  });
+
+  it('throws a clear error for a permission entry without a requestId', () => {
     const s = setup();
-    s.svc.onPermissionRequest(s.m.id, s.t.id, 's1', req('r1', 'Bash', { command: 'npm test && rm -rf x' }));
+    const e = inbox.add(s.db, { missionId: s.m.id, taskId: s.t.id, kind: 'permission', payload: { toolName: 'Write', input: {}, sessionRowId: 's1' } });
+    expect(() => s.svc.answerPermission(e.id, { allow: true })).toThrow(/requestId/);
+    expect(s.session.calls).toHaveLength(0);
+  });
+
+  it('marks an entry undelivered (expired, answer kept) when the session is closed', () => {
+    const s = setup(fakeSession(true));
+    s.svc.onPermissionRequest(s.m.id, s.t.id, 's1', req('r1', 'Write', {}));
     const [e] = inbox.listOpen(s.db, Date.now());
-    const r = s.svc.answerPermission(e.id, { allow: true, always: true });
-    expect(r.ruleStored).toBe(false);
-    expect(s.db.prepare('SELECT COUNT(*) n FROM permission_rules').get()).toEqual({ n: 0 });
-    expect(s.session.calls).toHaveLength(1);
+    const r = s.svc.answerPermission(e.id, { allow: true });
+    expect(r.delivered).toBe(false);
+    const got = inbox.get(s.db, e.id)!;
+    expect(got.state).toBe('expired');
+    expect(got.answer).toEqual({ allow: true });
   });
 
   it('ask resolves with the answer and rejects non-option answers', async () => {
