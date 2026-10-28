@@ -204,6 +204,8 @@ export class MissionEngine extends EventEmitter implements BridgeHandlers {
   private stuckOpen = new Set<string>();
   /** Task id to the time before which "Keep waiting" silences it. */
   private stuckSnoozed = new Map<string, number>();
+  /** Tasks recovery left alone because a live PID (another Maestro instance?) owns them. */
+  private heldTasks = new Set<string>();
 
   constructor(private o: MissionEngineOptions) {
     super();
@@ -216,6 +218,9 @@ export class MissionEngine extends EventEmitter implements BridgeHandlers {
   }
 
   private warn(msg: string): void { console.error(`[maestro engine] ${msg}`); }
+
+  /** True once shutdown() has begun. */
+  get isClosed(): boolean { return this.closed; }
 
   /** Every bridge handler and user-facing mutator refuses once shutdown() has begun. */
   private assertOpen(): void {
@@ -460,9 +465,10 @@ export class MissionEngine extends EventEmitter implements BridgeHandlers {
   }
 
   private onConductorExit(c: MissionCtx, code: number | null): void {
-    if (c.detached || this.closed) return; // shutdown() ends the row itself and changes nothing else
+    // First, so a recovery waiting on this resume never hangs (even during shutdown).
     const unconfirmed = c.conductorResume !== null;
     this.confirmConductor(c, false);
+    if (c.detached || this.closed) return; // shutdown() ends the row itself and changes nothing else
     if (c.conductorRowId) {
       this.registry.delete(c.conductorRowId);
       try { sessions.end(this.db, c.conductorRowId, code === 0 ? 'ended' : 'failed'); } catch { /* already ended */ }
@@ -963,6 +969,9 @@ export class MissionEngine extends EventEmitter implements BridgeHandlers {
   recover(isPidAlive: (pid: number) => boolean = defaultIsPidAlive): Promise<RecoveryReport> {
     if (!this.recoverPromise) {
       this.assertOpen();
+      if (this.ctxs.size > 0) {
+        throw new Error('recover() must run before any mission is started or attached in this engine');
+      }
       this.recovering = true;
       this.recoverPromise = recoverOnStartup(this, this.db, isPidAlive).finally(() => {
         this.recovering = false;
@@ -996,6 +1005,7 @@ export class MissionEngine extends EventEmitter implements BridgeHandlers {
     const project = projects.list(this.db).find(p => p.id === m.projectId);
     if (!project) throw new Error(`Unknown project: ${m.projectId}`);
     const bridge = await this.ensureBridge();
+    this.assertOpen(); // shutdown began while the bridge started: create nothing
     const c = this.createCtx(m, project.path, bridge);
 
     const open = inboxRepo.listOpenForMission(this.db, missionId).filter(e => e.taskId === null);
@@ -1031,6 +1041,59 @@ export class MissionEngine extends EventEmitter implements BridgeHandlers {
     for (const e of open) if (e.kind === 'question' || e.kind === 'permission') expire(e);
     this.emit('inbox');
     this.flushEvents();
+    if (m.state === 'finishing' && !c.mergeWait) await this.recoverFinishing(c, m);
+  }
+
+  /**
+   * A finishing mission with no open merge_decision: Maestro died during the base merge. If the mission branch is
+   * already in the base branch the merge landed, so record it. Otherwise abort any half-done merge it left and ask
+   * again with a fresh merge_decision (and merge wait).
+   */
+  private async recoverFinishing(c: MissionCtx, m: Mission): Promise<void> {
+    const root = c.projectRoot;
+    const merged = await git(root, ['merge-base', '--is-ancestor', `refs/heads/${m.missionBranch}`, `refs/heads/${m.baseBranch}`])
+      .then(() => true, () => false);
+    this.assertOpen();
+    if (merged) {
+      this.transition(c.id, 'merged');
+      missions.setOutcome(this.db, c.id, 'merged');
+      this.emit('mission', this.mission(c.id));
+      this.inbox.expireForMission(c.id);
+      try { await removeIntegrationWorktree(root, c.id); }
+      catch (e) { this.warn(`remove integration worktree: ${(e as Error).message}`); }
+      return;
+    }
+    await this.abortHalfMerges(c, m);
+    this.assertOpen();
+    const prev = (this.db.prepare(`SELECT id FROM inbox WHERE mission_id = ? AND kind = 'merge_decision'
+      ORDER BY created_at DESC, rowid DESC LIMIT 1`).get(c.id) as { id: string } | undefined);
+    const summary = prev ? ((inboxRepo.get(this.db, prev.id)?.payload as { summary?: string } | null)?.summary ?? '') : '';
+    const w: MergeWait = { entryId: '', summary, merging: null, d: deferred<'merge' | 'keep'>() };
+    c.mergeWait = w;
+    w.entryId = this.mergeEntry(m, summary, 'Maestro restarted before the merge finished. Choose again.').id;
+  }
+
+  /**
+   * Aborts a merge of this mission's branch left in progress: in the main checkout only when it is on the base
+   * branch and MERGE_HEAD is the mission branch tip (a merge of the user's own stays untouched), and in this
+   * mission's temporary merge worktrees (which are then removed).
+   */
+  private async abortHalfMerges(c: MissionCtx, m: Mission): Promise<void> {
+    const root = c.projectRoot;
+    const tip = await git(root, ['rev-parse', `refs/heads/${m.missionBranch}`]).catch(() => '');
+    const mergeHead = (cwd: string): Promise<string> => git(cwd, ['rev-parse', '-q', '--verify', 'MERGE_HEAD']).catch(() => '');
+    const head = await git(root, ['rev-parse', '--abbrev-ref', 'HEAD']).catch(() => '');
+    if (tip && head === m.baseBranch && (await mergeHead(root)) === tip) {
+      await git(root, ['merge', '--abort']).catch(e => this.warn(`merge --abort: ${(e as Error).message}`));
+    }
+    const prefix = `${mission8(c.id)}-merge-`.toLowerCase();
+    const list = await git(root, ['worktree', 'list', '--porcelain']).catch(() => '');
+    const temps = list.split(/\r?\n/).filter(l => l.startsWith('worktree ')).map(l => l.slice(9).trim())
+      .filter(p => (p.split(/[\\/]/).pop() ?? '').toLowerCase().startsWith(prefix));
+    for (const dir of temps) {
+      if (await mergeHead(dir)) await git(dir, ['merge', '--abort']).catch(() => undefined);
+      try { await removeWorktree(root, dir); } catch (e) { this.warn(`remove merge worktree: ${(e as Error).message}`); }
+    }
   }
 
   /** Recovery: --resume the conductor once; false (and the mission failed) when it exits before confirming. */
@@ -1050,6 +1113,9 @@ export class MissionEngine extends EventEmitter implements BridgeHandlers {
     if (c.conductor && c.conductor.status !== 'exited') return;
     this.startConductor(c, this.mission(missionId));
   }
+
+  /** Recovery: the task is owned by a live process elsewhere; this engine never flags or touches it. */
+  holdTask(taskId: string): void { this.heldTasks.add(taskId); }
 
   /** Recovery: a running task with no Claude session goes back to ready (the scheduler starts it). */
   requeueTask(taskId: string): void {
@@ -1081,7 +1147,7 @@ export class MissionEngine extends EventEmitter implements BridgeHandlers {
     if (this.closed || this.recovering) return;
     const after = this.o.stuckAfterMs ?? DEFAULT_STUCK_AFTER_MS;
     for (const id of checkStuck(this.db, now, after)) {
-      if (this.stuckOpen.has(id)) continue;
+      if (this.stuckOpen.has(id) || this.heldTasks.has(id)) continue;
       if ((this.stuckSnoozed.get(id) ?? 0) > now) continue;
       const t = tasks.get(this.db, id);
       const c = t && this.ctxs.get(t.missionId);
@@ -1182,7 +1248,6 @@ export class MissionEngine extends EventEmitter implements BridgeHandlers {
     this.closed = true;
     if (this.tick) { clearInterval(this.tick); this.tick = null; }
     if (this.stuckTimer) { clearInterval(this.stuckTimer); this.stuckTimer = null; }
-    if (this.recoverPromise) await bounded(this.recoverPromise, SHUTDOWN_WAIT_MS);
     const all = [...this.ctxs.values()];
     // In-flight work that writes the database settles first (a merge bails out at its next check unless git is
     // already merging; a stop finishes its transitions).
@@ -1218,6 +1283,8 @@ export class MissionEngine extends EventEmitter implements BridgeHandlers {
       await c.runner.detachAll().catch(e => this.warn(`detach tasks: ${(e as Error).message}`));
       c.runner.dispose();
     }));
+    // A recovery in progress sees `closed` after its current await and stops without writing; let it settle.
+    if (this.recoverPromise) await bounded(this.recoverPromise, SHUTDOWN_WAIT_MS);
   }
 }
 

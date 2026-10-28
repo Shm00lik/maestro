@@ -67,11 +67,12 @@ export async function recoverOnStartup(
   ).all() as { id: string }[]).map(r => missions.get(db, r.id)!);
 
   for (const m of open) {
+    if (engine.isClosed) break; // shutdown: stop without writing anything more
     if (m.state === 'draft') continue; // never started: nothing to resume
     if (heldMissions.has(m.id)) { report.skippedMissions.push(m.id); continue; }
     // One mission's failure (e.g. its project folder is gone) must not stop the others from recovering.
     try { await recoverMission(engine, db, m, heldTasks, report); }
-    catch (e) { report.errors.push({ missionId: m.id, message: (e as Error).message }); }
+    catch (e) { if (!engine.isClosed) report.errors.push({ missionId: m.id, message: (e as Error).message }); }
   }
   return report;
 }
@@ -79,9 +80,14 @@ export async function recoverOnStartup(
 async function recoverMission(
   engine: MissionEngine, db: Db, m: Mission, heldTasks: Set<string>, report: RecoveryReport,
 ): Promise<void> {
+  // Every await below can span a shutdown: re-check `isClosed` after each one and stop without writes.
   await engine.attachForRecovery(m.id);
+  if (engine.isClosed) return;
+  const cur = missions.get(db, m.id);
+  if (!cur || cur.state === 'done' || cur.state === 'stopped' || cur.state === 'failed') return; // e.g. merge had landed
   if (m.conductorSessionId) {
     const ok = await engine.resumeConductor(m.id, m.conductorSessionId);
+    if (engine.isClosed) return;
     if (!ok) { report.missionsFailed.push(m.id); return; }
     report.conductorsResumed.push(m.id);
   } else {
@@ -91,7 +97,7 @@ async function recoverMission(
   const toResume: string[] = [];
   for (const t of tasks.listByMission(db, m.id)) {
     if (t.state !== 'running' && t.state !== 'needs_you') continue;
-    if (heldTasks.has(t.id)) { report.skipped.push(t.id); continue; }
+    if (heldTasks.has(t.id)) { engine.holdTask(t.id); report.skipped.push(t.id); continue; }
     if (!t.sessionId) {
       engine.requeueTask(t.id);
       report.restarted.push(t.id);
@@ -100,6 +106,7 @@ async function recoverMission(
     toResume.push(t.id);
   }
   const results = await Promise.all(toResume.map(async id => ({ id, ok: await engine.resumeTask(id) })));
+  if (engine.isClosed) return;
   for (const r of results) {
     if (r.ok) { report.resumed.push(r.id); continue; }
     const t = tasks.get(db, r.id);

@@ -8,7 +8,8 @@ import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { openDb, type Db } from '../../src/store/db.js';
 import { events, inbox, missions, projects, sessions, tasks, type InboxEntry, type Mission } from '../../src/store/repos.js';
-import { KEEP, MissionEngine } from '../../src/engine/missionEngine.js';
+import { KEEP, MERGE, MissionEngine } from '../../src/engine/missionEngine.js';
+import { RESUME_MESSAGE } from '../../src/engine/taskRunner.js';
 import { checkStuck } from '../../src/engine/recovery.js';
 
 const FAKE = fileURLToPath(new URL('../fake-claude/fake-claude.ts', import.meta.url));
@@ -156,6 +157,9 @@ const allEntries = (missionId: string, kind: string): InboxEntry[] =>
   (db.prepare('SELECT id FROM inbox WHERE mission_id = ? AND kind = ? ORDER BY rowid').all(missionId, kind) as { id: string }[])
     .map(r => inbox.get(db, r.id)!);
 const mission = (id: string): Mission => missions.get(db, id)!;
+/** Every row of every table the engine writes, for "nothing changed" checks. */
+const snapshot = (): string => JSON.stringify(['missions', 'tasks', 'inbox', 'sessions', 'events', 'plan_versions']
+  .map(t => db.prepare(`SELECT * FROM ${t} ORDER BY rowid`).all()));
 
 async function approved(e: MissionEngine, m: Mission, plan: string): Promise<void> {
   const res = e.submitPlan(m.id, writePlan(plan));
@@ -196,6 +200,8 @@ describe('recovery', () => {
     const taskArgv = argvs('fake-2.jsonl');
     expect(taskArgv).toHaveLength(1); // T2's resume only: T1 never runs again
     expect(resumeOf(taskArgv[0])).toBe(s2);
+    expect(RESUME_MESSAGE).toMatch(/question.*ask it again/i);
+    expect(readFileSync(join(dir, 'fake-2.jsonl'), 'utf8')).toContain('Maestro restarted');
     const condArgv = argvs('conductor-2.jsonl');
     expect(condArgv).toHaveLength(1);
     expect(resumeOf(condArgv[0])).toBe(conductorSession);
@@ -310,6 +316,8 @@ describe('recovery', () => {
     expect(tasks.get(db, r)!.state).toBe('running');
     expect(argvs('fake-2.jsonl')).toHaveLength(0);
     expect(sessions.listLive(db).some(s => s.id === other.id)).toBe(true);
+    e2.checkStuckTasks(Date.now() + 21 * 60_000); // held by the other instance: never flagged here
+    expect(allEntries(m.id, 'question')).toHaveLength(0);
   }, T);
 
   it('stuck entry is created once and Keep waiting snoozes it', async () => {
@@ -383,5 +391,99 @@ describe('recovery', () => {
     expect(await again).toBe('keep');
     expect(mission(m.id).state).toBe('done');
     expect(argvs('fake-2.jsonl')).toHaveLength(0);
+  }, T);
+
+  it('recover() must run before any mission is started or attached', async () => {
+    const e = makeEngine('1', TASK_HANG);
+    await start(e);
+    expect(() => e.recover(() => false)).toThrow(/recover\(\) must run before any mission/);
+  }, T);
+
+  /** Mission finishing whose merge_decision was already answered when Maestro died (a crash during the merge). */
+  async function finishingWithoutEntry(): Promise<{ m: Mission; entry: InboxEntry }> {
+    const e1 = makeEngine('1', TASK_DONE);
+    const m = await start(e1);
+    await approved(e1, m, PLAN);
+    const r = ref(await e1.dispatchTask(m.id, { task_id: 'T1', agent: 'implementer', prompt: 'p', depends_on: [], owns: ['a/**'] }));
+    await until(() => tasks.get(db, r)!.state === 'done');
+    void e1.finishMission(m.id, 'All done.').catch(() => undefined);
+    const entry = await until(() => openEntries(m.id, 'merge_decision')[0]);
+    await until(() => mission(m.id).conductorSessionId);
+    await restart(e1);
+    inbox.answer(db, entry.id, MERGE); // answered, then the crash: no outcome recorded
+    return { m, entry };
+  }
+
+  it('records merged for a finishing mission whose branch is already in the base branch', async () => {
+    const { m } = await finishingWithoutEntry();
+    git(root, 'merge', '--no-ff', '-m', 'Maestro: Fix login', 'refs/heads/maestro/fix-login'); // the merge had landed
+    const e2 = makeEngine('2', TASK_DONE);
+    await e2.recover(() => false);
+    expect(mission(m.id).state).toBe('done');
+    expect(mission(m.id).outcome).toBe('merged');
+    expect(openEntries(m.id, 'merge_decision')).toHaveLength(0);
+    expect(git(root, 'worktree', 'list')).not.toMatch(/integration/);
+    expect(argvs('conductor-2.jsonl')).toHaveLength(0); // the mission is over: no conductor to resume
+  }, T);
+
+  it('asks again for a finishing mission with no merge decision and aborts a half-done merge', async () => {
+    const { m, entry } = await finishingWithoutEntry();
+    const base = git(root, 'rev-parse', 'main');
+    git(root, 'merge', '--no-ff', '--no-commit', 'refs/heads/maestro/fix-login'); // half-done: MERGE_HEAD set
+    const e2 = makeEngine('2', TASK_DONE);
+    await e2.recover(() => false);
+    expect(() => git(root, 'rev-parse', '-q', '--verify', 'MERGE_HEAD')).toThrow();
+    expect(git(root, 'status', '--porcelain')).toBe('');
+    expect(git(root, 'rev-parse', 'main')).toBe(base);
+    expect(mission(m.id).state).toBe('finishing');
+    const fresh = openEntries(m.id, 'merge_decision');
+    expect(fresh).toHaveLength(1);
+    expect(fresh[0].id).not.toBe(entry.id);
+    expect(fresh[0].payload).toMatchObject({ summary: 'All done.', options: [MERGE, KEEP] });
+    const again = e2.finishMission(m.id, 'All done.'); // the resumed conductor re-calls
+    expect(await e2.answerMergeDecision(fresh[0].id, KEEP)).toEqual({ outcome: 'kept' });
+    expect(await again).toBe('keep');
+    expect(mission(m.id).state).toBe('done');
+  }, T);
+
+  it('shutdown while recovery waits for the conductor to confirm writes nothing afterwards', async () => {
+    const e1 = makeEngine('1', TASK_HANG);
+    const { m, r } = await runningTask(e1);
+    await restart(e1);
+
+    const e2 = makeEngine('2', TASK_DONE, TASK_NO_INIT); // the resumed conductor never confirms
+    const rec = e2.recover(() => false);
+    await until(() => sessions.listLive(db).some(s => s.role === 'conductor'));
+    const t0 = Date.now();
+    await e2.shutdown();
+    expect(Date.now() - t0).toBeLessThan(10_000);
+    const after = snapshot();
+    await rec;
+    await sleep(1500);
+    expect(snapshot()).toBe(after);
+    expect(mission(m.id).state).toBe('running');
+    expect(tasks.get(db, r)!.state).toBe('running');
+    expect(argvs('fake-2.jsonl')).toHaveLength(0);
+    expect(sessions.listLive(db)).toHaveLength(0);
+  }, T);
+
+  it('shutdown while recovery waits for a task resume writes nothing afterwards', async () => {
+    const e1 = makeEngine('1', TASK_HANG);
+    const { m, r } = await runningTask(e1);
+    await restart(e1);
+
+    const e2 = makeEngine('2', TASK_NO_INIT); // the resumed task never confirms
+    const rec = e2.recover(() => false);
+    await until(() => sessions.listLive(db).some(s => s.taskId === r));
+    await e2.shutdown();
+    const after = snapshot();
+    await rec;
+    await sleep(1500);
+    expect(snapshot()).toBe(after);
+    const t = tasks.get(db, r)!;
+    expect(t.state).toBe('running');
+    expect(t.failureReason).toBeNull();
+    expect(mission(m.id).state).toBe('running');
+    expect(sessions.listLive(db)).toHaveLength(0);
   }, T);
 });

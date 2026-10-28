@@ -23,7 +23,8 @@ const execFileP = promisify(execFile);
 
 export const HANDOFF_REMINDER = 'Finish with a ## Handoff section.';
 export const RESUME_MESSAGE =
-  'Maestro restarted while you were working. Continue the task where you left off and finish with a ## Handoff section.';
+  'Maestro restarted while you were working. Any question you were waiting on was interrupted: ask it again. '
+  + 'Then continue the task where you left off and finish with a ## Handoff section.';
 /** Tools of Maestro's own bridge MCP server (named `maestro` in the bridge config). Any other mcp__* tool is unsafe. */
 export const BRIDGE_TOOL_PREFIX = 'mcp__maestro__';
 const CLOSE_WAIT_MS = 10_000;
@@ -189,6 +190,8 @@ interface Run {
 export class TaskRunner extends EventEmitter {
   readonly registry: LiveSessionRegistry;
   private runs = new Map<string, Run>();
+  /** resumeAfterCrash confirmations by task id, kept after they settle so whenResumed never races them. */
+  private resumes = new Map<string, Promise<boolean>>();
   private readonly onInboxChanged = (e: InboxChanged): void => this.inboxChanged(e);
 
   constructor(private deps: TaskRunnerDeps) {
@@ -274,6 +277,7 @@ export class TaskRunner extends EventEmitter {
     let confirm!: (ok: boolean) => void;
     const confirmed = new Promise<boolean>(r => { confirm = r; });
     run.resumeConfirm = { promise: confirmed, resolve: confirm };
+    this.resumes.set(taskId, confirmed);
     run.resumeId = task.sessionId;
     const release = this.holdReady(run);
     try {
@@ -290,7 +294,7 @@ export class TaskRunner extends EventEmitter {
       try { role = loadRole(task.agent as AgentRole, this.deps.rolesDir); }
       catch (e) { await this.fail(run, `unknown-agent: ${(e as Error).message}`); return; }
       run.role = role;
-      if (run.stopRequested) return;
+      if (run.stopRequested || run.detached) return;
       this.spawn(run, role, task.worktreePath, task.sessionId);
       this.sendOwn(run, RESUME_MESSAGE);
     } catch (e) {
@@ -306,7 +310,7 @@ export class TaskRunner extends EventEmitter {
    * or a result), false when the run ended first (it then failed with reason 'unrecoverable', or was stopped).
    */
   whenResumed(taskId: string): Promise<boolean> {
-    return this.runs.get(taskId)?.resumeConfirm?.promise ?? Promise.resolve(false);
+    return this.resumes.get(taskId) ?? Promise.resolve(false);
   }
 
   /**
@@ -334,6 +338,7 @@ export class TaskRunner extends EventEmitter {
 
   /** A resume that never confirmed its session: reason 'unrecoverable', the detail in a 'resume-failed' event. */
   private failUnrecoverable(run: Run, detail: string): Promise<void> {
+    if (run.detached) return Promise.resolve();
     this.safe('resume-failed event', () => events.append(this.db, {
       missionId: run.missionId, taskId: run.taskId, type: 'resume-failed', data: { detail },
     }));
@@ -611,6 +616,7 @@ export class TaskRunner extends EventEmitter {
   /** Fails the run once. The work runs on a later microtask, so `run.failing` is set before any listener fires. */
   private fail(run: Run, reason: string): Promise<void> {
     if (run.failing) return run.failing;
+    if (run.detached) return Promise.resolve(); // shutdown: the task keeps its state for recovery
     if (run.phase !== 'starting' && run.phase !== 'running') return Promise.resolve();
     run.phase = 'failing';
     run.failing = Promise.resolve()
