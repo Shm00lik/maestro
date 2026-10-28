@@ -1,5 +1,5 @@
 // Windows process-tree control. Never SIGINT / child.kill(): they orphan grandchildren (R5 spike).
-import { spawnSync } from 'node:child_process';
+import { execFile, spawnSync } from 'node:child_process';
 
 export function killTree(pid: number): { ok: boolean; output: string } {
   try {
@@ -15,15 +15,12 @@ export function killTree(pid: number): { ok: boolean; output: string } {
 
 interface Row { ProcessId: number; ParentProcessId: number }
 
-/** pid itself (if running) followed by all descendants; [] when pid is not running. */
-export function listTreePids(pid: number): number[] {
-  const r = spawnSync(
-    'powershell',
-    ['-NoProfile', '-Command', 'Get-CimInstance Win32_Process | Select ProcessId,ParentProcessId | ConvertTo-Json -Compress'],
-    { windowsHide: true, encoding: 'utf8', maxBuffer: 1 << 26 },
-  );
-  if (r.status !== 0 || !r.stdout?.trim()) return [];
-  const parsed = JSON.parse(r.stdout) as Row | Row[];
+const PS_ARGS = ['-NoProfile', '-Command', 'Get-CimInstance Win32_Process | Select ProcessId,ParentProcessId | ConvertTo-Json -Compress'];
+
+function treeFromJson(stdout: string | undefined | null, pid: number): number[] {
+  if (!stdout?.trim()) return [];
+  let parsed: Row | Row[];
+  try { parsed = JSON.parse(stdout) as Row | Row[]; } catch { return []; }
   const rows = Array.isArray(parsed) ? parsed : [parsed];
   if (!rows.some(p => p.ProcessId === pid)) return [];
   const result: number[] = [];
@@ -36,4 +33,22 @@ export function listTreePids(pid: number): number[] {
   };
   walk(pid);
   return result;
+}
+
+/** pid itself (if running) followed by all descendants; [] when pid is not running. */
+export function listTreePids(pid: number): number[] {
+  const r = spawnSync('powershell', PS_ARGS, { windowsHide: true, encoding: 'utf8', maxBuffer: 1 << 26 });
+  if (r.status !== 0) return [];
+  return treeFromJson(r.stdout, pid);
+}
+
+/** Async variant of listTreePids (does not block the event loop); never rejects. */
+export function listTreePidsAsync(pid: number): Promise<number[]> {
+  return new Promise(resolve => {
+    try {
+      execFile('powershell', PS_ARGS, { windowsHide: true, encoding: 'utf8', maxBuffer: 1 << 26 }, (err, stdout) => {
+        resolve(err ? [] : treeFromJson(stdout, pid));
+      });
+    } catch { resolve([]); }
+  });
 }

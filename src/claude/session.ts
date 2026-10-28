@@ -6,10 +6,12 @@ import { randomUUID } from 'node:crypto';
 import { appendFileSync, mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { resolveClaudeCommand } from './exe.js';
-import { killTree, listTreePids } from './processTree.js';
+import { killTree, listTreePidsAsync } from './processTree.js';
 import {
   encodeInterrupt, encodePermissionAllow, encodePermissionDeny, encodeUserMessage, parseEvent, type StreamEvent,
 } from './protocol.js';
+
+const KILL_WAIT_MS = 5000;
 
 export const BASE_ARGS = [
   '-p', '--input-format', 'stream-json', '--output-format', 'stream-json', '--verbose',
@@ -44,6 +46,9 @@ export class ClaudeSession extends EventEmitter {
   private weKilled = false;
   private exitCode: number | null = null;
   private finalized = false;
+  private baseline: Set<number> | null = null;
+  private baselineStarted = false;
+  private killing = false;
   private killPromise: Promise<void> | null = null;
   private interruptPromise: Promise<'interrupted' | 'killed'> | null = null;
 
@@ -65,8 +70,8 @@ export class ClaudeSession extends EventEmitter {
 
     this.child.stdout.setEncoding('utf8');
     this.child.stderr.setEncoding('utf8');
-    this.child.stdout.on('data', (d: string) => { this.outBuf = this.lines(this.outBuf + d, false); });
-    this.child.stderr.on('data', (d: string) => { this.errBuf = this.lines(this.errBuf + d, true); });
+    this.child.stdout.on('data', (d: string) => { if (this.finalized) return; this.outBuf = this.lines(this.outBuf + d, false); });
+    this.child.stderr.on('data', (d: string) => { if (this.finalized) return; this.errBuf = this.lines(this.errBuf + d, true); });
     this.child.stdin.on('error', (e: Error) => this.emitErrorOnce(e));
     this.child.on('error', (e: Error) => {
       this.emitErrorOnce(e);
@@ -83,7 +88,9 @@ export class ClaudeSession extends EventEmitter {
   private emitErrorOnce(e: Error): void {
     if (this.errorEmitted) return;
     this.errorEmitted = true;
-    this.emit('error', e);
+    // An 'error' with no listener would crash the host process: log it instead.
+    if (this.listenerCount('error') > 0) this.emit('error', e);
+    else this.log(`[session error] ${e.message}`);
   }
 
   private log(text: string): void {
@@ -112,6 +119,10 @@ export class ClaudeSession extends EventEmitter {
   private handle(ev: StreamEvent): void {
     if (ev.kind === 'init') {
       this.sessionId = ev.sessionId;
+      if (this.baseline === null && !this.baselineStarted) {
+        this.baselineStarted = true;
+        void listTreePidsAsync(this.pid).then(pids => { this.baseline = new Set(pids); });
+      }
       if (this.status === 'starting') this.status = 'idle';
     } else if (ev.kind === 'result') {
       if (this.status !== 'exited') this.status = 'idle';
@@ -147,6 +158,8 @@ export class ClaudeSession extends EventEmitter {
 
   interrupt(timeoutMs = 5000): Promise<'interrupted' | 'killed'> {
     if (this.status === 'exited') return Promise.resolve('killed');
+    // Nothing to interrupt: don't write (the CLI would never answer and we would kill the session after the timeout).
+    if (this.status === 'idle' || this.status === 'starting') return Promise.resolve('interrupted');
     if (this.interruptPromise) return this.interruptPromise;
     const p = new Promise<'interrupted' | 'killed'>(resolve => {
       let done = false;
@@ -159,27 +172,44 @@ export class ClaudeSession extends EventEmitter {
         resolve(v);
       };
       const onEvent = (ev: StreamEvent): void => {
-        if (ev.kind !== 'result') return;
-        // Tool children may outlive the interrupt; claude's own cleanup is unverified.
-        try {
-          for (const pid of listTreePids(this.pid)) if (pid !== this.pid) killTree(pid);
-        } catch { /* best effort */ }
+        if (ev.kind !== 'result' || this.killing) return;
         settle('interrupted');
+        void this.cleanupToolChildren();
       };
       const onExit = (): void => settle('killed');
-      const timer = setTimeout(() => { void this.kill().then(() => settle('killed')); }, timeoutMs);
+      const timer = setTimeout(() => {
+        this.killing = true; // from here only 'killed' may settle
+        this.off('event', onEvent);
+        void this.kill().then(() => settle('killed'));
+      }, timeoutMs);
       this.on('event', onEvent);
       this.on('exit', onExit);
       try {
         this.write(encodeInterrupt(`maestro-int-${randomUUID()}`));
       } catch {
+        this.killing = true;
+        this.off('event', onEvent);
         void this.kill().then(() => settle('killed'));
       }
-    }).finally(() => { this.interruptPromise = null; });
+    }).finally(() => { this.interruptPromise = null; this.killing = false; });
     this.interruptPromise = p;
     return p;
   }
 
+  /** Kill descendants that appeared since the post-init baseline (tool children), sparing e.g. stdio MCP servers. */
+  private async cleanupToolChildren(): Promise<void> {
+    if (!this.baseline) { this.log('[session] interrupt cleanup skipped: baseline not ready'); return; }
+    const now = await listTreePidsAsync(this.pid);
+    for (const pid of now) {
+      if (pid === this.pid || this.baseline.has(pid)) continue;
+      killTree(pid);
+    }
+  }
+
+  /**
+   * Ends stdin. Allowed while starting/idle, a no-op once exited or already ended,
+   * and throws when busy (interrupt first).
+   */
   close(): void {
     if (this.status === 'busy') throw new Error('Cannot close a busy session: interrupt() it first');
     if (this.status === 'exited' || this.stdinEnded) return;
@@ -195,7 +225,12 @@ export class ClaudeSession extends EventEmitter {
       if (this.status !== 'exited') {
         this.weKilled = true;
         this.stdinEnded = true;
-        if (this.pid > 0) killTree(this.pid);
+        const r = this.pid > 0 ? killTree(this.pid) : { ok: false, output: 'no pid' };
+        setTimeout(() => {
+          if (this.finalized) return;
+          this.log(`[session] no exit ${KILL_WAIT_MS}ms after killTree (ok=${r.ok}): ${r.output}`);
+          this.finalize(null);
+        }, KILL_WAIT_MS).unref();
       }
     });
     return this.killPromise;

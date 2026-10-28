@@ -147,15 +147,80 @@ describe('ClaudeSession', () => {
     expect(ev).toEqual({ kind: 'permission-cancel', requestId: 'abc' });
   }, 10000);
 
+  const alive = (pid: number): boolean => { try { process.kill(pid, 0); return true; } catch { return false; } };
+  const waitUntil = async (cond: () => boolean, ms = 6000): Promise<void> => {
+    const end = Date.now() + ms;
+    while (!cond() && Date.now() < end) await new Promise(r => setTimeout(r, 100));
+  };
+  const baselineReady = (s: ClaudeSession): Promise<void> =>
+    waitUntil(() => (s as unknown as { baseline: Set<number> | null }).baseline !== null);
+  const children = (): number[] => fakeLogLines().filter(l => typeof l.spawnedChild === 'number').map(l => l.spawnedChild as number);
+
   it('kills a spawned tool child left behind after an interrupt', async () => {
-    const s = start({ steps: [{ emit: INIT }, { spawnChild: 'ping' }, { waitFor: 'user' }, { waitFor: 'interrupt' }, { emit: RESULT }, { waitFor: 'stdin-close' }] });
+    const s = start({ steps: [{ emit: INIT }, { waitFor: 'user' }, { spawnChild: 'ping' }, { waitFor: 'interrupt' }, { emit: RESULT }, { waitFor: 'stdin-close' }] });
+    await until(s, 'init');
+    await baselineReady(s);
+    s.send('go');
+    await waitUntil(() => children().length === 1);
+    const pid = children()[0];
+    expect(alive(pid)).toBe(true);
+    expect(await s.interrupt(8000)).toBe('interrupted');
+    await waitUntil(() => !alive(pid));
+    expect(alive(pid)).toBe(false);
+    expect(s.status).toBe('idle');
+  }, 10000);
+
+  it('a child spawned before the baseline survives the interrupt cleanup', async () => {
+    const s = start({ steps: [{ spawnChild: 'ping' }, { emit: INIT }, { waitFor: 'user' }, { spawnChild: 'ping' }, { waitFor: 'interrupt' }, { emit: RESULT }, { waitFor: 'stdin-close' }] });
+    await until(s, 'init');
+    await baselineReady(s);
+    s.send('go');
+    await waitUntil(() => children().length === 2);
+    const [early, late] = children();
+    expect(await s.interrupt(8000)).toBe('interrupted');
+    await waitUntil(() => !alive(late));
+    expect(alive(late)).toBe(false);
+    expect(alive(early)).toBe(true);
+  }, 10000);
+
+  it('interrupt after result returns interrupted and the session stays alive', async () => {
+    const s = start('idle');
     await until(s, 'init');
     s.send('go');
-    expect(await s.interrupt(8000)).toBe('interrupted');
-    const pid = fakeLogLines().find(l => typeof l.spawnedChild === 'number')!.spawnedChild as number;
-    let alive = true;
-    try { process.kill(pid, 0); } catch { alive = false; }
-    expect(alive).toBe(false);
+    await until(s, 'result');
     expect(s.status).toBe('idle');
+    expect(await s.interrupt(300)).toBe('interrupted');
+    expect(s.status).toBe('idle');
+    expect(fakeLogLines().filter(l => l?.request?.subtype === 'interrupt')).toHaveLength(0);
+    s.send('again');
+    expect(s.status).toBe('busy');
+  }, 10000);
+
+  it('a result arriving after the timeout fired still resolves killed', async () => {
+    const s = start({ steps: [{ emit: INIT }, { waitFor: 'user' }, { waitFor: 'interrupt' }, { sleepMs: 150 }, { emit: RESULT }, { waitFor: 'stdin-close' }] });
+    await until(s, 'init');
+    s.send('go');
+    expect(await s.interrupt(100)).toBe('killed');
+    expect(s.status).toBe('exited');
+  }, 10000);
+
+  it('stdin EPIPE without an error listener does not throw and is logged', async () => {
+    const s = start('idle');
+    await until(s, 'init');
+    const priv = s as unknown as { child: { stdin: { emit(e: string, err: Error): void } } };
+    expect(() => priv.child.stdin.emit('error', new Error('write EPIPE'))).not.toThrow();
+    expect(() => priv.child.stdin.emit('error', new Error('write EPIPE'))).not.toThrow();
+    expect(readFileSync(join(dir, 'logs', 's.log'), 'utf8')).toContain('write EPIPE');
+  }, 10000);
+
+  it('stdin EPIPE with an error listener emits error once', async () => {
+    const s = start('idle');
+    await until(s, 'init');
+    const errs: Error[] = [];
+    s.on('error', e => errs.push(e));
+    const priv = s as unknown as { child: { stdin: { emit(e: string, err: Error): void } } };
+    priv.child.stdin.emit('error', new Error('EPIPE 1'));
+    priv.child.stdin.emit('error', new Error('EPIPE 2'));
+    expect(errs).toHaveLength(1);
   }, 10000);
 });
