@@ -27,6 +27,7 @@ export const RESUME_MESSAGE =
 /** Tools of Maestro's own bridge MCP server (named `maestro` in the bridge config). Any other mcp__* tool is unsafe. */
 export const BRIDGE_TOOL_PREFIX = 'mcp__maestro__';
 const CLOSE_WAIT_MS = 10_000;
+const DETACHED = '\u0000detached';
 const CRASH_LOG_LINES = 50;
 const CRASH_LOG_MAX = 4096;
 
@@ -161,6 +162,8 @@ interface Run {
   lastAssistantText: string;
   lastError: string | null;
   finished: boolean;
+  /** Set by detach(): a completion that has not started merging stops without any state change. */
+  detached: boolean;
   /** Set synchronously by stop(); start/resume check it before spawning. */
   stopRequested: boolean;
   /** Settles when start/resume finished spawning (or failed). */
@@ -212,7 +215,7 @@ export class TaskRunner extends EventEmitter {
     const run: Run = {
       taskId: task.id, missionId: task.missionId, role: null, phase: 'starting', session: null, rowId: null,
       rowEnded: false, logPath: null, reminded: false, turns: [], lastAssistantText: '', lastError: null,
-      finished: false, stopRequested: false, ready: Promise.resolve(), stopPromise: null, finishing: null, failing: null,
+      finished: false, detached: false, stopRequested: false, ready: Promise.resolve(), stopPromise: null, finishing: null, failing: null,
     };
     this.runs.set(task.id, run);
     return run;
@@ -327,8 +330,12 @@ export class TaskRunner extends EventEmitter {
     const run = this.runs.get(taskId);
     if (!run) return;
     run.stopRequested = true; // a start still preparing its worktree spawns nothing
+    run.detached = true; // a completion still waiting for its process to exit ends here (no merge, no transition)
     await run.ready;
     if (run.stopPromise) { await run.stopPromise; return; }
+    if (run.finishing && run.session && run.session.status !== 'exited') {
+      try { await run.session.kill(); } catch (e) { this.warn(`detach kill: ${(e as Error).message}`); }
+    }
     if (run.finishing) await run.finishing;
     if (run.failing) await run.failing;
     if (run.phase === 'ended') return;
@@ -572,6 +579,13 @@ export class TaskRunner extends EventEmitter {
         let f: TaskFinished;
         try {
           const reason = await this.completeSteps(run, handoff);
+          if (reason === DETACHED) {
+            // Shutdown: the task stays as it is (its handoff is stored) for recovery; no 'finished'.
+            this.safe('end session row', () => this.endSessionRow(run, 'ended'));
+            run.phase = 'ended';
+            run.finished = true;
+            return;
+          }
           f = reason === null ? { taskId: run.taskId, outcome: 'done' } : { taskId: run.taskId, outcome: 'failed', reason };
         } catch (e) {
           // A throw after the task reached done (e.g. a 'state' listener) must not turn it into a failure.
@@ -589,7 +603,7 @@ export class TaskRunner extends EventEmitter {
       .catch(e => this.warn(`complete: ${(e as Error)?.message ?? e}`));
   }
 
-  /** Returns null when merged and done, or a failure reason. */
+  /** Returns null when merged and done, DETACHED when detach() interrupted it before the merge, or a failure reason. */
   private async completeSteps(run: Run, handoff: string): Promise<string | null> {
     tasks.setRuntime(this.db, run.taskId, { handoffMd: handoff });
     const session = run.session!;
@@ -604,6 +618,7 @@ export class TaskRunner extends EventEmitter {
       try { await session.stop(this.deps.stopTimeoutMs ?? 5000); }
       catch (e) { this.warn(`session stop: ${(e as Error).message}`); }
     }
+    if (run.detached) return DETACHED;
     this.endSessionRow(run, 'ended');
 
     const task = this.task(run.taskId);

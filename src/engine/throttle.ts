@@ -20,7 +20,6 @@ export class Throttle {
     const at = ev.resetsAt !== null && Number.isFinite(ev.resetsAt) ? ev.resetsAt * 1000 : null; // resetsAt is in seconds
     if (at !== null && at > now) this.until = at;
     else this.onRateLimitedWithoutReset(now); // no resetsAt, or one already in the past
-
   }
 
   onRateLimitedWithoutReset(now: number): void {

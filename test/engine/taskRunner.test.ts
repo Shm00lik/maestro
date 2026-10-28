@@ -308,6 +308,25 @@ describe('TaskRunner', () => {
     expect(getTask(c).failureReason).toBeNull();
   }, 15000);
 
+  it('detach during a slow completion leaves the task running and merges nothing', async () => {
+    // The process lingers 4 s after stdin closes, so the completion is still waiting for it to exit.
+    const c = setup([INIT(), USER, RESULT(HANDOFF), STDIN_CLOSE, { sleepMs: 4000 }]);
+    const missionTip = git(root, 'rev-parse', MISSION_BRANCH);
+    await c.runner.start(c.task.id, []);
+    for (let i = 0; i < 200 && !getTask(c).handoffMd; i++) await sleep(25);
+    expect(getTask(c).handoffMd).toContain('Made x.');
+    const [row] = sessions.listLive(c.db);
+    await c.runner.detachAll();
+    expect(getTask(c).state).toBe('running');
+    expect(c.states).toEqual(['running']);
+    expect(c.finished).toEqual([]);
+    expect(git(root, 'rev-parse', MISSION_BRANCH)).toBe(missionTip);
+    expect(events.list(c.db, c.missionId).some(e => e.type === 'merged')).toBe(false);
+    expect(sessions.listLive(c.db)).toHaveLength(0);
+    for (let i = 0; i < 50 && alive(row.pid!); i++) await sleep(50);
+    expect(alive(row.pid!)).toBe(false);
+  }, 15000);
+
   it('stop is idempotent and expires pending permissions', async () => {
     const c = setup([
       INIT(), USER, PERM('r1', 'npm test'), PERM('r2', 'npm run lint'), { waitFor: 'interrupt' },

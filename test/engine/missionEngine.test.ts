@@ -38,6 +38,8 @@ const CONDUCTOR_IDLE = [INIT, USER, ...UNTIL_INTERRUPT];
 const TASK_DONE = [INIT, USER, { writeFile: 'out-$SESSION.txt', content: 'work\n' }, RESULT('Did it.\n\n## Handoff\nMade a file.'), { waitFor: 'stdin-close' }];
 const TASK_HANG = [INIT, USER, ...UNTIL_INTERRUPT];
 const TASK_SLOW = [INIT, USER, { sleepMs: 1500 }, ...TASK_DONE.slice(2)];
+/** Ends with a handoff, then lingers 4 s after stdin closes: the completion is slow. */
+const TASK_LINGER = [...TASK_DONE, { sleepMs: 4000 }];
 const ASSISTANT_TASK_TOOL = {
   emit: {
     type: 'assistant', parent_tool_use_id: null,
@@ -556,5 +558,112 @@ describe('MissionEngine', () => {
     await expect(start(e, 'x', { baseBranch: 'nope' })).rejects.toThrow(/does not exist/);
     expect(count()).toBe(0);
     expect(git(root, 'branch', '--list')).not.toMatch(/bad|force/);
+  }, T);
+
+  /** Everything the engine could write, to prove nothing changes after a point. */
+  const snapshot = (): string => JSON.stringify({
+    missions: db.prepare('SELECT * FROM missions ORDER BY id').all(),
+    tasks: db.prepare('SELECT id, state, handoff_md, failure_reason FROM tasks ORDER BY id').all(),
+    inbox: db.prepare('SELECT id, kind, state, answer_json FROM inbox ORDER BY id').all(),
+    events: (db.prepare('SELECT COUNT(*) AS n FROM events').get() as { n: number }).n,
+    plans: db.prepare('SELECT * FROM plan_versions ORDER BY id').all(),
+  });
+
+  it('shutdown blocks every bridge handler and mutator while a task completion is slow', async () => {
+    const e = makeEngine(TASK_LINGER);
+    const m = await start(e);
+    await approved(e, m, PLAN);
+    const r1 = ref(await e.dispatchTask(m.id, { task_id: 'T1', agent: 'implementer', prompt: 'p', depends_on: [], owns: ['a/**'] }));
+    await until(() => tasks.get(db, r1)!.handoffMd); // completing: the process is lingering
+    const inboxBefore = (db.prepare('SELECT COUNT(*) AS n FROM inbox').get() as { n: number }).n;
+    const stateEvents = (): number => (db.prepare("SELECT COUNT(*) AS n FROM events WHERE type = 'state'").get() as { n: number }).n;
+    const statesBefore = stateEvents();
+
+    const sd = e.shutdown();
+    const err = /Maestro is shutting down/;
+    await expect(e.finishMission(m.id, 's')).rejects.toThrow(err);
+    await expect(e.dispatchTask(m.id, { task_id: 'T2', agent: 'implementer', prompt: 'p', depends_on: [], owns: ['b/**'] })).rejects.toThrow(err);
+    await expect(e.askUser(m.id, null, { question: 'q' })).rejects.toThrow(err);
+    await expect(e.askUser(m.id, r1, { question: 'q' })).rejects.toThrow(err);
+    await expect(e.submitPlan(m.id, writePlan(PLAN_SRC, 'late.md'))).rejects.toThrow(err);
+    expect(() => e.approvePlan(m.id)).toThrow(err);
+    expect(() => e.replan(m.id, 'n')).toThrow(err);
+    await expect(e.answerMergeDecision('nope', 'Merge')).rejects.toThrow(err);
+    await sd;
+
+    expect(mission(m.id).state).toBe('running');
+    expect(tasks.get(db, r1)!.state).toBe('running');
+    expect(tasks.getByKey(db, m.id, 'T2')!.state).toBe('planned');
+    expect((db.prepare('SELECT COUNT(*) AS n FROM inbox').get() as { n: number }).n).toBe(inboxBefore);
+    expect(stateEvents()).toBe(statesBefore);
+    expect(git(root, 'log', '--format=%s', 'maestro/fix-login')).not.toMatch(/Merge T1/);
+    const snap = snapshot();
+    await sleep(500);
+    expect(snapshot()).toBe(snap);
+  }, T);
+
+  it('shutdown during a slow base merge waits for it and never writes afterwards', async () => {
+    let entered!: () => void;
+    const inMerge = new Promise<void>(r => { entered = r; });
+    let release!: () => void;
+    const gate = new Promise<void>(r => { release = r; });
+    const e = makeEngine(TASK_DONE, CONDUCTOR_IDLE, async () => { entered(); await gate; });
+    const m = await start(e);
+    const base = git(root, 'rev-parse', 'main');
+    await approved(e, m, PLAN_SRC);
+    const r = ref(await e.dispatchTask(m.id, { task_id: 'T1', agent: 'implementer', prompt: 'p', depends_on: [], owns: ['src/**'] }));
+    await e.waitForTasks(m.id, [r], 'all', () => {});
+    void e.finishMission(m.id, 'Done.').catch(() => undefined);
+    const entry = await until(() => openEntry(m.id, 'merge_decision'));
+    const answer = e.answerMergeDecision(entry.id, 'Merge').catch((x: unknown) => x);
+    await inMerge;
+    const sd = e.shutdown();
+    expect(await pending(sd)).toBe(true); // waits for the merge in flight
+    release();
+    await sd;
+    const res = await answer;
+    const after = mission(m.id);
+    if (git(root, 'rev-parse', 'main') !== base) {
+      expect([after.state, after.outcome]).toEqual(['done', 'merged']);
+    } else {
+      expect(after.state).toBe('finishing');
+      expect(inbox.get(db, entry.id)!.state).toBe('open');
+      expect(String(res)).toMatch(/shutting down/);
+    }
+    const snap = snapshot();
+    await sleep(700);
+    expect(snapshot()).toBe(snap);
+  }, T);
+
+  it('stop after a merged mission leaves its never-dispatched tasks planned', async () => {
+    const e = makeEngine(TASK_DONE);
+    const m = await start(e);
+    await approved(e, m, PLAN);
+    const r = ref(await e.dispatchTask(m.id, { task_id: 'T1', agent: 'implementer', prompt: 'p', depends_on: [], owns: ['a/**'] }));
+    await e.waitForTasks(m.id, [r], 'all', () => {});
+    const fin = e.finishMission(m.id, 'Partial on purpose.');
+    const entry = await until(() => openEntry(m.id, 'merge_decision'));
+    await e.answerMergeDecision(entry.id, 'Merge');
+    expect(await fin).toBe('merge');
+    await e.stop(m.id);
+    expect([mission(m.id).state, mission(m.id).outcome]).toEqual(['done', 'merged']);
+    expect(tasks.listByMission(db, m.id).map(t => [t.taskKey, t.state])).toEqual(
+      [['T1', 'done'], ['T2', 'planned'], ['T3', 'planned']]);
+  }, T);
+
+  it('shutdown waits for a stop in progress, so nothing changes after it resolves', async () => {
+    const e = makeEngine(TASK_HANG);
+    const m = await start(e);
+    await approved(e, m, PLAN_SRC);
+    const r = ref(await e.dispatchTask(m.id, { task_id: 'T1', agent: 'implementer', prompt: 'p', depends_on: [], owns: ['src/**'] }));
+    await until(() => sessions.listLive(db).length === 2);
+    const st = e.stop(m.id);
+    await e.shutdown();
+    expect(mission(m.id).state).toBe('stopped');
+    expect(tasks.get(db, r)!.state).toBe('cancelled');
+    const snap = snapshot();
+    await st;
+    await sleep(500);
+    expect(snapshot()).toBe(snap);
   }, T);
 });

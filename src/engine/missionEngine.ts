@@ -34,6 +34,9 @@ const execFileP = promisify(execFile);
 
 const DEFAULT_PROMPT_FILE = fileURLToPath(new URL('../../prompts/conductor.md', import.meta.url));
 const TICK_MS = 1000;
+/** shutdown() waits at most this long for an in-flight merge or stop. */
+const SHUTDOWN_WAIT_MS = 15_000;
+const SHUTTING_DOWN = 'Maestro is shutting down';
 const PROGRESS_MS = 60_000;
 /** After the mission ends, the conductor gets this long to finish its turn before it is stopped. */
 const CONDUCTOR_LINGER_MS = 120_000;
@@ -76,6 +79,10 @@ export type MergeDecisionResult =
   | { outcome: 'retry'; reason: string }
   /** The mission was stopped while the merge was starting; the base branch is untouched. */
   | { outcome: 'stopped' };
+
+type BaseMergeResult =
+  | { ok: true }
+  | { ok: false; reason: string; files?: string[]; halted?: 'closed' | 'stopped' };
 
 type PlanResult = { errors: PlanError[] } | { approved: true } | { approved: false; note: string };
 
@@ -179,6 +186,11 @@ export class MissionEngine extends EventEmitter implements BridgeHandlers {
 
   private warn(msg: string): void { console.error(`[maestro engine] ${msg}`); }
 
+  /** Every bridge handler and user-facing mutator refuses once shutdown() has begun. */
+  private assertOpen(): void {
+    if (this.closed) throw new Error(SHUTTING_DOWN);
+  }
+
   // ---- lookups ---------------------------------------------------------------
 
   private ctx(missionId: string): MissionCtx {
@@ -248,7 +260,7 @@ export class MissionEngine extends EventEmitter implements BridgeHandlers {
   }
 
   async startMission(input: StartMissionInput): Promise<Mission> {
-    if (this.closed) throw new Error('The mission engine is closed');
+    this.assertOpen();
     const { quick, missionBranch: givenBranch, ...rest } = input;
     const project = projects.list(this.db).find(p => p.id === input.projectId);
     if (!project) throw new Error(`Unknown project: ${input.projectId}`);
@@ -351,6 +363,7 @@ export class MissionEngine extends EventEmitter implements BridgeHandlers {
   }
 
   private onConductorEvent(c: MissionCtx, ev: StreamEvent): void {
+    if (this.closed) return; // shutting down: the conductor writes nothing more
     switch (ev.kind) {
       case 'init':
         if (ev.sessionId) {
@@ -415,7 +428,7 @@ export class MissionEngine extends EventEmitter implements BridgeHandlers {
     if (this.hooked.has(s)) return;
     this.hooked.add(s);
     s.on('event', (ev: StreamEvent) => {
-      if (ev.kind !== 'rate-limit') return;
+      if (ev.kind !== 'rate-limit' || this.closed) return;
       const now = Date.now();
       this.throttle.onRateLimit(ev, now);
       if (ev.fiveHour || ev.sevenDay) {
@@ -432,6 +445,7 @@ export class MissionEngine extends EventEmitter implements BridgeHandlers {
   }
 
   async submitPlan(missionId: string, planPath: string): Promise<PlanResult> {
+    this.assertOpen();
     const c = this.ctx(missionId);
     if (c.stopPromise) throw new Error('The mission is stopping');
     const abs = this.resolvePlanPath(c, planPath);
@@ -512,6 +526,7 @@ export class MissionEngine extends EventEmitter implements BridgeHandlers {
   }
 
   approvePlan(missionId: string): void {
+    this.assertOpen();
     const c = this.ctx(missionId);
     const w = c.planWait;
     if (!w) throw new Error(`Mission ${missionId} has no plan waiting for approval`);
@@ -526,6 +541,7 @@ export class MissionEngine extends EventEmitter implements BridgeHandlers {
   }
 
   replan(missionId: string, note: string): void {
+    this.assertOpen();
     const c = this.ctx(missionId);
     const w = c.planWait;
     if (!w) throw new Error(`Mission ${missionId} has no plan waiting for approval`);
@@ -540,6 +556,7 @@ export class MissionEngine extends EventEmitter implements BridgeHandlers {
   // ---- dispatch_task -----------------------------------------------------------
 
   async dispatchTask(missionId: string, d: DispatchInput): Promise<{ task_ref: string }> {
+    this.assertOpen();
     const c = this.ctx(missionId);
     const m = this.mission(missionId);
     if (m.state !== 'running') {
@@ -655,7 +672,7 @@ export class MissionEngine extends EventEmitter implements BridgeHandlers {
       return mode === 'any' ? states.some(s => WAIT_TERMINAL.has(s)) : states.every(s => WAIT_TERMINAL.has(s));
     };
     if (!isDone()) {
-      if (this.closed) throw new Error('Maestro is shutting down');
+      this.assertOpen();
       await new Promise<void>((res, rej) => {
         const progress = setInterval(() => { try { onProgress(); } catch { /* ignore */ } }, this.o.progressMs ?? PROGRESS_MS);
         progress.unref();
@@ -691,6 +708,7 @@ export class MissionEngine extends EventEmitter implements BridgeHandlers {
   // ---- ask_user ----------------------------------------------------------------
 
   async askUser(missionId: string, taskId: string | null, q: { question: string; options?: string[]; context?: string }): Promise<string> {
+    this.assertOpen();
     const c = this.ctx(missionId);
     if (taskId !== null) this.ownTask(missionId, taskId);
     if (c.stopPromise) throw new Error('The mission is stopping');
@@ -702,6 +720,7 @@ export class MissionEngine extends EventEmitter implements BridgeHandlers {
   // ---- finish_mission ----------------------------------------------------------
 
   async finishMission(missionId: string, summary: string): Promise<'merge' | 'keep'> {
+    this.assertOpen();
     const c = this.ctx(missionId);
     if (c.stopPromise) throw new Error('The mission is stopping');
     if (c.mergeWait) return c.mergeWait.d.promise; // idempotent re-call
@@ -729,6 +748,7 @@ export class MissionEngine extends EventEmitter implements BridgeHandlers {
 
   /** The user's answer to a merge_decision entry. A failed merge creates a new entry and keeps the mission finishing. */
   async answerMergeDecision(entryId: string, answer: string): Promise<MergeDecisionResult> {
+    this.assertOpen();
     const entry = inboxRepo.get(this.db, entryId);
     if (!entry || entry.kind !== 'merge_decision') throw new Error(`Not a merge decision: ${entryId}`);
     const c = this.ctx(entry.missionId);
@@ -740,11 +760,11 @@ export class MissionEngine extends EventEmitter implements BridgeHandlers {
     if (answer !== MERGE && answer !== KEEP) throw new Error(`Answer must be one of the options: ${MERGE}, ${KEEP}`);
     if (c.stopPromise) throw new Error('The mission is stopping');
     if (w.merging) throw new Error('A merge is already in progress');
-    inboxRepo.answer(this.db, entryId, answer);
-    this.emit('inbox');
     const m = this.mission(c.id);
 
     if (answer === KEEP) {
+      inboxRepo.answer(this.db, entryId, answer);
+      this.emit('inbox');
       this.transition(c.id, 'kept');
       missions.setOutcome(this.db, c.id, 'kept');
       this.emit('mission', this.mission(c.id));
@@ -753,19 +773,21 @@ export class MissionEngine extends EventEmitter implements BridgeHandlers {
       return { outcome: 'kept' };
     }
 
-    // stop() waits for this promise before it changes anything.
-    const merging = this.runMerge(c, w, m);
+    // The entry is answered only once the merge has an outcome, so a merge halted by shutdown leaves it open.
+    // stop() and shutdown() wait for this promise before they change or tear down anything.
+    const merging = this.runMerge(c, w, m, entryId);
     w.merging = merging;
     try { return await merging; } finally { w.merging = null; }
   }
 
-  private async runMerge(c: MissionCtx, w: MergeWait, m: Mission): Promise<MergeDecisionResult> {
-    let res: { ok: true } | { ok: false; reason: string; files?: string[] };
+  private async runMerge(c: MissionCtx, w: MergeWait, m: Mission, entryId: string): Promise<MergeDecisionResult> {
+    let res: BaseMergeResult;
     try { res = await this.mergeIntoBase(c, m); }
     catch (e) { res = { ok: false, reason: (e as Error).message }; }
 
     if (res.ok) {
-      // The base branch now has the work: record it even if a stop arrived meanwhile (stop waits for us).
+      // The base branch now has the work: record it even if a stop or shutdown arrived meanwhile (both wait for us).
+      this.answerQuietly(entryId, MERGE);
       if (this.mission(c.id).state === 'finishing') {
         this.transition(c.id, 'merged');
         missions.setOutcome(this.db, c.id, 'merged');
@@ -777,7 +799,10 @@ export class MissionEngine extends EventEmitter implements BridgeHandlers {
       w.d.resolve('merge');
       return { outcome: 'merged' };
     }
-    if (c.stopPromise || this.mission(c.id).state !== 'finishing') return { outcome: 'stopped' };
+    // Halted before the merge: shutdown writes nothing (the entry stays open); a stop expires the entry itself.
+    if (res.halted === 'closed' || this.closed) throw new Error('Maestro is shutting down');
+    if (res.halted === 'stopped' || c.stopPromise || this.mission(c.id).state !== 'finishing') return { outcome: 'stopped' };
+    this.answerQuietly(entryId, MERGE);
     if (res.files) {
       this.appendEvent(c.id, 'merge-conflict', { files: res.files });
       // Informational: the answer itself is not needed (the user acts on the new merge decision).
@@ -790,19 +815,32 @@ export class MissionEngine extends EventEmitter implements BridgeHandlers {
     return { outcome: 'retry', reason: res.reason };
   }
 
+  private answerQuietly(entryId: string, answer: string): void {
+    try { inboxRepo.answer(this.db, entryId, answer); this.emit('inbox'); }
+    catch (e) { this.warn(`answer ${entryId}: ${(e as Error).message}`); }
+  }
+
+  /** Why to give up before merging, re-checked after every await: shutdown, or a stop. */
+  private halt(c: MissionCtx): BaseMergeResult | null {
+    if (this.closed) return { ok: false, reason: 'Maestro is shutting down', halted: 'closed' };
+    if (c.stopPromise) return { ok: false, reason: 'The mission is stopping', halted: 'stopped' };
+    return null;
+  }
+
   /** Merges the mission branch into the base branch: in the main checkout, else in a temporary worktree. */
-  private async mergeIntoBase(c: MissionCtx, m: Mission): Promise<{ ok: true } | { ok: false; reason: string; files?: string[] }> {
+  private async mergeIntoBase(c: MissionCtx, m: Mission): Promise<BaseMergeResult> {
     const root = c.projectRoot;
     const msg = `Maestro: ${m.title}`;
-    const stopped = { ok: false as const, reason: 'The mission is stopping' };
     if (this.o.beforeBaseMerge) await this.o.beforeBaseMerge();
-    if (c.stopPromise) return stopped;
+    let h = this.halt(c);
+    if (h) return h;
     const head = await git(root, ['rev-parse', '--abbrev-ref', 'HEAD']).catch(() => '');
     const clean = (await git(root, ['status', '--porcelain'])) === '';
-    if (c.stopPromise) return stopped;
+    if ((h = this.halt(c))) return h;
     if (head === m.baseBranch && clean) return this.mergeIn(root, m.missionBranch, msg);
 
     const list = await git(root, ['worktree', 'list', '--porcelain']);
+    if ((h = this.halt(c))) return h;
     const checkedOut = list.split(/\r?\n/).some(l => l.trim() === `branch refs/heads/${m.baseBranch}`);
     if (checkedOut) {
       return { ok: false, reason: `Check out ${m.baseBranch} or commit your changes, then choose Merge again` };
@@ -810,14 +848,15 @@ export class MissionEngine extends EventEmitter implements BridgeHandlers {
     const dir = worktreeDirFor(root, c.id, `merge-${randomUUID().slice(0, 6)}`);
     await git(root, ['worktree', 'add', '--', dir, m.baseBranch]);
     try {
-      if (c.stopPromise) return stopped;
+      if ((h = this.halt(c))) return h;
       return await this.mergeIn(dir, m.missionBranch, msg);
     } finally {
       try { await removeWorktree(root, dir); } catch (e) { this.warn(`remove merge worktree: ${(e as Error).message}`); }
     }
   }
 
-  private async mergeIn(cwd: string, branch: string, msg: string): Promise<{ ok: true } | { ok: false; reason: string; files?: string[] }> {
+  /** One `git merge --no-ff`: committed, or aborted (a started merge never stays half-done). */
+  private async mergeIn(cwd: string, branch: string, msg: string): Promise<BaseMergeResult> {
     try {
       await git(cwd, ['merge', '--no-ff', '-m', msg, `refs/heads/${branch}`]);
       return { ok: true };
@@ -855,6 +894,13 @@ export class MissionEngine extends EventEmitter implements BridgeHandlers {
     const stopped = new Error('The mission was stopped');
     if (c.planWait) { const w = c.planWait; c.planWait = null; w.d.reject(stopped); }
     if (c.mergeWait) { const w = c.mergeWait; c.mergeWait = null; w.d.reject(stopped); }
+    const ended = missions.get(this.db, c.id);
+    if (!ended || TERMINAL_MISSION_STATES.has(ended.state)) {
+      // Already done (e.g. merged): leave its tasks alone, just make sure the conductor is gone.
+      if (c.lingerTimer) { clearTimeout(c.lingerTimer); c.lingerTimer = null; }
+      if (c.conductor) await c.conductor.stop(this.o.stopTimeoutMs ?? 5000).catch(() => undefined);
+      return;
+    }
     const list = tasks.listByMission(this.db, c.id);
     await Promise.all(list.filter(t => LIVE_TASK_STATES.has(t.state)).map(t =>
       c.runner.stop(t.id).catch(e => this.warn(`stop ${t.taskKey}: ${(e as Error).message}`))));
@@ -880,9 +926,10 @@ export class MissionEngine extends EventEmitter implements BridgeHandlers {
   }
 
   /**
-   * App shutdown. Changes no mission, task or inbox state: pending handler calls are rejected in memory, every live
-   * conductor and task process is killed and only its session row ends ('live' to 'ended'), so recovery can resume
-   * them. Then the runners are disposed and the bridge closes. Idempotent.
+   * App shutdown. Changes no mission, task or inbox state of its own: every handler and mutator refuses at once,
+   * an in-flight base merge or stop is awaited (bounded), pending handler calls are rejected in memory, the
+   * conductors are killed and the bridge closes, then every task process is killed (only session rows end,
+   * 'live' to 'ended') so recovery can resume them. Nothing is written after it resolves. Idempotent.
    */
   shutdown(): Promise<void> {
     if (!this.shutdownPromise) this.shutdownPromise = this.runShutdown();
@@ -892,29 +939,49 @@ export class MissionEngine extends EventEmitter implements BridgeHandlers {
   private async runShutdown(): Promise<void> {
     this.closed = true;
     if (this.tick) { clearInterval(this.tick); this.tick = null; }
+    const all = [...this.ctxs.values()];
+    // In-flight work that writes the database settles first (a merge bails out at its next check unless git is
+    // already merging; a stop finishes its transitions).
+    await Promise.all(all.map(c => bounded(Promise.all([
+      c.mergeWait?.merging?.catch(() => undefined), c.stopPromise?.catch(() => undefined),
+    ]), SHUTDOWN_WAIT_MS)));
     const err = new Error('Maestro is shutting down');
-    for (const c of this.ctxs.values()) {
+    for (const c of all) {
       if (c.lingerTimer) { clearTimeout(c.lingerTimer); c.lingerTimer = null; }
       if (c.planWait) { const w = c.planWait; c.planWait = null; w.d.reject(err); }
       if (c.mergeWait) { const w = c.mergeWait; c.mergeWait = null; w.d.reject(err); }
     }
     for (const w of [...this.waiters]) w.fail(err);
     this.inbox.detachPending(err);
-    await Promise.all([...this.ctxs.values()].map(async c => {
-      await c.runner.detachAll().catch(e => this.warn(`detach tasks: ${(e as Error).message}`));
-      c.detached = true;
-      const rowId = c.conductorRowId;
-      if (rowId) {
-        this.registry.delete(rowId);
-        if (sessions.listLive(this.db).some(s => s.id === rowId)) sessions.end(this.db, rowId, 'ended');
-      }
-      if (c.conductor && c.conductor.status !== 'exited') {
-        await c.conductor.kill().catch(e => this.warn(`conductor kill: ${(e as Error).message}`));
-      }
-      c.runner.dispose();
-    }));
+    // Conductors and the bridge go first, so nothing can call in while the tasks are detached.
     const b = this.bridge;
     this.bridge = null;
-    if (b) await b.then(x => x.close(), () => undefined);
+    await Promise.all([
+      ...all.map(async c => {
+        c.detached = true;
+        const rowId = c.conductorRowId;
+        if (rowId) {
+          this.registry.delete(rowId);
+          if (sessions.listLive(this.db).some(s => s.id === rowId)) sessions.end(this.db, rowId, 'ended');
+        }
+        if (c.conductor && c.conductor.status !== 'exited') {
+          await c.conductor.kill().catch(e => this.warn(`conductor kill: ${(e as Error).message}`));
+        }
+      }),
+      b ? b.then(x => x.close(), () => undefined) : Promise.resolve(),
+    ]);
+    await Promise.all(all.map(async c => {
+      await c.runner.detachAll().catch(e => this.warn(`detach tasks: ${(e as Error).message}`));
+      c.runner.dispose();
+    }));
   }
+}
+
+/** Resolves when p settles or after ms, whichever comes first. */
+function bounded(p: Promise<unknown>, ms: number): Promise<void> {
+  return new Promise<void>(res => {
+    const t = setTimeout(res, ms);
+    t.unref();
+    p.then(() => { clearTimeout(t); res(); }, () => { clearTimeout(t); res(); });
+  });
 }
