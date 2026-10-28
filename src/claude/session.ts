@@ -49,15 +49,11 @@ export class ClaudeSession extends EventEmitter {
   private weKilled = false;
   private exitCode: number | null = null;
   private finalized = false;
-  private baseline: Set<number> | null = null;
-  private baselinePending = false;
-  private cleanupPending = false;
-  private queued: string[] = [];
+  private stopping = false;
   private readonly listTreeFn: (pid: number) => Promise<number[]>;
   private readonly killTreeFn: (pid: number) => Promise<{ ok: boolean; output: string }>;
-  private killing = false;
   private killPromise: Promise<void> | null = null;
-  private interruptPromise: Promise<'interrupted' | 'killed'> | null = null;
+  private stopPromise: Promise<'exited' | 'killed'> | null = null;
 
   static start(opts: SessionOptions): ClaudeSession { return new ClaudeSession(opts); }
 
@@ -128,7 +124,6 @@ export class ClaudeSession extends EventEmitter {
   private handle(ev: StreamEvent): void {
     if (ev.kind === 'init') {
       this.sessionId = ev.sessionId;
-      this.startBaseline();
       if (this.status === 'starting') this.status = 'idle';
     } else if (ev.kind === 'result') {
       if (this.status !== 'exited') this.status = 'idle';
@@ -146,27 +141,14 @@ export class ClaudeSession extends EventEmitter {
     this.emit('exit', info);
   }
 
-  /** Snapshot of descendants taken after init. A snapshot without our own pid is a failed one: baseline stays null. */
-  private startBaseline(): void {
-    if (this.baseline !== null || this.baselinePending || this.pid <= 0) return;
-    this.baselinePending = true;
-    void this.listTreeFn(this.pid).then(pids => {
-      if (pids.includes(this.pid)) this.baseline = new Set(pids);
-      else this.log('[session] baseline snapshot failed; interrupt cleanup disabled until a retry succeeds');
-    }, () => { /* treated as failed */ }).finally(() => { this.baselinePending = false; });
-  }
-
-  private write(data: string): void {
-    if (this.status === 'exited' || this.stdinEnded || this.child.stdin.destroyed || !this.child.stdin.writable) {
+  private write(data: string, internal = false): void {
+    if ((this.stopping && !internal) || this.status === 'exited' || this.stdinEnded || this.child.stdin.destroyed || !this.child.stdin.writable) {
       throw new SessionClosed();
     }
-    // While post-interrupt cleanup is pending, hold writes so the next turn's children can't be caught by it.
-    if (this.cleanupPending) this.queued.push(data);
-    else this.child.stdin.write(data);
+    this.child.stdin.write(data);
   }
 
   send(text: string): void {
-    if (this.baseline === null) this.startBaseline(); // retry a failed/missing baseline at turn start
     this.write(encodeUserMessage(text));
     this.status = 'busy';
   }
@@ -175,83 +157,76 @@ export class ClaudeSession extends EventEmitter {
     this.write(decision.allow ? encodePermissionAllow(requestId, decision.input) : encodePermissionDeny(requestId, decision.message));
   }
 
-  interrupt(timeoutMs = 5000): Promise<'interrupted' | 'killed'> {
-    if (this.status === 'exited') return Promise.resolve('killed');
-    // Nothing to interrupt: don't write (the CLI would never answer and we would kill the session after the timeout).
-    if (this.status === 'idle' || this.status === 'starting') return Promise.resolve('interrupted');
-    if (this.interruptPromise) return this.interruptPromise;
-    const p = new Promise<'interrupted' | 'killed'>(resolve => {
-      let done = false;
-      const settle = (v: 'interrupted' | 'killed'): void => {
-        if (done) return;
-        done = true;
+  /**
+   * Stop per spec 8.3: snapshot the tree; if busy write ONE interrupt and wait up to timeoutMs for a result;
+   * end stdin and wait up to timeoutMs for exit; else killTree; then kill snapshot PIDs still alive.
+   * Concurrent calls share one run. After this starts, send/answerPermission throw SessionClosed.
+   */
+  stop(timeoutMs = 5000): Promise<'exited' | 'killed'> {
+    if (this.stopPromise) return this.stopPromise;
+    if (this.status === 'exited' || this.finalized) return Promise.resolve('exited');
+    this.stopping = true;
+    this.stopPromise = this.runStop(timeoutMs);
+    return this.stopPromise;
+  }
+
+  private async runStop(timeoutMs: number): Promise<'exited' | 'killed'> {
+    const hasExited = (): boolean => this.finalized || this.status === 'exited';
+    // Resolves true when `exit` is emitted, false on timeout (or `ev` predicate, when given, matched -> true).
+    const waitFor = (ms: number, onEvent?: (e: StreamEvent) => boolean): Promise<boolean> => new Promise(resolve => {
+      const done = (v: boolean): void => {
         clearTimeout(timer);
-        this.off('event', onEvent);
         this.off('exit', onExit);
+        this.off('event', onEv);
         resolve(v);
       };
-      const onEvent = (ev: StreamEvent): void => {
-        if (ev.kind !== 'result' || this.killing) return;
-        // Snapshot first (async, outside this handler), then settle, then kill the diff.
-        this.cleanupPending = true;
-        void this.cleanupToolChildren().then(kill => {
-          if (this.killing || done) return;
-          settle('interrupted');
-          return kill();
-        }).catch(() => { /* best effort */ }).finally(() => this.endCleanup());
-      };
-      const onExit = (): void => settle('killed');
-      const timer = setTimeout(() => {
-        this.killing = true; // from here only 'killed' may settle
-        this.off('event', onEvent);
-        void this.kill().then(() => settle('killed'));
-      }, timeoutMs);
-      this.on('event', onEvent);
+      const onExit = (): void => done(true);
+      const onEv = (e: StreamEvent): void => { if (onEvent?.(e)) done(true); };
+      const timer = setTimeout(() => done(false), ms);
       this.on('exit', onExit);
-      try {
-        this.write(encodeInterrupt(`maestro-int-${randomUUID()}`));
-      } catch {
-        this.killing = true;
-        this.off('event', onEvent);
-        void this.kill().then(() => settle('killed'));
+      if (onEvent) this.on('event', onEv);
+      if (this.finalized) done(true);
+    });
+
+    let snapshot: number[] = [];
+    try {
+      const pids = this.pid > 0 ? await this.listTreeFn(this.pid) : [];
+      if (pids.includes(this.pid)) snapshot = pids.filter(p => p !== this.pid);
+      else this.log('[session] stop: tree snapshot failed or missing root; continuing without it');
+    } catch (e) {
+      this.log(`[session] stop: tree snapshot threw: ${(e as Error).message}`);
+    }
+
+    if (!hasExited() && this.status === 'busy') {
+      const resultOrExit = waitFor(timeoutMs, e => e.kind === 'result');
+      try { this.write(encodeInterrupt(`maestro-int-${randomUUID()}`), true); }
+      catch { /* stdin gone: fall through to the exit wait */ }
+      await resultOrExit;
+    }
+
+    let killed = false;
+    if (!hasExited()) {
+      if (!this.stdinEnded && !this.child.stdin.destroyed) { this.stdinEnded = true; this.child.stdin.end(); }
+      if (!(await waitFor(timeoutMs))) {
+        killed = true;
+        await this.kill(); // killTree + bounded wait for exit
       }
-    }).finally(() => { this.interruptPromise = null; this.killing = false; });
-    this.interruptPromise = p;
-    return p;
-  }
-
-  private endCleanup(): void {
-    this.cleanupPending = false;
-    const q = this.queued.splice(0);
-    if (this.status === 'exited' || this.stdinEnded || this.child.stdin.destroyed) return;
-    for (const d of q) this.child.stdin.write(d);
-  }
-
-  /**
-   * Snapshots descendants now; returns a function that kills those that appeared since the post-init baseline
-   * (tool children), sparing e.g. stdio MCP servers. With no baseline nothing is killed.
-   */
-  private async cleanupToolChildren(): Promise<() => Promise<void>> {
-    const baseline = this.baseline;
-    if (!baseline) {
-      this.log('[session] interrupt cleanup skipped: baseline not ready');
-      return async () => { /* nothing */ };
     }
-    const now = await this.listTreeFn(this.pid);
-    if (!now.includes(this.pid)) {
-      this.log('[session] interrupt cleanup skipped: post-interrupt snapshot failed');
-      return async () => { /* nothing */ };
+
+    for (const pid of snapshot) {
+      let up = true;
+      try { process.kill(pid, 0); } catch { up = false; }
+      if (up) { try { await this.killTreeFn(pid); } catch { /* never throws */ } }
     }
-    const extra = now.filter(pid => pid !== this.pid && !baseline.has(pid));
-    return async () => { await Promise.all(extra.map(pid => this.killTreeFn(pid))); };
+    return killed ? 'killed' : 'exited';
   }
 
   /**
    * Ends stdin. Allowed while starting/idle, a no-op once exited or already ended,
-   * and throws when busy (interrupt first).
+   * and throws when busy (stop() first).
    */
   close(): void {
-    if (this.status === 'busy') throw new Error('Cannot close a busy session: interrupt() it first');
+    if (this.status === 'busy') throw new Error('Cannot close a busy session: stop() it first');
     if (this.status === 'exited' || this.stdinEnded) return;
     this.stdinEnded = true;
     this.child.stdin.end();

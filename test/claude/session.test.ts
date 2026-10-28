@@ -48,6 +48,13 @@ const until = (s: ClaudeSession, kind: StreamEvent['kind']): Promise<StreamEvent
 const exited = (s: ClaudeSession): Promise<{ code: number | null; killed: boolean }> => new Promise(res => s.once('exit', res));
 
 describe('ClaudeSession', () => {
+  const alive = (pid: number): boolean => { try { process.kill(pid, 0); return true; } catch { return false; } };
+  const waitUntil = async (cond: () => boolean, ms = 6000): Promise<void> => {
+    const end = Date.now() + ms;
+    while (!cond() && Date.now() < end) await new Promise(r => setTimeout(r, 100));
+  };
+  const children = (): number[] => fakeLogLines().filter(l => typeof l.spawnedChild === 'number').map(l => l.spawnedChild as number);
+
   it('emits parsed events and records sessionId from init', async () => {
     const s = start('init-result', ['--model', 'x']);
     const evs = collect(s);
@@ -74,37 +81,6 @@ describe('ClaudeSession', () => {
     expect(s.status).toBe('exited');
     expect(() => s.send('hi')).toThrow(SessionClosed);
     expect(() => s.answerPermission('r', { allow: false, message: 'no' })).toThrow(SessionClosed);
-  }, 10000);
-
-  it('interrupt returns interrupted on aborted_tools result', async () => {
-    const s = start('interrupt');
-    await until(s, 'init');
-    s.send('go');
-    expect(s.status).toBe('busy');
-    expect(await s.interrupt(5000)).toBe('interrupted');
-    expect(s.status).toBe('idle');
-    const ex = exited(s);
-    s.close();
-    expect((await ex).killed).toBe(false);
-  }, 10000);
-
-  it('interrupt falls back to kill after timeout', async () => {
-    const s = start({ steps: [{ emit: INIT }, { waitFor: 'user' }, { waitFor: 'stdin-close' }] });
-    await until(s, 'init');
-    s.send('go');
-    const ex = exited(s);
-    expect(await s.interrupt(300)).toBe('killed');
-    expect(await ex).toMatchObject({ killed: true });
-    expect(s.status).toBe('exited');
-  }, 10000);
-
-  it('concurrent interrupts send one control_request', async () => {
-    const s = start('interrupt');
-    await until(s, 'init');
-    s.send('go');
-    const [a, b] = await Promise.all([s.interrupt(), s.interrupt()]);
-    expect([a, b]).toEqual(['interrupted', 'interrupted']);
-    expect(fakeLogLines().filter(l => l?.request?.subtype === 'interrupt')).toHaveLength(1);
   }, 10000);
 
   it('kill is idempotent', async () => {
@@ -148,110 +124,74 @@ describe('ClaudeSession', () => {
     expect(ev).toEqual({ kind: 'permission-cancel', requestId: 'abc' });
   }, 10000);
 
-  const alive = (pid: number): boolean => { try { process.kill(pid, 0); return true; } catch { return false; } };
-  const waitUntil = async (cond: () => boolean, ms = 6000): Promise<void> => {
-    const end = Date.now() + ms;
-    while (!cond() && Date.now() < end) await new Promise(r => setTimeout(r, 100));
-  };
-  const baselineReady = (s: ClaudeSession): Promise<void> =>
-    waitUntil(() => (s as unknown as { baseline: Set<number> | null }).baseline !== null);
-  const children = (): number[] => fakeLogLines().filter(l => typeof l.spawnedChild === 'number').map(l => l.spawnedChild as number);
+  it('stop on a busy session interrupts, closes stdin and resolves exited', async () => {
+    const s = start('interrupt');
+    await until(s, 'init');
+    s.send('go');
+    expect(s.status).toBe('busy');
+    const ex = exited(s);
+    expect(await s.stop(5000)).toBe('exited');
+    expect(await ex).toMatchObject({ killed: false });
+    expect(s.status).toBe('exited');
+    expect(fakeLogLines().filter(l => l?.request?.subtype === 'interrupt')).toHaveLength(1);
+  }, 10000);
 
-  it('kills a spawned tool child left behind after an interrupt', async () => {
+  it('stop falls back to kill after timeout', async () => {
+    const s = start({ steps: [{ emit: INIT }, { waitFor: 'user' }, { sleepMs: 60000 }] });
+    await until(s, 'init');
+    s.send('go');
+    const ex = exited(s);
+    expect(await s.stop(300)).toBe('killed');
+    expect(await ex).toMatchObject({ killed: true });
+    expect(s.status).toBe('exited');
+  }, 10000);
+
+  it('concurrent stops send one control_request', async () => {
+    const s = start('interrupt');
+    await until(s, 'init');
+    s.send('go');
+    const [a, b] = await Promise.all([s.stop(), s.stop()]);
+    expect([a, b]).toEqual(['exited', 'exited']);
+    expect(fakeLogLines().filter(l => l?.request?.subtype === 'interrupt')).toHaveLength(1);
+  }, 10000);
+
+  it('stop kills a tool child left behind', async () => {
     const s = start({ steps: [{ emit: INIT }, { waitFor: 'user' }, { spawnChild: 'ping' }, { waitFor: 'interrupt' }, { emit: RESULT }, { waitFor: 'stdin-close' }] });
     await until(s, 'init');
-    await baselineReady(s);
     s.send('go');
     await waitUntil(() => children().length === 1);
     const pid = children()[0];
     expect(alive(pid)).toBe(true);
-    expect(await s.interrupt(8000)).toBe('interrupted');
-    await waitUntil(() => !alive(pid));
+    expect(await s.stop(5000)).toBe('exited');
     expect(alive(pid)).toBe(false);
-    expect(s.status).toBe('idle');
   }, 10000);
 
-  it('a child spawned before the baseline survives the interrupt cleanup', async () => {
-    const s = start({ steps: [{ spawnChild: 'ping' }, { emit: INIT }, { waitFor: 'user' }, { spawnChild: 'ping' }, { waitFor: 'interrupt' }, { emit: RESULT }, { waitFor: 'stdin-close' }] });
-    await until(s, 'init');
-    await baselineReady(s);
-    s.send('go');
-    await waitUntil(() => children().length === 2);
-    const [early, late] = children();
-    expect(await s.interrupt(8000)).toBe('interrupted');
-    await waitUntil(() => !alive(late));
-    expect(alive(late)).toBe(false);
-    expect(alive(early)).toBe(true);
-  }, 10000);
-
-  it('interrupt after result returns interrupted and the session stays alive', async () => {
-    const s = start('idle');
-    await until(s, 'init');
-    s.send('go');
+  it('stop on an idle session writes no interrupt and resolves exited', async () => {
+    const s = start('init-result');
     await until(s, 'result');
     expect(s.status).toBe('idle');
-    expect(await s.interrupt(300)).toBe('interrupted');
-    expect(s.status).toBe('idle');
+    expect(await s.stop(5000)).toBe('exited');
     expect(fakeLogLines().filter(l => l?.request?.subtype === 'interrupt')).toHaveLength(0);
-    s.send('again');
-    expect(s.status).toBe('busy');
+    expect(await s.stop()).toBe('exited'); // already exited
   }, 10000);
 
-  it('a result arriving after the timeout fired still resolves killed', async () => {
-    const stubKills: number[] = [];
-    const s = start(
-      { steps: [{ emit: INIT }, { waitFor: 'user' }, { waitFor: 'interrupt' }, { sleepMs: 400 }, { emit: RESULT }, { waitFor: 'stdin-close' }] },
-      [], { killTree: async pid => { stubKills.push(pid); return { ok: true, output: 'stub' }; } },
-    );
+  it('send after stop throws SessionClosed', async () => {
+    const s = start('interrupt');
     await until(s, 'init');
     s.send('go');
-    let outcome: string | null = null;
-    void s.interrupt(100).then(o => { outcome = o; });
-    const gotResult = until(s, 'result');
-    await gotResult; // result arrives after the timeout fired; the stub did not kill anything
-    await new Promise(r => setTimeout(r, 200));
-    expect(stubKills).toContain(s.pid);
-    expect(outcome).toBeNull(); // must not settle 'interrupted'
-    killTree(s.pid); // really kill now
-    await exited(s);
-    await waitUntil(() => outcome !== null, 3000);
-    expect(outcome).toBe('killed');
+    const p = s.stop(5000);
+    expect(() => s.send('more')).toThrow(SessionClosed);
+    expect(() => s.answerPermission('r', { allow: false, message: 'no' })).toThrow(SessionClosed);
+    await p;
+    expect(() => s.send('more')).toThrow(SessionClosed);
   }, 10000);
 
-  it('skips cleanup (kills nothing) when the baseline snapshot failed', async () => {
-    const s = start(
-      { steps: [{ emit: INIT }, { waitFor: 'user' }, { spawnChild: 'ping' }, { waitFor: 'interrupt' }, { emit: RESULT }, { waitFor: 'stdin-close' }] },
-      [], { listTree: async () => [] },
-    );
+  it('stop continues without a snapshot when listing fails', async () => {
+    const s = start('interrupt', [], { listTree: async () => { throw new Error('boom'); } });
     await until(s, 'init');
-    await new Promise(r => setTimeout(r, 300));
     s.send('go');
-    await waitUntil(() => children().length === 1);
-    const pid = children()[0];
-    expect(await s.interrupt(8000)).toBe('interrupted');
-    await new Promise(r => setTimeout(r, 500));
-    expect(alive(pid)).toBe(true);
-    expect(readFileSync(join(dir, 'logs', 's.log'), 'utf8')).toContain('baseline');
-  }, 10000);
-
-  it("send right after interrupt does not kill the new turn's tool child", async () => {
-    const s = start({ steps: [
-      { emit: INIT }, { waitFor: 'user' }, { spawnChild: 'ping' }, { waitFor: 'interrupt' }, { emit: RESULT },
-      { waitFor: 'user' }, { spawnChild: 'ping' }, { waitFor: 'stdin-close' },
-    ] });
-    await until(s, 'init');
-    await baselineReady(s);
-    s.send('one');
-    await waitUntil(() => children().length === 1);
-    expect(await s.interrupt(8000)).toBe('interrupted');
-    s.send('two');
-    expect(s.status).toBe('busy');
-    await waitUntil(() => children().length === 2);
-    const [first, second] = children();
-    await waitUntil(() => !alive(first));
-    await new Promise(r => setTimeout(r, 1500));
-    expect(alive(first)).toBe(false);
-    expect(alive(second)).toBe(true);
+    expect(await s.stop(5000)).toBe('exited');
+    expect(readFileSync(join(dir, 'logs', 's.log'), 'utf8')).toContain('snapshot threw');
   }, 10000);
 
   it('stdin EPIPE without an error listener does not throw and is logged', async () => {
