@@ -448,8 +448,10 @@ export const inbox = {
   },
 };
 
-/** Commands with chaining, redirection or substitution never match a stored prefix. */
-export const UNSAFE_SHELL = /[\n\r;&|`>]|\$\(/;
+/** Commands with chaining, redirection or substitution (incl. process substitution) never match a stored prefix. */
+export const UNSAFE_SHELL = /[\n\r;&|`>]|\$\(|<\(/;
+/** Shell tools: always-allow rules are command prefixes (first two words), never commands with shell operators. */
+export const SHELL_TOOLS: ReadonlySet<string> = new Set(['Bash', 'PowerShell']);
 
 export const permissionRules = {
   add(db: Db, r: { missionId: string; toolName: string; inputPrefix: string }): void {
@@ -459,7 +461,7 @@ export const permissionRules = {
   match(db: Db, missionId: string, toolName: string, input: unknown): boolean {
     const rules = db.prepare('SELECT input_prefix FROM permission_rules WHERE mission_id = ? AND tool_name = ?')
       .all(missionId, toolName) as Row[];
-    if (toolName !== 'Bash') return rules.some(r => r.input_prefix === '');
+    if (!SHELL_TOOLS.has(toolName)) return rules.some(r => r.input_prefix === '');
     const cmd = typeof input === 'object' && input !== null ? (input as Record<string, unknown>).command : undefined;
     if (typeof cmd !== 'string' || UNSAFE_SHELL.test(cmd)) return false;
     return rules.some(r => {

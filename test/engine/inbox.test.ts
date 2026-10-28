@@ -97,6 +97,67 @@ describe('InboxService', () => {
     }
   });
 
+  it('conductor requests (taskId null) are never auto-answered from rules and refuse "always"', () => {
+    const s = setup();
+    permissionRules.add(s.db, { missionId: s.m.id, toolName: 'Bash', inputPrefix: 'npm install' });
+    permissionRules.add(s.db, { missionId: s.m.id, toolName: 'Write', inputPrefix: '' });
+    s.svc.onPermissionRequest(s.m.id, null, 's1', req('r1', 'Bash', { command: 'npm install pg' }));
+    s.svc.onPermissionRequest(s.m.id, null, 's1', req('r2', 'Write', { file_path: 'x' }));
+    expect(s.session.calls).toHaveLength(0);
+    const open = inbox.listOpen(s.db, Date.now());
+    expect(open.map(e => e.taskId)).toEqual([null, null]);
+    const before = s.db.prepare('SELECT COUNT(*) n FROM permission_rules').get();
+    expect(() => s.svc.answerPermission(open[0].id, { allow: true, always: true })).toThrow(/conductor/i);
+    expect(inbox.get(s.db, open[0].id)!.state).toBe('open'); // refused: still answerable
+    expect(s.db.prepare('SELECT COUNT(*) n FROM permission_rules').get()).toEqual(before);
+    expect(s.session.calls).toHaveLength(0);
+    // Allow once and deny work.
+    expect(s.svc.answerPermission(open[0].id, { allow: true }).ruleStored).toBe(false);
+    s.svc.answerPermission(open[1].id, { allow: false });
+    expect(s.session.calls.map(c => c.decision.allow)).toEqual([true, false]);
+    // A task request still matches the same rules.
+    s.svc.onPermissionRequest(s.m.id, s.t.id, 's1', req('r3', 'Bash', { command: 'npm install x' }));
+    expect(s.session.calls).toHaveLength(3);
+  });
+
+  it('PowerShell always-allow is a two-word prefix and never covers chained commands', () => {
+    const s = setup();
+    s.svc.onPermissionRequest(s.m.id, s.t.id, 's1', req('r1', 'PowerShell', { command: 'Get-ChildItem -Recurse src' }));
+    const [e] = inbox.listOpen(s.db, Date.now());
+    expect(s.svc.answerPermission(e.id, { allow: true, always: true }).ruleStored).toBe(true);
+    expect(s.db.prepare('SELECT tool_name, input_prefix FROM permission_rules').all())
+      .toEqual([{ tool_name: 'PowerShell', input_prefix: 'Get-ChildItem -Recurse' }]);
+    const auto = (command: string): boolean => {
+      const n = s.session.calls.length;
+      s.svc.onPermissionRequest(s.m.id, s.t.id, 's1', req(`q-${command}`, 'PowerShell', { command }));
+      return s.session.calls.length > n;
+    };
+    expect(auto('Get-ChildItem -Recurse test')).toBe(true);
+    expect(auto('Remove-Item -Recurse x')).toBe(false);
+    for (const c of ['Get-ChildItem -Recurse; Remove-Item x', 'Get-ChildItem -Recurse | Remove-Item',
+      'Get-ChildItem -Recurse & calc', 'Get-ChildItem -Recurse $(Remove-Item x)', 'Get-ChildItem -Recurse `n',
+      'Get-ChildItem -Recurse > f', 'Get-ChildItem -Recurse\nRemove-Item x']) {
+      expect(auto(c), c).toBe(false);
+    }
+    // Storing refuses chained PowerShell too.
+    s.svc.onPermissionRequest(s.m.id, s.t.id, 's1', req('r9', 'PowerShell', { command: 'ls; rm x' }));
+    const e9 = inbox.listOpen(s.db, Date.now()).find(x => x.requestId === 'r9')!;
+    const r = s.svc.answerPermission(e9.id, { allow: true, always: true });
+    expect(r.ruleStored).toBe(false);
+    expect(r.ruleSkippedReason).toMatch(/shell operators/);
+  });
+
+  it('process substitution is a shell operator: never stored, never matched', () => {
+    const s = setup();
+    permissionRules.add(s.db, { missionId: s.m.id, toolName: 'Bash', inputPrefix: 'git diff' });
+    expect(permissionRules.match(s.db, s.m.id, 'Bash', { command: 'git diff <(rm -rf x)' })).toBe(false);
+    expect(permissionRules.match(s.db, s.m.id, 'Bash', { command: 'git diff >(rm -rf x)' })).toBe(false);
+    expect(permissionRules.match(s.db, s.m.id, 'Bash', { command: 'git diff HEAD' })).toBe(true);
+    s.svc.onPermissionRequest(s.m.id, s.t.id, 's1', req('r1', 'Bash', { command: 'cat <(rm -rf x)' }));
+    const [e] = inbox.listOpen(s.db, Date.now());
+    expect(s.svc.answerPermission(e.id, { allow: true, always: true }).ruleSkippedReason).toMatch(/shell operators/);
+  });
+
   it('throws a clear error for a permission entry without a requestId', () => {
     const s = setup();
     const e = inbox.add(s.db, { missionId: s.m.id, taskId: s.t.id, kind: 'permission', payload: { toolName: 'Write', input: {}, sessionRowId: 's1' } });

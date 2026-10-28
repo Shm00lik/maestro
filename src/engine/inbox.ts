@@ -1,8 +1,8 @@
-// Routes Claude permission requests and questions into the user's inbox, auto-approves requests that match mission
-// "always allow" rules, and delivers each answer back to the right Claude session exactly once.
+// Routes Claude permission requests and questions into the user's inbox, auto-approves task-session requests that
+// match mission "always allow" rules (never the conductor's), and delivers each answer back to the right session once.
 import { EventEmitter } from 'node:events';
 import type { Db } from '../store/db.js';
-import { inbox, permissionRules, Expired, UNSAFE_SHELL, type InboxEntry } from '../store/repos.js';
+import { inbox, permissionRules, Expired, SHELL_TOOLS, UNSAFE_SHELL, type InboxEntry } from '../store/repos.js';
 import { SessionClosed, type ClaudeSession } from '../claude/session.js';
 import type { StreamEvent } from '../claude/protocol.js';
 
@@ -42,7 +42,8 @@ export class InboxService extends EventEmitter {
   }
 
   onPermissionRequest(missionId: string, taskId: string | null, sessionRowId: string, ev: PermissionRequestEvent): void {
-    if (permissionRules.match(this.db, missionId, ev.toolName, ev.input)) {
+    // Always-allow rules cover task sessions only: a conductor request (taskId null) always goes to the user.
+    if (taskId !== null && permissionRules.match(this.db, missionId, ev.toolName, ev.input)) {
       try {
         this.sessions.get(sessionRowId)?.answerPermission(ev.requestId, { allow: true, input: ev.input });
       } catch (e) {
@@ -79,6 +80,9 @@ export class InboxService extends EventEmitter {
     if (entry.kind !== 'permission') throw new Error(`Inbox entry ${entryId} is not a permission request`);
     const p = entry.payload as PermissionPayload;
     if (!entry.requestId) throw new Error(`Permission entry ${entryId} has no requestId; cannot answer the session`);
+    if (a.allow && a.always && entry.taskId === null) {
+      throw new Error('Always-allow is not available for conductor requests: allow once or deny');
+    }
 
     // Store first: a second click gets AlreadyAnswered/Expired here and never reaches the session.
     inbox.answer(this.db, entryId, a);
@@ -112,9 +116,9 @@ export class InboxService extends EventEmitter {
     return result;
   }
 
-  /** Bash: first two words of the command. Other tools: '' (any input). Or a skip reason when no rule is safe. */
+  /** Bash / PowerShell: first two words of the command. Other tools: '' (any input). Or a skip reason when no rule is safe. */
   private rulePrefix(p: PermissionPayload): string | { skip: string } {
-    if (p.toolName !== 'Bash') return '';
+    if (!SHELL_TOOLS.has(p.toolName)) return '';
     const cmd = typeof p.input === 'object' && p.input !== null ? (p.input as Record<string, unknown>).command : undefined;
     if (typeof cmd !== 'string' || cmd.trim() === '') return { skip: 'empty command; allowed once only' };
     if (UNSAFE_SHELL.test(cmd)) return { skip: 'command contains shell operators; allowed once only' };
