@@ -49,7 +49,7 @@ describe('store', () => {
     expect(t6.depth).toBe(3);
     expect(t6.onCriticalPath).toBe(true);
     expect(t7.onCriticalPath).toBe(false);
-    expect(t6.state).toBe('waiting');
+    expect(t6.state).toBe('planned');
     expect(t6.dependsOn).toEqual(['T3', 'T4']);
     expect(t6.owns).toEqual(['src/api/**', 'test/api/**']);
   });
@@ -57,13 +57,14 @@ describe('store', () => {
   it('transition goes through the state machine', () => {
     const { db, m, rows } = seedPlan();
     const t = rows[0];
+    tasks.transition(db, t.id, 'dispatch');
     expect(tasks.transition(db, t.id, 'deps_met').state).toBe('ready');
     const nEvents = events.list(db, m.id).length;
     expect(() => tasks.transition(db, t.id, 'complete')).toThrow(InvalidTransition);
     expect(tasks.listByMission(db, m.id).find(x => x.id === t.id)!.state).toBe('ready');
     expect(events.list(db, m.id)).toHaveLength(nEvents);
     const log = events.list(db, m.id, { taskId: t.id });
-    expect(log[0]).toMatchObject({ type: 'state', data: { from: 'waiting', to: 'ready', event: 'deps_met' } });
+    expect(log[1]).toMatchObject({ type: 'state', data: { from: 'waiting', to: 'ready', event: 'deps_met' } });
 
     expect(missions.transition(db, m.id, 'start').state).toBe('understanding');
     expect(() => missions.transition(db, m.id, 'merged')).toThrow(InvalidTransition);
@@ -91,8 +92,8 @@ describe('store', () => {
 
   it('addUsage accumulates tokens', () => {
     const { db, m, rows } = seedPlan();
-    tasks.addUsage(db, rows[0].id, 10, 5);
-    tasks.addUsage(db, rows[0].id, 3, 2);
+    tasks.addUsage(db, rows[0].id, { input: 10, output: 5, cacheRead: 0, cacheWrite: 0 });
+    tasks.addUsage(db, rows[0].id, { input: 3, output: 2, cacheRead: 0, cacheWrite: 0 });
     const t = tasks.listByMission(db, m.id).find(x => x.id === rows[0].id)!;
     expect([t.tokensIn, t.tokensOut]).toEqual([13, 7]);
   });
@@ -120,7 +121,7 @@ describe('store', () => {
 
   it('addUsage and approve throw on an unknown id', () => {
     const { db } = seedPlan();
-    expect(() => tasks.addUsage(db, 'nope', 1, 1)).toThrow(/task not found: nope/i);
+    expect(() => tasks.addUsage(db, 'nope', { input: 1, output: 1, cacheRead: 0, cacheWrite: 0 })).toThrow(/task not found: nope/i);
     expect(() => planVersions.approve(db, 'nope')).toThrow(/plan version not found: nope/i);
   });
 
@@ -154,6 +155,7 @@ describe('task timestamps', () => {
     const { db, rows } = seedPlan();
     const id = rows[0].id;
     expect(rows[0].startedAt).toBeNull();
+    tasks.transition(db, id, 'dispatch');
     at(100); tasks.transition(db, id, 'deps_met');
     at(200); const r = tasks.transition(db, id, 'start');
     expect([r.startedAt, r.endedAt]).toEqual([200, null]);
@@ -164,6 +166,7 @@ describe('task timestamps', () => {
   it('sets ended_at on failed and cancelled, clears it on retry, resets started_at on restart', () => {
     const { db, rows } = seedPlan();
     const [a, b] = [rows[0].id, rows[1].id];
+    tasks.transition(db, a, 'dispatch'); tasks.transition(db, b, 'dispatch');
     at(10); tasks.transition(db, a, 'deps_met'); tasks.transition(db, a, 'start');
     at(20); expect(tasks.transition(db, a, 'fail').endedAt).toBe(20);
     at(30); const w = tasks.transition(db, a, 'retry');
@@ -216,7 +219,7 @@ describe('schema', () => {
   it('rejects duplicate plan versions and duplicate task keys', () => {
     const { db, m, rows } = seedPlan();
     expect(() => planVersions.create(db, { missionId: m.id, version: 1, planPath: 'p', planMd: 'x' })).toThrow(/UNIQUE/);
-    const pvId = rows[0].planVersionId;
+    const pvId = rows[0].planVersionId!;
     const planTasks = parsePlan(read('analytics.md')).slice(0, 1);
     expect(() => tasks.insertPlan(db, m.id, pvId, planTasks, buildGraph(planTasks))).toThrow(/UNIQUE/);
   });
