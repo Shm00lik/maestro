@@ -54,6 +54,8 @@ export const CONDUCTOR_RESUME_MESSAGE =
 const STUCK_CHECK_MS = 60_000;
 /** How long recovery waits for a resumed session to confirm itself before it moves on. */
 const RECOVERY_CONFIRM_MS = 30_000;
+/** A plain-text conductor turn becomes a question of at most this many characters. */
+const CONDUCTOR_TEXT_MAX = 2000;
 const SUBAGENT_TOOLS: ReadonlySet<string> = new Set(['Task', 'Agent']);
 const ACTIVE_TASK_STATES: ReadonlySet<string> = new Set(['waiting', 'ready', 'running', 'needs_you']);
 const LIVE_TASK_STATES: ReadonlySet<string> = new Set(['planned', 'waiting', 'ready', 'running', 'needs_you']);
@@ -192,6 +194,12 @@ interface MissionCtx {
   conductorRestarts: number;
   conductorRowId: string | null;
   subagentUses: number;
+  /** The conductor's bridge calls in flight. */
+  bridgeCalls: number;
+  /** The open question made from a plain-text conductor turn (at most one). */
+  idleEntryId: string | null;
+  /** The conductor's last top-level assistant text in the current turn. */
+  lastText: string;
   planWait: PlanWait | null;
   /** The last approved plan, so a re-call that raced the approval gets `{approved:true}` instead of a re-plan. */
   lastPlan: { planPath: string; hash: string; result: PlanResult } | null;
@@ -378,7 +386,7 @@ export class MissionEngine extends EventEmitter implements BridgeHandlers {
     });
     const c: MissionCtx = {
       id: m.id, projectRoot: root, missionDir, conductorCfg, runner, conductor: null, conductorResume: null,
-      conductorRestarts: 0, conductorRowId: null, subagentUses: 0,
+      conductorRestarts: 0, conductorRowId: null, subagentUses: 0, bridgeCalls: 0, idleEntryId: null, lastText: "",
       planWait: null, lastPlan: null, mergeWait: null, stopPromise: null, lingerTimer: null, detached: false,
     };
     this.ctxs.set(m.id, c);
@@ -507,6 +515,11 @@ export class MissionEngine extends EventEmitter implements BridgeHandlers {
           c.subagentUses++;
           this.appendEvent(c.id, 'conductor-subagent-warning', { tool: tu.name, count: c.subagentUses, toolUseId: tu.id });
         }
+        if (ev.parentToolUseId === null && ev.text.trim()) {
+          c.lastText = ev.text.trim();
+          try { this.emit('conductor-text', { missionId: c.id, text: c.lastText }); }
+          catch (e) { this.warn(`conductor-text listener: ${(e as Error).message}`); }
+        }
         return;
       case 'permission-request':
         if (c.conductorRowId && !c.stopPromise) this.inbox.onPermissionRequest(c.id, null, c.conductorRowId, ev);
@@ -514,13 +527,50 @@ export class MissionEngine extends EventEmitter implements BridgeHandlers {
       case 'permission-cancel':
         this.inbox.onPermissionCancel(ev.requestId);
         return;
-      case 'result':
+      case 'result': {
         this.confirmConductor(c, true);
-        if (c.lingerTimer) this.closeConductor(c); // the mission ended; this was the conductor's last turn
+        const text = (ev.text?.trim() || c.lastText).trim();
+        c.lastText = '';
+        if (c.lingerTimer) { this.closeConductor(c); return; } // the mission ended; this was the conductor's last turn
+        if (ev.ok) this.onConductorIdle(c, text);
         return;
+      }
       default:
         return; // rate-limit events are handled for every session via the registry
     }
+  }
+
+  /**
+   * The conductor ended a turn with plain text while no bridge call of its own is pending: it is waiting for the
+   * user, who cannot see its replies (spec §7.1). Its last text becomes one free-text question (never more than one
+   * open); the answer goes back to the conductor as a user message.
+   */
+  private onConductorIdle(c: MissionCtx, text: string): void {
+    if (c.bridgeCalls > 0 || c.stopPromise || c.idleEntryId) return;
+    const m = missions.get(this.db, c.id);
+    if (!m || TERMINAL_MISSION_STATES.has(m.state)) return;
+    const shown = text.length > CONDUCTOR_TEXT_MAX ? `${text.slice(0, CONDUCTOR_TEXT_MAX - 1)}…` : text;
+    const question = shown || 'The conductor ended its turn without a message. Tell it how to continue.';
+    const asked = this.inbox.ask(c.id, null, question);
+    const entry = inboxRepo.listOpenForMission(this.db, c.id).filter(e => e.kind === 'question' && e.taskId === null).at(-1);
+    c.idleEntryId = entry?.id ?? null;
+    asked.then(answer => {
+      c.idleEntryId = null;
+      if (this.closed || c.stopPromise) return;
+      const s = c.conductor;
+      if (!s || s.status === 'exited') { this.warn(`conductor ${c.id} is gone; the answer was not delivered`); return; }
+      try { s.send(answer); } catch (e) { this.warn(`send to conductor: ${(e as Error).message}`); }
+    }, () => { c.idleEntryId = null; }); // expired (stop, restart) or shutdown
+  }
+
+  /** Counts the conductor's bridge calls in flight, so a turn that ends while one is pending is not "idle". */
+  private conductorCall<T>(missionId: string, fn: () => Promise<T>): Promise<T> {
+    const c = this.ctxs.get(missionId);
+    if (!c) return fn();
+    c.bridgeCalls++;
+    let p: Promise<T>;
+    try { p = fn(); } catch (e) { c.bridgeCalls--; throw e; }
+    return p.finally(() => { c.bridgeCalls--; });
   }
 
   private onConductorExit(c: MissionCtx, code: number | null): void {
@@ -583,7 +633,11 @@ export class MissionEngine extends EventEmitter implements BridgeHandlers {
     return isAbsolute(planPath) ? resolve(planPath) : resolve(c.projectRoot, planPath);
   }
 
-  async submitPlan(missionId: string, planPath: string): Promise<PlanResult> {
+  submitPlan(missionId: string, planPath: string): Promise<PlanResult> {
+    return this.conductorCall(missionId, () => this.doSubmitPlan(missionId, planPath));
+  }
+
+  private async doSubmitPlan(missionId: string, planPath: string): Promise<PlanResult> {
     this.assertOpen();
     const c = this.ctx(missionId);
     if (c.stopPromise) throw new Error('The mission is stopping');
@@ -699,7 +753,11 @@ export class MissionEngine extends EventEmitter implements BridgeHandlers {
 
   // ---- dispatch_task -----------------------------------------------------------
 
-  async dispatchTask(missionId: string, d: DispatchInput): Promise<{ task_ref: string }> {
+  dispatchTask(missionId: string, d: DispatchInput): Promise<{ task_ref: string }> {
+    return this.conductorCall(missionId, () => this.doDispatchTask(missionId, d));
+  }
+
+  private async doDispatchTask(missionId: string, d: DispatchInput): Promise<{ task_ref: string }> {
     this.assertOpen();
     const c = this.ctx(missionId);
     const m = this.mission(missionId);
@@ -807,7 +865,11 @@ export class MissionEngine extends EventEmitter implements BridgeHandlers {
 
   // ---- wait_for_tasks ----------------------------------------------------------
 
-  async waitForTasks(missionId: string, refs: string[], mode: 'all' | 'any', onProgress: () => void): Promise<TaskSummary[]> {
+  waitForTasks(missionId: string, refs: string[], mode: 'all' | 'any', onProgress: () => void): Promise<TaskSummary[]> {
+    return this.conductorCall(missionId, () => this.doWaitForTasks(missionId, refs, mode, onProgress));
+  }
+
+  private async doWaitForTasks(missionId: string, refs: string[], mode: 'all' | 'any', onProgress: () => void): Promise<TaskSummary[]> {
     const c = this.ctx(missionId);
     for (const r of refs) this.ownTask(missionId, r);
     const isDone = (): boolean => {
@@ -854,7 +916,12 @@ export class MissionEngine extends EventEmitter implements BridgeHandlers {
 
   // ---- ask_user ----------------------------------------------------------------
 
-  async askUser(missionId: string, taskId: string | null, q: { question: string; options?: string[]; context?: string }): Promise<string> {
+  askUser(missionId: string, taskId: string | null, q: { question: string; options?: string[]; context?: string }): Promise<string> {
+    if (taskId !== null) return this.doAskUser(missionId, taskId, q); // a task session's question
+    return this.conductorCall(missionId, () => this.doAskUser(missionId, taskId, q));
+  }
+
+  private async doAskUser(missionId: string, taskId: string | null, q: { question: string; options?: string[]; context?: string }): Promise<string> {
     this.assertOpen();
     const c = this.ctx(missionId);
     if (taskId !== null) this.ownTask(missionId, taskId);
@@ -866,7 +933,11 @@ export class MissionEngine extends EventEmitter implements BridgeHandlers {
 
   // ---- finish_mission ----------------------------------------------------------
 
-  async finishMission(missionId: string, summary: string): Promise<'merge' | 'keep'> {
+  finishMission(missionId: string, summary: string): Promise<'merge' | 'keep'> {
+    return this.conductorCall(missionId, () => this.doFinishMission(missionId, summary));
+  }
+
+  private async doFinishMission(missionId: string, summary: string): Promise<'merge' | 'keep'> {
     this.assertOpen();
     const c = this.ctx(missionId);
     if (c.stopPromise) throw new Error('The mission is stopping');

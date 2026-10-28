@@ -3,7 +3,7 @@
 // (honoured only with MAESTRO_TEST=1), which calls the engine's bridge handlers in order.
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { execFileSync, spawn } from 'node:child_process';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -105,12 +105,12 @@ afterEach(() => {
 
 interface CliResult { code: number | null; out: string; err: string }
 
-function runCli(o: { taskSteps: object[]; script: object[]; answers: string; extraArgs?: string[] }): Promise<CliResult> {
+function runCli(o: { taskSteps: object[]; script: object[]; answers: string; extraArgs?: string[]; conductorSteps?: object[] }): Promise<CliResult> {
   const taskScenario = join(dir, 'task-scenario.json');
   const condScenario = join(dir, 'conductor-scenario.json');
   const scriptPath = join(dir, 'conductor-script.json');
   writeFileSync(taskScenario, JSON.stringify({ steps: o.taskSteps }));
-  writeFileSync(condScenario, JSON.stringify({ steps: CONDUCTOR_IDLE }));
+  writeFileSync(condScenario, JSON.stringify({ steps: o.conductorSteps ?? CONDUCTOR_IDLE }));
   writeFileSync(scriptPath, JSON.stringify(o.script));
   const args = [
     '--import', TSX, CLI, 'run', '--project', root, '--brief', join(dir, 'brief.md'), '--quick',
@@ -211,6 +211,24 @@ describe('maestro run', () => {
     expect(r.out).toContain('[test-conductor] ask_user -> Blue');
     expect(r.out).toContain('[test-conductor] ask_user -> Widget');
     expect(onlyMission().outcome).toBe('kept');
+  }, T);
+
+  it('cli prints conductor text and turns a plain-text turn into a question answered back to the conductor', async () => {
+    const say = (text: string) => ({ emit: { type: 'assistant', parent_tool_use_id: null, message: { content: [{ type: 'text', text }] } } });
+    const conductorSteps = [
+      INIT, USER, say('Hello from the conductor. Which framework?'), RESULT('Hello from the conductor. Which framework?'),
+      USER, say('Thanks. One more thing?'), RESULT('Thanks. One more thing?'), ...UNTIL_INTERRUPT,
+    ];
+    // The first question is answered; stdin then ends while the second waits, which stops the mission.
+    const r = await runCli({ taskSteps: TASK_HANG, script: [], answers: 'React please\n', conductorSteps });
+    const all = r.out + r.err;
+    expect(r.code, all).toBe(1);
+    expect(r.out).toContain('[conductor] Hello from the conductor. Which framework?');
+    expect(r.out).toContain('Question from conductor: Hello from the conductor. Which framework?');
+    expect(r.out).toContain('[conductor] Thanks. One more thing?');
+    const userLines = readFileSync(join(dir, 'fake.jsonl'), 'utf8').split('\n').filter(Boolean).map(l => JSON.parse(l))
+      .filter(l => l?.type === 'user').map(l => l.message.content);
+    expect(userLines).toContain('React please');
   }, T);
 
   it('cli refuses the test conductor hook outside test mode', () => {

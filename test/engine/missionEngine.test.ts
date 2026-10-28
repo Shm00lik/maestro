@@ -475,6 +475,42 @@ describe('MissionEngine', () => {
     expect(mission(m.id).conductorSessionId).toBeTruthy();
   }, T);
 
+  it('a plain-text conductor turn becomes one free-text question whose answer goes back to the conductor', async () => {
+    const say = (text: string) => ({ emit: { type: 'assistant', parent_tool_use_id: null, message: { content: [{ type: 'text', text }] } } });
+    const long = `Which database should I use? ${'x'.repeat(3000)}`;
+    const e = makeEngine(TASK_HANG, [
+      INIT, USER, say(long), RESULT(long), say('Also: tabs or spaces?'), RESULT('Also: tabs or spaces?'),
+      USER, ...UNTIL_INTERRUPT,
+    ]);
+    const texts: string[] = [];
+    e.on('conductor-text', (x: { text: string }) => texts.push(x.text));
+    const m = await start(e);
+    const q = await until(() => openEntry(m.id, 'question'));
+    await sleep(500); // the second plain-text result arrives too
+    const open = inbox.listOpen(db, Date.now()).filter(x => x.missionId === m.id && x.kind === 'question');
+    expect(open).toHaveLength(1); // never more than one
+    expect(q.taskId).toBeNull();
+    const p = q.payload as { question: string; options?: string[] };
+    expect(p.options).toBeUndefined();
+    expect(p.question.startsWith('Which database should I use?')).toBe(true);
+    expect(p.question.length).toBeLessThanOrEqual(2000);
+    expect(texts[0]).toMatch(/^Which database/);
+    e.inbox.answerQuestion(q.id, 'Postgres');
+    await until(() => readFileSync(join(dir, 'conductor.jsonl'), 'utf8').includes('Postgres'));
+  }, T);
+
+  it('a conductor turn that ends while its own bridge call is pending asks nothing', async () => {
+    const e = makeEngine(TASK_HANG, [INIT, USER, { sleepMs: 800 }, RESULT('waiting on you'), USER, ...UNTIL_INTERRUPT]);
+    const m = await start(e);
+    const asked = e.askUser(m.id, null, { question: 'Pick one', options: ['a', 'b'] }).catch(() => undefined);
+    const condLog = join(dir, 'logs', 'missions', m.id, 'conductor.log');
+    await until(() => { try { return readFileSync(condLog, 'utf8').includes('"type":"result"'); } catch { return false; } });
+    await sleep(300);
+    const qs = inbox.listOpen(db, Date.now()).filter(x => x.missionId === m.id && x.kind === 'question');
+    expect(qs.map(x => (x.payload as { question: string }).question)).toEqual(['Pick one']);
+    void asked;
+  }, T);
+
   it('rejects calls for unknown missions and foreign task ids', async () => {
     const e = makeEngine(TASK_HANG);
     const a = await start(e);

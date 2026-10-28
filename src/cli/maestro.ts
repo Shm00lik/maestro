@@ -29,6 +29,9 @@ Options:
   --db <path>        database file (default: %APPDATA%\\Maestro\\maestro.db; logs then go to <db folder>\\logs)
 `;
 
+/** Conductor text lines are cut to this many characters. */
+const CONDUCTOR_LINE_MAX = 300;
+
 export interface RunArgs {
   project: string; brief: string; title?: string; quick: boolean; base: string; parallel: number; db?: string;
   conductorScript?: string;
@@ -150,6 +153,12 @@ export async function main(argv: string[], env: NodeJS.ProcessEnv = process.env)
     if (ev.missionId === missionId && ev.type === 'state' && !ev.taskId) setImmediate(checkEnded);
   });
   engine.on('mission', (m: Mission) => { if (m.id === missionId) setImmediate(checkEnded); });
+  // What the conductor says (the user cannot see its session otherwise); a plain-text turn also becomes a question.
+  engine.on('conductor-text', (x: { missionId: string; text: string }) => {
+    if (finished) return;
+    const one = x.text.replace(/\s+/g, ' ').trim();
+    out(`${label(x.missionId)}[conductor] ${one.length > CONDUCTOR_LINE_MAX ? `${one.slice(0, CONDUCTOR_LINE_MAX - 1)}…` : one}`);
+  });
 
   // ---- stopping ----
   let stopRequested = false;
