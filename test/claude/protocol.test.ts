@@ -30,6 +30,7 @@ describe('parseEvent', () => {
     for (const [name, kinds] of Object.entries(expected)) expect(all(name).map(e => e.kind), name).toEqual(kinds);
   });
 
+  // NOTE: `claude_code_version` (source of cliVersion) is UNVERIFIED: the spikes never recorded the real key name.
   it('init', () => {
     expect(first('init')).toEqual({
       kind: 'init', sessionId: '3b637c25-ffcc-4605-99f5-d6f4c9075042', model: 'claude-haiku-5-5',
@@ -51,8 +52,8 @@ describe('parseEvent', () => {
   it('user echo, tool results and interrupt marker', () => {
     expect(first('user-echo')).toEqual({ kind: 'user-echo', text: 'List the files here, then wait.' });
     const [ok, err, marker] = all('user-tool');
-    expect(ok).toEqual({ kind: 'tool-result', toolUseId: 'toolu_018vtQoAyayacZn6K97RaGFZ', isError: false });
-    expect(err).toEqual({ kind: 'tool-result', toolUseId: 'toolu_01Bu1V3C', isError: true });
+    expect(ok).toEqual({ kind: 'tool-result', results: [{ toolUseId: 'toolu_018vtQoAyayacZn6K97RaGFZ', isError: false }] });
+    expect(err).toEqual({ kind: 'tool-result', results: [{ toolUseId: 'toolu_01Bu1V3C', isError: true }] });
     expect(marker).toEqual({ kind: 'interrupt-marker' });
   });
 
@@ -74,6 +75,21 @@ describe('parseEvent', () => {
   it('result with missing numbers counts 0', () => {
     const e = parseEvent(JSON.stringify({ type: 'result', subtype: 'success', is_error: false, session_id: 's', usage: { input_tokens: 3 } }));
     expect(e).toMatchObject({ kind: 'result', text: null, terminalReason: null, usage: { input: 3, output: 0, cacheRead: 0, cacheWrite: 0 } });
+  });
+
+  it('collects every tool_result block of a user event in order', () => {
+    const e = parseEvent(JSON.stringify({ type: 'user', message: { role: 'user', content: [
+      { type: 'tool_result', tool_use_id: 'a', content: 'x' },
+      { type: 'text', text: 'ignored' },
+      { type: 'tool_result', tool_use_id: 'b', content: 'y', is_error: true },
+    ] } }));
+    expect(e).toEqual({ kind: 'tool-result', results: [{ toolUseId: 'a', isError: false }, { toolUseId: 'b', isError: true }] });
+  });
+
+  it('empty model_usage_since_last_result falls back to result.usage', () => {
+    const e = parseEvent(JSON.stringify({ type: 'result', subtype: 'success', is_error: false, session_id: 's',
+      model_usage_since_last_result: {}, usage: { input_tokens: 1, output_tokens: 2, cache_read_input_tokens: 3, cache_creation_input_tokens: 4 } }));
+    expect(e).toMatchObject({ usage: { input: 1, output: 2, cacheRead: 3, cacheWrite: 4 } });
   });
 
   it('result interrupted', () => {
@@ -105,7 +121,7 @@ describe('parseEvent', () => {
 
   it('ignores unknown types, subtypes and extra keys', () => {
     expect(all('unknown')).toEqual([
-      { kind: 'unknown', type: 'task_summary', subtype: null },
+      { kind: 'unknown', type: 'system', subtype: 'task_summary' },
       { kind: 'unknown', type: 'tool_progress', subtype: null },
       { kind: 'unknown', type: 'system', subtype: 'hook_started' },
       { kind: 'unknown', type: 'system', subtype: 'thinking_tokens' },

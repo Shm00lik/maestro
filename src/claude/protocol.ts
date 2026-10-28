@@ -5,7 +5,7 @@ export type StreamEvent =
   | { kind: 'init'; sessionId: string; model: string; cwd: string; tools: string[]; permissionMode: string; cliVersion?: string }
   | { kind: 'assistant'; text: string; toolUses: { id: string; name: string; input: unknown }[]; parentToolUseId: string | null }
   | { kind: 'user-echo'; text: string }
-  | { kind: 'tool-result'; toolUseId: string; isError: boolean }
+  | { kind: 'tool-result'; results: { toolUseId: string; isError: boolean }[] }
   | { kind: 'interrupt-marker' }
   | { kind: 'result'; ok: boolean; subtype: string; terminalReason: string | null; text: string | null; sessionId: string; usage: TokenUsage }
   | { kind: 'permission-request'; requestId: string; toolName: string; input: unknown; toolUseId: string; description: string | null }
@@ -23,7 +23,7 @@ const arr = (v: unknown): unknown[] => (Array.isArray(v) ? v : []);
 
 function tokenUsage(r: Obj): TokenUsage {
   const since = r.model_usage_since_last_result;
-  if (isObj(since)) {
+  if (isObj(since) && Object.keys(since).length > 0) {
     const t: TokenUsage = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
     for (const m of Object.values(since)) {
       if (!isObj(m)) continue;
@@ -89,10 +89,11 @@ export function parseEvent(line: string): StreamEvent | null {
     case 'user': {
       const content = isObj(raw.message) ? raw.message.content : undefined;
       if (typeof content === 'string') return { kind: 'user-echo', text: content };
+      const results: { toolUseId: string; isError: boolean }[] = [];
       for (const b of arr(content)) {
-        if (!isObj(b)) continue;
-        if (b.type === 'tool_result') return { kind: 'tool-result', toolUseId: str(b.tool_use_id), isError: b.is_error === true };
+        if (isObj(b) && b.type === 'tool_result') results.push({ toolUseId: str(b.tool_use_id), isError: b.is_error === true });
       }
+      if (results.length > 0) return { kind: 'tool-result', results };
       for (const b of arr(content)) {
         if (isObj(b) && b.type === 'text' && str(b.text).startsWith(INTERRUPT_TEXT)) return { kind: 'interrupt-marker' };
       }
