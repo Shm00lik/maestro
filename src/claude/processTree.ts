@@ -35,6 +35,20 @@ function treeFromJson(stdout: string | undefined | null, pid: number): number[] 
   return result;
 }
 
+/** Async killTree (taskkill /T /F); same ok rules, never rejects. */
+export function killTreeAsync(pid: number): Promise<{ ok: boolean; output: string }> {
+  return new Promise(resolve => {
+    try {
+      execFile('taskkill', ['/PID', String(pid), '/T', '/F'], { windowsHide: true, encoding: 'utf8' }, (err, stdout, stderr) => {
+        const output = `${stdout ?? ''}${stderr ?? ''}`.trim();
+        const code = err ? (typeof err.code === 'number' ? err.code : -1) : 0;
+        const gone = code === 128 && /not found/i.test(output);
+        resolve({ ok: code === 0 || gone, output: output || (err ? err.message : '') });
+      });
+    } catch (e) { resolve({ ok: false, output: (e as Error).message }); }
+  });
+}
+
 /** pid itself (if running) followed by all descendants; [] when pid is not running. */
 export function listTreePids(pid: number): number[] {
   const r = spawnSync('powershell', PS_ARGS, { windowsHide: true, encoding: 'utf8', maxBuffer: 1 << 26 });

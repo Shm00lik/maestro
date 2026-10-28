@@ -6,7 +6,7 @@ import { randomUUID } from 'node:crypto';
 import { appendFileSync, mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { resolveClaudeCommand } from './exe.js';
-import { killTree, listTreePidsAsync } from './processTree.js';
+import { killTreeAsync, listTreePidsAsync } from './processTree.js';
 import {
   encodeInterrupt, encodePermissionAllow, encodePermissionDeny, encodeUserMessage, parseEvent, type StreamEvent,
 } from './protocol.js';
@@ -24,6 +24,9 @@ export interface SessionOptions {
   env?: Record<string, string>;
   logPath: string;
   command?: { exe: string; prefixArgs: string[] };
+  /** Test hooks. */
+  listTree?: (pid: number) => Promise<number[]>;
+  killTree?: (pid: number) => Promise<{ ok: boolean; output: string }>;
 }
 export type SessionStatus = 'starting' | 'busy' | 'idle' | 'exited';
 export interface ExitInfo { code: number | null; killed: boolean }
@@ -47,7 +50,11 @@ export class ClaudeSession extends EventEmitter {
   private exitCode: number | null = null;
   private finalized = false;
   private baseline: Set<number> | null = null;
-  private baselineStarted = false;
+  private baselinePending = false;
+  private cleanupPending = false;
+  private queued: string[] = [];
+  private readonly listTreeFn: (pid: number) => Promise<number[]>;
+  private readonly killTreeFn: (pid: number) => Promise<{ ok: boolean; output: string }>;
   private killing = false;
   private killPromise: Promise<void> | null = null;
   private interruptPromise: Promise<'interrupted' | 'killed'> | null = null;
@@ -57,6 +64,8 @@ export class ClaudeSession extends EventEmitter {
   private constructor(opts: SessionOptions) {
     super();
     this.logPath = opts.logPath;
+    this.listTreeFn = opts.listTree ?? listTreePidsAsync;
+    this.killTreeFn = opts.killTree ?? killTreeAsync;
     mkdirSync(dirname(opts.logPath), { recursive: true });
     const command = opts.command ?? resolveClaudeCommand();
     this.child = spawn(command.exe, [...command.prefixArgs, ...BASE_ARGS, ...opts.args], {
@@ -119,10 +128,7 @@ export class ClaudeSession extends EventEmitter {
   private handle(ev: StreamEvent): void {
     if (ev.kind === 'init') {
       this.sessionId = ev.sessionId;
-      if (this.baseline === null && !this.baselineStarted) {
-        this.baselineStarted = true;
-        void listTreePidsAsync(this.pid).then(pids => { this.baseline = new Set(pids); });
-      }
+      this.startBaseline();
       if (this.status === 'starting') this.status = 'idle';
     } else if (ev.kind === 'result') {
       if (this.status !== 'exited') this.status = 'idle';
@@ -140,14 +146,27 @@ export class ClaudeSession extends EventEmitter {
     this.emit('exit', info);
   }
 
+  /** Snapshot of descendants taken after init. A snapshot without our own pid is a failed one: baseline stays null. */
+  private startBaseline(): void {
+    if (this.baseline !== null || this.baselinePending || this.pid <= 0) return;
+    this.baselinePending = true;
+    void this.listTreeFn(this.pid).then(pids => {
+      if (pids.includes(this.pid)) this.baseline = new Set(pids);
+      else this.log('[session] baseline snapshot failed; interrupt cleanup disabled until a retry succeeds');
+    }, () => { /* treated as failed */ }).finally(() => { this.baselinePending = false; });
+  }
+
   private write(data: string): void {
     if (this.status === 'exited' || this.stdinEnded || this.child.stdin.destroyed || !this.child.stdin.writable) {
       throw new SessionClosed();
     }
-    this.child.stdin.write(data);
+    // While post-interrupt cleanup is pending, hold writes so the next turn's children can't be caught by it.
+    if (this.cleanupPending) this.queued.push(data);
+    else this.child.stdin.write(data);
   }
 
   send(text: string): void {
+    if (this.baseline === null) this.startBaseline(); // retry a failed/missing baseline at turn start
     this.write(encodeUserMessage(text));
     this.status = 'busy';
   }
@@ -173,8 +192,13 @@ export class ClaudeSession extends EventEmitter {
       };
       const onEvent = (ev: StreamEvent): void => {
         if (ev.kind !== 'result' || this.killing) return;
-        settle('interrupted');
-        void this.cleanupToolChildren();
+        // Snapshot first (async, outside this handler), then settle, then kill the diff.
+        this.cleanupPending = true;
+        void this.cleanupToolChildren().then(kill => {
+          if (this.killing || done) return;
+          settle('interrupted');
+          return kill();
+        }).catch(() => { /* best effort */ }).finally(() => this.endCleanup());
       };
       const onExit = (): void => settle('killed');
       const timer = setTimeout(() => {
@@ -196,14 +220,30 @@ export class ClaudeSession extends EventEmitter {
     return p;
   }
 
-  /** Kill descendants that appeared since the post-init baseline (tool children), sparing e.g. stdio MCP servers. */
-  private async cleanupToolChildren(): Promise<void> {
-    if (!this.baseline) { this.log('[session] interrupt cleanup skipped: baseline not ready'); return; }
-    const now = await listTreePidsAsync(this.pid);
-    for (const pid of now) {
-      if (pid === this.pid || this.baseline.has(pid)) continue;
-      killTree(pid);
+  private endCleanup(): void {
+    this.cleanupPending = false;
+    const q = this.queued.splice(0);
+    if (this.status === 'exited' || this.stdinEnded || this.child.stdin.destroyed) return;
+    for (const d of q) this.child.stdin.write(d);
+  }
+
+  /**
+   * Snapshots descendants now; returns a function that kills those that appeared since the post-init baseline
+   * (tool children), sparing e.g. stdio MCP servers. With no baseline nothing is killed.
+   */
+  private async cleanupToolChildren(): Promise<() => Promise<void>> {
+    const baseline = this.baseline;
+    if (!baseline) {
+      this.log('[session] interrupt cleanup skipped: baseline not ready');
+      return async () => { /* nothing */ };
     }
+    const now = await this.listTreeFn(this.pid);
+    if (!now.includes(this.pid)) {
+      this.log('[session] interrupt cleanup skipped: post-interrupt snapshot failed');
+      return async () => { /* nothing */ };
+    }
+    const extra = now.filter(pid => pid !== this.pid && !baseline.has(pid));
+    return async () => { await Promise.all(extra.map(pid => this.killTreeFn(pid))); };
   }
 
   /**
@@ -225,10 +265,11 @@ export class ClaudeSession extends EventEmitter {
       if (this.status !== 'exited') {
         this.weKilled = true;
         this.stdinEnded = true;
-        const r = this.pid > 0 ? killTree(this.pid) : { ok: false, output: 'no pid' };
+        let r = 'pending';
+        if (this.pid > 0) void this.killTreeFn(this.pid).then(x => { r = `ok=${x.ok} ${x.output}`; }, () => { r = 'rejected'; });
         setTimeout(() => {
           if (this.finalized) return;
-          this.log(`[session] no exit ${KILL_WAIT_MS}ms after killTree (ok=${r.ok}): ${r.output}`);
+          this.log(`[session] no exit ${KILL_WAIT_MS}ms after killTree (${r})`);
           this.finalize(null);
         }, KILL_WAIT_MS).unref();
       }

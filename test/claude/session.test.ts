@@ -3,7 +3,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { BASE_ARGS, ClaudeSession, SessionClosed } from '../../src/claude/session.js';
+import { BASE_ARGS, ClaudeSession, SessionClosed, type SessionOptions } from '../../src/claude/session.js';
 import { killTree } from '../../src/claude/processTree.js';
 import type { StreamEvent } from '../../src/claude/protocol.js';
 
@@ -29,13 +29,14 @@ function fakeLogLines(): any[] {
   try { return readFileSync(fakeLog(), 'utf8').split('\n').filter(Boolean).map(l => JSON.parse(l)); } catch { return []; }
 }
 
-function start(scenario: string | object, extraArgs: string[] = []): ClaudeSession {
+function start(scenario: string | object, extraArgs: string[] = [], extra: Partial<SessionOptions> = {}): ClaudeSession {
   let sc: string;
   if (typeof scenario === 'string') sc = scenarioFile(scenario);
   else { sc = join(dir, 'inline.json'); writeFileSync(sc, JSON.stringify(scenario)); }
   const s = ClaudeSession.start({
     args: extraArgs, cwd: dir, logPath: join(dir, 'logs', 's.log'), command,
     env: { FAKE_CLAUDE_SCENARIO: sc, FAKE_CLAUDE_LOG: fakeLog() },
+    ...extra,
   });
   sessions.push(s);
   return s;
@@ -197,11 +198,60 @@ describe('ClaudeSession', () => {
   }, 10000);
 
   it('a result arriving after the timeout fired still resolves killed', async () => {
-    const s = start({ steps: [{ emit: INIT }, { waitFor: 'user' }, { waitFor: 'interrupt' }, { sleepMs: 150 }, { emit: RESULT }, { waitFor: 'stdin-close' }] });
+    const stubKills: number[] = [];
+    const s = start(
+      { steps: [{ emit: INIT }, { waitFor: 'user' }, { waitFor: 'interrupt' }, { sleepMs: 400 }, { emit: RESULT }, { waitFor: 'stdin-close' }] },
+      [], { killTree: async pid => { stubKills.push(pid); return { ok: true, output: 'stub' }; } },
+    );
     await until(s, 'init');
     s.send('go');
-    expect(await s.interrupt(100)).toBe('killed');
-    expect(s.status).toBe('exited');
+    let outcome: string | null = null;
+    void s.interrupt(100).then(o => { outcome = o; });
+    const gotResult = until(s, 'result');
+    await gotResult; // result arrives after the timeout fired; the stub did not kill anything
+    await new Promise(r => setTimeout(r, 200));
+    expect(stubKills).toContain(s.pid);
+    expect(outcome).toBeNull(); // must not settle 'interrupted'
+    killTree(s.pid); // really kill now
+    await exited(s);
+    await waitUntil(() => outcome !== null, 3000);
+    expect(outcome).toBe('killed');
+  }, 10000);
+
+  it('skips cleanup (kills nothing) when the baseline snapshot failed', async () => {
+    const s = start(
+      { steps: [{ emit: INIT }, { waitFor: 'user' }, { spawnChild: 'ping' }, { waitFor: 'interrupt' }, { emit: RESULT }, { waitFor: 'stdin-close' }] },
+      [], { listTree: async () => [] },
+    );
+    await until(s, 'init');
+    await new Promise(r => setTimeout(r, 300));
+    s.send('go');
+    await waitUntil(() => children().length === 1);
+    const pid = children()[0];
+    expect(await s.interrupt(8000)).toBe('interrupted');
+    await new Promise(r => setTimeout(r, 500));
+    expect(alive(pid)).toBe(true);
+    expect(readFileSync(join(dir, 'logs', 's.log'), 'utf8')).toContain('baseline');
+  }, 10000);
+
+  it("send right after interrupt does not kill the new turn's tool child", async () => {
+    const s = start({ steps: [
+      { emit: INIT }, { waitFor: 'user' }, { spawnChild: 'ping' }, { waitFor: 'interrupt' }, { emit: RESULT },
+      { waitFor: 'user' }, { spawnChild: 'ping' }, { waitFor: 'stdin-close' },
+    ] });
+    await until(s, 'init');
+    await baselineReady(s);
+    s.send('one');
+    await waitUntil(() => children().length === 1);
+    expect(await s.interrupt(8000)).toBe('interrupted');
+    s.send('two');
+    expect(s.status).toBe('busy');
+    await waitUntil(() => children().length === 2);
+    const [first, second] = children();
+    await waitUntil(() => !alive(first));
+    await new Promise(r => setTimeout(r, 1500));
+    expect(alive(first)).toBe(false);
+    expect(alive(second)).toBe(true);
   }, 10000);
 
   it('stdin EPIPE without an error listener does not throw and is logged', async () => {
