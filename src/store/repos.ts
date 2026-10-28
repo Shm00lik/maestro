@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import type { Db } from './db.js';
+import { normalizePath } from './pathKey.js';
 import type { PlanTask } from '../core/types.js';
 import type { PlanGraph } from '../core/plan/graph.js';
 import { nextTaskState, type TaskState, type TaskEvent } from '../core/state/taskMachine.js';
@@ -34,9 +35,14 @@ export class Expired extends Error {
   }
 }
 
-/** Key used for the unique project path: lower-case, forward slashes, no trailing slash. */
-export function normalizePath(p: string): string {
-  return p.replace(/\\/g, '/').toLowerCase().replace(/\/+$/, '');
+export { normalizePath };
+
+/** Thrown by projects.add when a project with the same normalised path exists. */
+export class DuplicateProject extends Error {
+  constructor(public path: string) {
+    super(`A project with this path already exists: ${path}`);
+    this.name = 'DuplicateProject';
+  }
 }
 
 export interface Project { id: string; name: string; path: string; createdAt: number; lastUsedAt: number }
@@ -121,8 +127,13 @@ export const projects = {
   add(db: Db, p: { name: string; path: string }): Project {
     const now = Date.now();
     const id = randomUUID();
-    db.prepare('INSERT INTO projects (id, name, path, path_key, created_at, last_used_at) VALUES (?,?,?,?,?,?)')
-      .run(id, p.name, p.path, normalizePath(p.path), now, now);
+    try {
+      db.prepare('INSERT INTO projects (id, name, path, path_key, created_at, last_used_at) VALUES (?,?,?,?,?,?)')
+        .run(id, p.name, p.path, normalizePath(p.path), now, now);
+    } catch (err) {
+      if ((err as { code?: string }).code === 'SQLITE_CONSTRAINT_UNIQUE') throw new DuplicateProject(p.path);
+      throw err;
+    }
     return toProject(db.prepare('SELECT * FROM projects WHERE id = ?').get(id) as Row);
   },
   list(db: Db): Project[] {
@@ -201,7 +212,7 @@ export const tasks = {
   },
   /** Spec §6 re-plan rules. */
   applyReplan(db: Db, missionId: string, planVersionId: string, planTasks: PlanTask[], graph: PlanGraph):
-    { cancelled: string[]; runningUnplanned: string[] } {
+    { cancelled: string[]; runningUnplanned: string[]; conflicts: string[] } {
     const critical = new Set(graph.criticalPath);
     return db.transaction(() => {
       const existing = new Map(tasks.listByMission(db, missionId).map(t => [t.taskKey, t]));
@@ -211,6 +222,9 @@ export const tasks = {
       const ins = db.prepare(`INSERT INTO tasks (id, mission_id, plan_version_id, task_key, title, agent, prompt,
         plan_body, state, depends_on_json, owns_json, acceptance, depth, on_critical_path)
         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`);
+      const part = db.prepare(`UPDATE tasks SET plan_version_id = ?, plan_body = ?, depends_on_json = ?, owns_json = ?,
+        depth = ?, on_critical_path = ? WHERE id = ?`);
+      const conflicts: string[] = [];
       for (const t of planTasks) {
         const cur = existing.get(t.key);
         const depth = graph.depth[t.key] ?? 0;
@@ -218,7 +232,12 @@ export const tasks = {
         if (!cur) {
           ins.run(randomUUID(), missionId, planVersionId, t.key, t.title, t.agent, t.body, t.body, 'planned',
             JSON.stringify(t.dependsOn), JSON.stringify(t.owns), t.acceptance, depth, crit);
-        } else if (isPreRun(cur.state)) {
+        } else if (cur.planVersionId === null || cur.state === 'cancelled') {
+          conflicts.push(t.key); // ad-hoc key collision, or a cancelled key re-introduced
+        } else if (cur.state === 'waiting' || cur.state === 'ready') {
+          part.run(planVersionId, t.body, JSON.stringify(t.dependsOn), JSON.stringify(t.owns), depth, crit, cur.id);
+          appendEvent(db, { missionId, taskId: cur.id, type: 'replan', data: { planVersionId } });
+        } else if (cur.state === 'planned') {
           upd.run(planVersionId, t.title, t.agent, t.body, t.body, JSON.stringify(t.dependsOn),
             JSON.stringify(t.owns), t.acceptance, depth, crit, cur.id);
           appendEvent(db, { missionId, taskId: cur.id, type: 'replan', data: { planVersionId } });
@@ -227,7 +246,7 @@ export const tasks = {
       const cancelled: string[] = [];
       const runningUnplanned: string[] = [];
       for (const [key, cur] of existing) {
-        if (newKeys.has(key)) continue;
+        if (newKeys.has(key) || cur.planVersionId === null) continue;
         if (isPreRun(cur.state)) {
           tasks.transition(db, cur.id, 'cancel');
           cancelled.push(key);
@@ -235,7 +254,7 @@ export const tasks = {
           runningUnplanned.push(key);
         }
       }
-      return { cancelled, runningUnplanned };
+      return { cancelled, runningUnplanned, conflicts };
     })();
   },
   getByKey(db: Db, missionId: string, key: string): Task | undefined {
@@ -247,7 +266,13 @@ export const tasks = {
     return db.transaction(() => {
       const cur = tasks.getByKey(db, missionId, d.key);
       const now = Date.now();
+      const checkDeps = () => {
+        if (d.dependsOn.includes(d.key)) throw new Error(`Task ${d.key} cannot depend on itself`);
+        const unknown = d.dependsOn.filter(k => !tasks.getByKey(db, missionId, k));
+        if (unknown.length > 0) throw new Error(`Unknown dependency key(s) for ${d.key}: ${unknown.join(', ')}`);
+      };
       if (cur && (cur.state === 'planned' || cur.state === 'failed')) {
+        checkDeps();
         tasks.transition(db, cur.id, cur.state === 'planned' ? 'dispatch' : 'retry');
         db.prepare(`UPDATE tasks SET prompt = ?, agent = ?, depends_on_json = ?, owns_json = ?, dispatched_at = ?
           WHERE id = ?`).run(d.prompt, d.agent, JSON.stringify(d.dependsOn), JSON.stringify(d.owns), now, cur.id);
@@ -255,6 +280,7 @@ export const tasks = {
       }
       if (cur) return { task: cur, created: false };
       if (!AD_HOC_KEY.test(d.key)) throw new Error(`Invalid ad-hoc task key: "${d.key}"`);
+      checkDeps();
       const byKey = new Map(tasks.listByMission(db, missionId).map(t => [t.taskKey, t]));
       const depth = d.dependsOn.reduce((m, k) => Math.max(m, (byKey.get(k)?.depth ?? 0) + 1), 1);
       const id = randomUUID();
@@ -291,10 +317,14 @@ export const tasks = {
       // started_at: set on start. ended_at: set on entering done/failed/cancelled, cleared on retry.
       const now = Date.now();
       const started = ev === 'start' ? now : null;
+      const retry = ev === 'retry' ? 1 : 0;
       const ended = to === 'done' || to === 'failed' || to === 'cancelled' ? now : null;
       db.prepare(`UPDATE tasks SET state = ?, started_at = COALESCE(?, started_at),
-        ended_at = CASE WHEN ? THEN NULL ELSE COALESCE(?, ended_at) END WHERE id = ?`)
-        .run(to, started, ev === 'retry' ? 1 : 0, ended, id);
+        ended_at = CASE WHEN ? THEN NULL ELSE COALESCE(?, ended_at) END,
+        failure_reason = CASE WHEN ? THEN NULL ELSE failure_reason END,
+        session_id = CASE WHEN ? THEN NULL ELSE session_id END,
+        worktree_path = CASE WHEN ? THEN NULL ELSE worktree_path END WHERE id = ?`)
+        .run(to, started, retry, ended, retry, retry, retry, id);
       appendEvent(db, { missionId: r.mission_id, taskId: id, type: 'state', data: { from, to, event: ev } });
       return getTask(db, id);
     })();
@@ -358,17 +388,20 @@ export const inbox = {
   },
 };
 
+/** Commands with chaining, redirection or substitution never match a stored prefix. */
+const UNSAFE_SHELL = /[\n\r;&|`>]|\$\(/;
+
 export const permissionRules = {
   add(db: Db, r: { missionId: string; toolName: string; inputPrefix: string }): void {
     db.prepare('INSERT INTO permission_rules (id, mission_id, tool_name, input_prefix, created_at) VALUES (?,?,?,?,?)')
-      .run(randomUUID(), r.missionId, r.toolName, r.inputPrefix, Date.now());
+      .run(randomUUID(), r.missionId, r.toolName, r.inputPrefix.trim(), Date.now());
   },
   match(db: Db, missionId: string, toolName: string, input: unknown): boolean {
     const rules = db.prepare('SELECT input_prefix FROM permission_rules WHERE mission_id = ? AND tool_name = ?')
       .all(missionId, toolName) as Row[];
     if (toolName !== 'Bash') return rules.some(r => r.input_prefix === '');
     const cmd = typeof input === 'object' && input !== null ? (input as Record<string, unknown>).command : undefined;
-    if (typeof cmd !== 'string') return false;
+    if (typeof cmd !== 'string' || UNSAFE_SHELL.test(cmd)) return false;
     return rules.some(r => {
       const p: string = r.input_prefix;
       return cmd.startsWith(p) && (cmd.length === p.length || /\s/.test(cmd[p.length]));

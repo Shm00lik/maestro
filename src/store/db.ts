@@ -1,5 +1,6 @@
 import { readFileSync } from 'node:fs';
 import Database from 'better-sqlite3';
+import { normalizePath } from './pathKey.js';
 
 export type Db = Database.Database;
 
@@ -19,7 +20,7 @@ CREATE TABLE projects_new (
   last_used_at INTEGER NOT NULL
 );
 INSERT INTO projects_new (id, name, path, path_key, created_at, last_used_at)
-  SELECT id, name, path, rtrim(lower(replace(path, char(92), '/')), '/'), created_at, last_used_at FROM projects;
+  SELECT id, name, path, id, created_at, last_used_at FROM projects;
 DROP TABLE projects;
 ALTER TABLE projects_new RENAME TO projects;
 
@@ -134,6 +135,35 @@ export const MIGRATIONS: readonly string[] = [
   MIGRATION_2, // 2: Plan 2 engine
 ];
 
+/** Pre-flight for migration 2: fail with a readable message instead of a raw UNIQUE error. */
+function precheckMigration2(db: Db): void {
+  const seen = new Map<string, string[]>();
+  for (const r of db.prepare('SELECT id, path FROM projects').all() as { id: string; path: string }[]) {
+    const k = normalizePath(r.path);
+    seen.set(k, [...(seen.get(k) ?? []), `${r.id} (${r.path})`]);
+  }
+  for (const [k, rows] of seen) {
+    if (rows.length > 1) {
+      throw new Error(`Migration 2 blocked: projects share the normalised path "${k}": ${rows.join(', ')}. ` +
+        'Delete or re-path all but one of these projects, then reopen.');
+    }
+  }
+  const dups = db.prepare('SELECT mission_id, task_key, COUNT(*) AS n FROM tasks GROUP BY mission_id, task_key HAVING n > 1')
+    .all() as { mission_id: string; task_key: string; n: number }[];
+  if (dups.length > 0) {
+    throw new Error('Migration 2 blocked: duplicate task keys within a mission across plan versions: ' +
+      dups.map(d => `mission ${d.mission_id} key ${d.task_key} (x${d.n})`).join(', ') +
+      '. Delete the stale duplicate task rows (keep one per key), then reopen.');
+  }
+}
+
+function backfillPathKeys(db: Db): void {
+  const upd = db.prepare('UPDATE projects SET path_key = ? WHERE id = ?');
+  for (const r of db.prepare('SELECT id, path FROM projects').all() as { id: string; path: string }[]) {
+    upd.run(normalizePath(r.path), r.id);
+  }
+}
+
 function migrate(db: Db): void {
   const current = db.pragma('user_version', { simple: true }) as number;
   if (current > MIGRATIONS.length) {
@@ -144,7 +174,11 @@ function migrate(db: Db): void {
   db.pragma('foreign_keys = OFF');
   try {
     db.transaction(() => {
-      for (let i = current; i < MIGRATIONS.length; i++) db.exec(MIGRATIONS[i]);
+      for (let i = current; i < MIGRATIONS.length; i++) {
+        if (i === 1) precheckMigration2(db);
+        db.exec(MIGRATIONS[i]);
+        if (i === 1) backfillPathKeys(db);
+      }
       const bad = db.pragma('foreign_key_check') as unknown[];
       if (bad.length > 0) throw new Error(`Migration left ${bad.length} foreign key violation(s)`);
       db.pragma(`user_version = ${MIGRATIONS.length}`);

@@ -2,7 +2,7 @@ import { describe, it, expect } from 'vitest';
 import Database from 'better-sqlite3';
 import { openDb, MIGRATIONS } from '../../src/store/db.js';
 import {
-  projects, missions, planVersions, tasks, inbox, permissionRules, sessions, usageWindow, Expired, AlreadyAnswered,
+  projects, missions, planVersions, tasks, inbox, permissionRules, sessions, usageWindow, Expired, AlreadyAnswered, DuplicateProject,
 } from '../../src/store/repos.js';
 import { buildGraph } from '../../src/core/plan/graph.js';
 import type { PlanTask } from '../../src/core/types.js';
@@ -64,7 +64,7 @@ describe('migration 2', () => {
         expect(inbox.listOpen(db, 10).map(e => e.id)).toEqual(['i1']);
         expect(db.prepare('SELECT COUNT(*) AS n FROM events').get()).toEqual({ n: 1 });
         // new constraints are live after the rebuild
-        expect(() => projects.add(db, { name: 'dup', path: 'c:/demo' })).toThrow(/UNIQUE/);
+        expect(() => projects.add(db, { name: 'dup', path: 'c:/demo' })).toThrow(DuplicateProject);
         const names = (db.prepare("SELECT name FROM sqlite_master WHERE type='index'").all() as { name: string }[]).map(r => r.name);
         expect(names).toEqual(expect.arrayContaining(['idx_tasks_mission', 'idx_inbox_mission']));
       } finally { db.close(); }
@@ -87,7 +87,7 @@ describe('projects', () => {
   it('project paths are unique after normalisation', () => {
     const { db } = setup();
     projects.add(db, { name: 'a', path: 'C:\\X\\' });
-    expect(() => projects.add(db, { name: 'b', path: 'c:/x' })).toThrow(/UNIQUE/);
+    expect(() => projects.add(db, { name: 'b', path: 'c:/x' })).toThrow(DuplicateProject);
     expect(projects.list(db).map(p => p.path)).toContain('C:\\X\\');
   });
 });
