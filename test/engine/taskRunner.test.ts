@@ -1,8 +1,8 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { execFileSync } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { basename, dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { openDb, type Db } from '../../src/store/db.js';
 import { events, inbox, missions, planVersions, projects, sessions, tasks, type Task } from '../../src/store/repos.js';
@@ -379,13 +379,16 @@ describe('TaskRunner', () => {
     expect(git(root, 'show', `${MISSION_BRANCH}:b.txt`)).toBe('first attempt');
   }, 15000);
 
-  it('replaces a worktree folder that is not a registered worktree', async () => {
+  it('moves aside (never deletes) a worktree folder that is not a registered worktree', async () => {
     const c = setup([INIT(), USER, RESULT(HANDOFF), STDIN_CLOSE]);
     const wt = worktreeDirFor(root, c.missionId, 'T1');
     mkdirSync(wt, { recursive: true });
     writeFileSync(join(wt, 'junk.txt'), 'junk');
     await c.runner.start(c.task.id, []);
     expect(existsSync(join(wt, 'junk.txt'))).toBe(false);
+    const stale = readdirSync(dirname(wt)).filter(n => n.startsWith(`${basename(wt)}.stale-`));
+    expect(stale).toHaveLength(1);
+    expect(readFileSync(join(dirname(wt), stale[0], 'junk.txt'), 'utf8')).toBe('junk');
     expect(git(wt, 'rev-parse', '--abbrev-ref', 'HEAD')).toBe(TASK_BRANCH);
     expect((await finished(c)).outcome).toBe('done');
   }, 15000);
@@ -462,11 +465,39 @@ describe('TaskRunner', () => {
     expect(c.finished).toEqual([{ taskId: c.task.id, outcome: 'cancelled' }]);
   });
 
-  it('a result for a turn started by message() without a handoff neither reminds nor fails', async () => {
-    const c = setup([INIT(), USER, RESULT('first'), USER, RESULT('reply to user'), USER, RESULT(HANDOFF), STDIN_CLOSE]);
+  it('a user message folded into the running turn: a result without handoff neither reminds nor fails', async () => {
+    const c = setup([INIT(), USER, USER, RESULT('answered both, no handoff'), STDIN_CLOSE]);
     await c.runner.start(c.task.id, []);
     c.runner.message(c.task.id, 'hi');
-    expect(await finished(c)).toEqual({ taskId: c.task.id, outcome: 'done' });
-    expect(userTexts().slice(1)).toEqual(['hi', 'Finish with a ## Handoff section.']);
+    while (getTask(c).tokensIn < 10) await sleep(20);
+    await sleep(300);
+    expect(getTask(c).state).toBe('running');
+    expect(c.finished).toEqual([]);
+    expect(userTexts().slice(1)).toEqual(['hi']);
+  }, 15000);
+
+  it('a reminder and a user message folded into one result do not fail with no-handoff', async () => {
+    const c = setup([INIT(), USER, RESULT('none'), USER, USER, RESULT('still none'), STDIN_CLOSE]);
+    await c.runner.start(c.task.id, []);
+    while (userTexts().length < 2) await sleep(20);
+    c.runner.message(c.task.id, 'hi');
+    while (getTask(c).tokensIn < 20) await sleep(20);
+    await sleep(300);
+    expect(userTexts().slice(1)).toEqual(['Finish with a ## Handoff section.', 'hi']);
+    expect(getTask(c).state).toBe('running');
+    expect(c.finished).toEqual([]);
+  }, 15000);
+
+  it('stop after an ended run cancels the retried task', async () => {
+    const c = setup([INIT(), USER, { exit: 1 }]);
+    await c.runner.start(c.task.id, []);
+    expect((await finished(c)).outcome).toBe('failed');
+    tasks.transition(c.db, c.task.id, 'retry');
+    tasks.transition(c.db, c.task.id, 'deps_met');
+    inbox.add(c.db, { missionId: c.missionId, taskId: c.task.id, kind: 'question', payload: { question: 'q' } });
+    await c.runner.stop(c.task.id);
+    expect(getTask(c).state).toBe('cancelled');
+    expect(inbox.openCountForTask(c.db, c.task.id)).toBe(0);
+    expect(c.finished.map(f => f.outcome)).toEqual(['failed', 'cancelled']);
   }, 15000);
 });

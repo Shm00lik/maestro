@@ -4,7 +4,7 @@ import { EventEmitter } from 'node:events';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { randomUUID } from 'node:crypto';
-import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type { Db } from '../store/db.js';
@@ -156,7 +156,7 @@ interface Run {
   rowEnded: boolean;
   logPath: string | null;
   reminded: boolean;
-  /** Origins of the turns sent and not yet answered by a result, oldest first. */
+  /** Origins of the messages sent since the last result. */
   turns: TurnOrigin[];
   lastAssistantText: string;
   lastError: string | null;
@@ -301,6 +301,11 @@ export class TaskRunner extends EventEmitter {
    */
   stop(taskId: string): Promise<void> {
     let run = this.runs.get(taskId);
+    if (run?.phase === 'ended') {
+      // That run is over (and maybe already stopped). If the task lives on (e.g. it was retried), stop it afresh.
+      const task = tasks.get(this.db, taskId);
+      if (task && !TERMINAL.includes(task.state)) run = this.newRun(task);
+    }
     if (run?.stopPromise) return run.stopPromise;
     if (!run) {
       const task = tasks.get(this.db, taskId);
@@ -341,13 +346,16 @@ export class TaskRunner extends EventEmitter {
 
   // ---- worktree ------------------------------------------------------------
 
-  /** Reuses a registered worktree; replaces a stray folder; re-adds an existing branch (retry); else cuts a new branch. */
+  /** Reuses a registered worktree; moves a stray folder aside; re-adds an existing branch (retry); else cuts a new branch. */
   private async ensureWorktree(task: Task, branch: string): Promise<string> {
     const root = this.deps.projectRoot;
     const dir = worktreeDirFor(root, task.missionId, task.taskKey);
     if (existsSync(dir)) {
       if (await isRegisteredWorktree(root, dir)) return dir;
-      rmSync(dir, { recursive: true, force: true });
+      // Never delete: a path-normalisation mismatch could make real agent work look unregistered.
+      const aside = `${dir}.stale-${Date.now()}`;
+      renameSync(dir, aside);
+      this.warn(`${dir} is not a registered worktree; moved it to ${aside}`);
     }
     await pruneWorktrees(root);
     if (await branchExists(root, branch)) await addExistingBranchWorktree(root, branch, dir);
@@ -434,7 +442,10 @@ export class TaskRunner extends EventEmitter {
       case 'result': {
         tasks.addUsage(this.db, run.taskId, ev.usage);
         if (run.phase !== 'running') return; // e.g. the interrupt result of our own stop
-        const origin = run.turns.shift() ?? 'user';
+        // One result can answer every queued message (the CLI folds queued input into the running turn), so the
+        // queue is cleared. Any user message in it makes this the user's turn: only Maestro's own turns remind or fail.
+        const origin: TurnOrigin = run.turns.includes('user') ? 'user' : run.turns.length > 0 ? 'maestro' : 'user';
+        run.turns = [];
         if (!ev.ok) { this.failLater(run, ev.subtype || 'error'); return; }
         const handoff = lastHandoff(ev.text ?? '') ?? lastHandoff(run.lastAssistantText);
         if (handoff !== null) { this.complete(run, handoff); return; }
