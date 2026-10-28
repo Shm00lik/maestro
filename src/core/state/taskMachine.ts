@@ -1,6 +1,6 @@
-export type TaskState = 'waiting' | 'ready' | 'running' | 'needs_you' | 'done' | 'failed' | 'cancelled';
+export type TaskState = 'planned' | 'waiting' | 'ready' | 'running' | 'needs_you' | 'done' | 'failed' | 'cancelled';
 export type TaskEvent =
-  | 'deps_met' | 'start' | 'needs_user' | 'answered' | 'complete' | 'fail' | 'cancel' | 'retry';
+  | 'dispatch' | 'deps_met' | 'start' | 'needs_user' | 'answered' | 'complete' | 'fail' | 'cancel' | 'retry';
 
 export class InvalidTransition extends Error {
   constructor(public from: string, public event: string) {
@@ -10,6 +10,7 @@ export class InvalidTransition extends Error {
 }
 
 const TABLE: Record<TaskState, Partial<Record<TaskEvent, TaskState>>> = {
+  planned: { dispatch: 'waiting', cancel: 'cancelled' },
   waiting: { deps_met: 'ready', cancel: 'cancelled' },
   ready: { start: 'running', cancel: 'cancelled' },
   running: { needs_user: 'needs_you', complete: 'done', fail: 'failed', cancel: 'cancelled' },

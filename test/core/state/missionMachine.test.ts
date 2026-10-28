@@ -6,12 +6,12 @@ import {
 import { InvalidTransition } from '../../../src/core/state/taskMachine.js';
 
 const STATES: MissionState[] = [
-  'draft', 'understanding', 'planning', 'awaiting_approval', 'running', 'paused',
+  'draft', 'understanding', 'planning', 'awaiting_approval', 'running',
   'finishing', 'done', 'stopped', 'failed',
 ];
 const EVENTS: MissionEvent[] = [
   'start', 'start_quick', 'understood', 'plan_submitted', 'approve', 'replan',
-  'pause', 'resume', 'all_tasks_done', 'merged', 'stop', 'fail',
+  'finish_requested', 'merged', 'kept', 'stop', 'fail',
 ];
 const TERMINAL: MissionState[] = ['done', 'stopped', 'failed'];
 const NON_TERMINAL = STATES.filter((s) => !TERMINAL.includes(s));
@@ -24,10 +24,9 @@ const TABLE: Array<[MissionState, MissionEvent, MissionState]> = [
   ['awaiting_approval', 'approve', 'running'],
   ['awaiting_approval', 'replan', 'planning'],
   ['running', 'replan', 'planning'],
-  ['running', 'pause', 'paused'],
-  ['paused', 'resume', 'running'],
-  ['running', 'all_tasks_done', 'finishing'],
+  ['running', 'finish_requested', 'finishing'],
   ['finishing', 'merged', 'done'],
+  ['finishing', 'kept', 'done'],
   ...NON_TERMINAL.map((s): [MissionState, MissionEvent, MissionState] => [s, 'stop', 'stopped']),
   ...NON_TERMINAL.map((s): [MissionState, MissionEvent, MissionState] => [s, 'fail', 'failed']),
 ];

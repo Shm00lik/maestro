@@ -4,10 +4,11 @@ import {
   type TaskState, type TaskEvent,
 } from '../../../src/core/state/taskMachine.js';
 
-const STATES: TaskState[] = ['waiting', 'ready', 'running', 'needs_you', 'done', 'failed', 'cancelled'];
-const EVENTS: TaskEvent[] = ['deps_met', 'start', 'needs_user', 'answered', 'complete', 'fail', 'cancel', 'retry'];
+const STATES: TaskState[] = ['planned', 'waiting', 'ready', 'running', 'needs_you', 'done', 'failed', 'cancelled'];
+const EVENTS: TaskEvent[] = ['dispatch', 'deps_met', 'start', 'needs_user', 'answered', 'complete', 'fail', 'cancel', 'retry'];
 
 const TABLE: Array<[TaskState, TaskEvent, TaskState]> = [
+  ['planned', 'dispatch', 'waiting'],
   ['waiting', 'deps_met', 'ready'],
   ['ready', 'start', 'running'],
   ['running', 'needs_user', 'needs_you'],
@@ -16,6 +17,7 @@ const TABLE: Array<[TaskState, TaskEvent, TaskState]> = [
   ['running', 'fail', 'failed'],
   ['needs_you', 'fail', 'failed'],
   ['failed', 'retry', 'waiting'],
+  ['planned', 'cancel', 'cancelled'],
   ['waiting', 'cancel', 'cancelled'],
   ['ready', 'cancel', 'cancelled'],
   ['running', 'cancel', 'cancelled'],
@@ -28,7 +30,7 @@ describe('taskMachine', () => {
   });
 
   it('allows cancel from every non-terminal state', () => {
-    for (const s of ['waiting', 'ready', 'running', 'needs_you'] as TaskState[]) {
+    for (const s of ['planned', 'waiting', 'ready', 'running', 'needs_you'] as TaskState[]) {
       expect(nextTaskState(s, 'cancel')).toBe('cancelled');
     }
   });

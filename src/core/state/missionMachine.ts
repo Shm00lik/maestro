@@ -2,10 +2,11 @@ import { InvalidTransition } from './taskMachine.js';
 
 export type MissionState =
   | 'draft' | 'understanding' | 'planning' | 'awaiting_approval' | 'running'
-  | 'paused' | 'finishing' | 'done' | 'stopped' | 'failed';
+  | 'finishing' | 'done' | 'stopped' | 'failed';
 export type MissionEvent =
   | 'start' | 'start_quick' | 'understood' | 'plan_submitted' | 'approve' | 'replan'
-  | 'pause' | 'resume' | 'all_tasks_done' | 'merged' | 'stop' | 'fail';
+  | 'finish_requested' | 'merged' | 'kept' | 'stop' | 'fail';
+export type MissionOutcome = 'merged' | 'kept';
 
 // "Needs you" is intentionally not a mission state; it is derived from open inbox entries.
 const TABLE: Record<MissionState, Partial<Record<MissionEvent, MissionState>>> = {
@@ -14,10 +15,9 @@ const TABLE: Record<MissionState, Partial<Record<MissionEvent, MissionState>>> =
   planning: { plan_submitted: 'awaiting_approval', stop: 'stopped', fail: 'failed' },
   awaiting_approval: { approve: 'running', replan: 'planning', stop: 'stopped', fail: 'failed' },
   running: {
-    replan: 'planning', pause: 'paused', all_tasks_done: 'finishing', stop: 'stopped', fail: 'failed',
+    replan: 'planning', finish_requested: 'finishing', stop: 'stopped', fail: 'failed',
   },
-  paused: { resume: 'running', stop: 'stopped', fail: 'failed' },
-  finishing: { merged: 'done', stop: 'stopped', fail: 'failed' },
+  finishing: { merged: 'done', kept: 'done', stop: 'stopped', fail: 'failed' },
   done: {},
   stopped: {},
   failed: {},

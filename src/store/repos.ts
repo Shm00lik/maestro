@@ -5,9 +5,9 @@ import type { PlanGraph } from '../core/plan/graph.js';
 import { nextTaskState, type TaskState, type TaskEvent } from '../core/state/taskMachine.js';
 import { nextMissionState, type MissionState, type MissionEvent } from '../core/state/missionMachine.js';
 
-const TASK_STATES: readonly string[] = ['waiting', 'ready', 'running', 'needs_you', 'done', 'failed', 'cancelled'];
+const TASK_STATES: readonly string[] = ['planned', 'waiting', 'ready', 'running', 'needs_you', 'done', 'failed', 'cancelled'];
 const MISSION_STATES: readonly string[] = [
-  'draft', 'understanding', 'planning', 'awaiting_approval', 'running', 'paused', 'finishing', 'done', 'stopped', 'failed',
+  'draft', 'understanding', 'planning', 'awaiting_approval', 'running', 'finishing', 'done', 'stopped', 'failed',
 ];
 
 function checkState<T extends string>(kind: string, known: readonly string[], v: string): T {
