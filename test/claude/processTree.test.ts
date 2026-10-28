@@ -20,7 +20,8 @@ describe('processTree', () => {
       expect(tree[0]).toBe(pid);
       expect(tree.length).toBeGreaterThanOrEqual(2);
       expect(killTree(pid).ok).toBe(true);
-      await sleep(500);
+      // Under a loaded full test run the killed processes can take a moment to leave the process table.
+      for (let i = 0; i < 25 && listTreePids(pid).length > 0; i++) await sleep(200);
       expect(listTreePids(pid)).toEqual([]);
       for (const p of tree) expect(listTreePids(p)).toEqual([]);
       expect(killTree(pid).ok).toBe(true); // already gone counts as ok

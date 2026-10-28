@@ -29,6 +29,9 @@ import type { BridgeHandlers, DispatchInput, TaskSummary } from '../bridge/tools
 import { InboxService } from './inbox.js';
 import { LiveSessionRegistry, TaskRunner, type TaskFinished } from './taskRunner.js';
 import { Throttle } from './throttle.js';
+import {
+  checkStuck, DEFAULT_STUCK_AFTER_MS, defaultIsPidAlive, lastActivity, recoverOnStartup, type RecoveryReport,
+} from './recovery.js';
 
 const execFileP = promisify(execFile);
 
@@ -42,6 +45,15 @@ const PROGRESS_MS = 60_000;
 const CONDUCTOR_LINGER_MS = 120_000;
 export const MERGE = 'Merge';
 export const KEEP = 'Keep branch';
+export const STOP_TASK = 'Stop task';
+export const KEEP_WAITING = 'Keep waiting';
+export const CONDUCTOR_UNRECOVERABLE = 'conductor-unrecoverable';
+export const CONDUCTOR_RESUME_MESSAGE =
+  'Maestro restarted. Any bridge tool call you were waiting on (submit_plan, wait_for_tasks, ask_user, '
+  + 'finish_mission) was interrupted: call it again with the same arguments, then continue the mission.';
+const STUCK_CHECK_MS = 60_000;
+/** How long recovery waits for a resumed session to confirm itself before it moves on. */
+const RECOVERY_CONFIRM_MS = 30_000;
 const SUBAGENT_TOOLS: ReadonlySet<string> = new Set(['Task', 'Agent']);
 const ACTIVE_TASK_STATES: ReadonlySet<string> = new Set(['waiting', 'ready', 'running', 'needs_you']);
 const LIVE_TASK_STATES: ReadonlySet<string> = new Set(['planned', 'waiting', 'ready', 'running', 'needs_you']);
@@ -66,6 +78,12 @@ export interface MissionEngineOptions {
   progressMs?: number;
   /** Test hook: awaited right before the base-branch merge starts. */
   beforeBaseMerge?: () => Promise<void>;
+  /** A running task with no event for this long gets a "seems stuck" question (default 20 min). */
+  stuckAfterMs?: number;
+  /** How often stuck tasks are looked for (default 60 s). */
+  stuckCheckMs?: number;
+  /** recover(): how long to wait for a resumed session to confirm itself (default 30 s). */
+  recoveryConfirmMs?: number;
 }
 
 export type StartMissionInput = Omit<NewMission, 'missionBranch'> & {
@@ -105,8 +123,14 @@ interface MergeWait {
 interface MissionCtx {
   id: string;
   projectRoot: string;
+  missionDir: string;
+  conductorCfg: string;
   runner: TaskRunner;
   conductor: ClaudeSession | null;
+  /** A conductor started with --resume that has not yet confirmed its session (init with that id, or a result). */
+  conductorResume: { sessionId: string; d: Deferred<boolean> } | null;
+  /** Automatic conductor restarts so far (at most one per mission and engine run). */
+  conductorRestarts: number;
   conductorRowId: string | null;
   subagentUses: number;
   planWait: PlanWait | null;
@@ -173,6 +197,13 @@ export class MissionEngine extends EventEmitter implements BridgeHandlers {
   private closed = false;
   private shutdownPromise: Promise<void> | null = null;
   private hooked = new WeakSet<ClaudeSession>();
+  private recovering = false;
+  private recoverPromise: Promise<RecoveryReport> | null = null;
+  private stuckTimer: NodeJS.Timeout | null = null;
+  /** Tasks with an open "seems stuck" entry. */
+  private stuckOpen = new Set<string>();
+  /** Task id to the time before which "Keep waiting" silences it. */
+  private stuckSnoozed = new Map<string, number>();
 
   constructor(private o: MissionEngineOptions) {
     super();
@@ -254,9 +285,42 @@ export class MissionEngine extends EventEmitter implements BridgeHandlers {
   }
 
   private startTick(): void {
-    if (this.tick) return;
-    this.tick = setInterval(() => this.kick(), TICK_MS);
-    this.tick.unref();
+    if (this.closed) return;
+    if (!this.tick) {
+      this.tick = setInterval(() => this.kick(), TICK_MS);
+      this.tick.unref();
+    }
+    if (!this.stuckTimer) {
+      this.stuckTimer = setInterval(() => {
+        try { this.checkStuckTasks(); } catch (e) { this.warn(`stuck check: ${(e as Error).message}`); }
+      }, this.o.stuckCheckMs ?? STUCK_CHECK_MS);
+      this.stuckTimer.unref();
+    }
+  }
+
+  /** The engine context of a mission: its task runner and conductor bridge config. */
+  private createCtx(m: Mission, root: string, bridge: BridgeHttp): MissionCtx {
+    const missionDir = join(this.o.logDir, 'missions', m.id);
+    const conductorCfg = writeBridgeConfig(missionDir, {
+      port: bridge.port, token: bridge.token, missionId: m.id, tools: 'conductor',
+    });
+    const runner = new TaskRunner({
+      db: this.db, inbox: this.inbox, registry: this.registry, projectRoot: root, missionBranch: m.missionBranch,
+      bridgeAskConfig: taskId => writeBridgeConfig(join(this.o.logDir, 'tasks', taskId), {
+        port: bridge.port, token: bridge.token, missionId: m.id, taskId, tools: 'task',
+      }),
+      logDir: join(missionDir, 'tasks'), exe: this.o.exe, command: this.o.command, env: this.o.env,
+      rolesDir: this.o.rolesDir, stopTimeoutMs: this.o.stopTimeoutMs,
+    });
+    const c: MissionCtx = {
+      id: m.id, projectRoot: root, missionDir, conductorCfg, runner, conductor: null, conductorResume: null,
+      conductorRestarts: 0, conductorRowId: null, subagentUses: 0,
+      planWait: null, lastPlan: null, mergeWait: null, stopPromise: null, lingerTimer: null, detached: false,
+    };
+    this.ctxs.set(m.id, c);
+    runner.on('state', () => { this.flushEvents(); this.kick(); });
+    runner.on('finished', (_f: TaskFinished) => { this.flushEvents(); this.kick(); });
+    return c;
   }
 
   async startMission(input: StartMissionInput): Promise<Mission> {
@@ -283,28 +347,10 @@ export class MissionEngine extends EventEmitter implements BridgeHandlers {
       }
       await ensureMissionBranch(root, input.baseBranch, branch);
       const bridge = await this.ensureBridge();
-      const missionDir = join(this.o.logDir, 'missions', m.id);
-      const conductorCfg = writeBridgeConfig(missionDir, {
-        port: bridge.port, token: bridge.token, missionId: m.id, tools: 'conductor',
-      });
-      const runner = new TaskRunner({
-        db: this.db, inbox: this.inbox, registry: this.registry, projectRoot: root, missionBranch: branch,
-        bridgeAskConfig: taskId => writeBridgeConfig(join(this.o.logDir, 'tasks', taskId), {
-          port: bridge.port, token: bridge.token, missionId: m.id, taskId, tools: 'task',
-        }),
-        logDir: join(missionDir, 'tasks'), exe: this.o.exe, command: this.o.command, env: this.o.env,
-        rolesDir: this.o.rolesDir, stopTimeoutMs: this.o.stopTimeoutMs,
-      });
-      const c: MissionCtx = {
-        id: m.id, projectRoot: root, runner, conductor: null, conductorRowId: null, subagentUses: 0,
-        planWait: null, lastPlan: null, mergeWait: null, stopPromise: null, lingerTimer: null, detached: false,
-      };
-      this.ctxs.set(m.id, c);
-      runner.on('state', () => { this.flushEvents(); this.kick(); });
-      runner.on('finished', (_f: TaskFinished) => { this.flushEvents(); this.kick(); });
+      const c = this.createCtx(missions.get(this.db, m.id)!, root, bridge);
 
       m = this.transition(m.id, quick || input.depth === 'quick' ? 'start_quick' : 'start');
-      this.startConductor(c, m, conductorCfg, missionDir);
+      this.startConductor(c, m);
       this.startTick();
       return missions.get(this.db, m.id)!;
     } catch (e) {
@@ -322,17 +368,27 @@ export class MissionEngine extends EventEmitter implements BridgeHandlers {
     }
   }
 
-  /** Spec §7.1. The brief and settings are the first user message. */
-  private startConductor(c: MissionCtx, m: Mission, bridgeCfg: string, missionDir: string): void {
+  /**
+   * Spec §7.1. The brief and settings are the first user message. With `resumeSessionId` (spec §12): the session is
+   * resumed with --resume and told that its pending bridge calls were interrupted; it must confirm the session (an
+   * init with the same id, or a result) before it exits, or the mission fails.
+   */
+  private startConductor(c: MissionCtx, m: Mission, resumeSessionId?: string): void {
+    const missionDir = c.missionDir;
     mkdirSync(missionDir, { recursive: true });
     const args = [
       '--model', 'opus',
-      '--mcp-config', bridgeCfg,
+      '--mcp-config', c.conductorCfg,
       '--append-system-prompt-file', this.o.conductorPromptFile ?? DEFAULT_PROMPT_FILE,
       '--permission-mode', 'default',
       // As in the R1 runs: the bridge's own tools never prompt (every other tool does).
       '--allowedTools', 'mcp__maestro__*',
     ];
+    if (resumeSessionId) {
+      args.push('--resume', resumeSessionId);
+      c.conductorResume = { sessionId: resumeSessionId, d: deferred<boolean>() };
+      c.conductorRestarts++;
+    }
     const logPath = join(missionDir, 'conductor.log');
     const command = this.o.command ?? (this.o.exe ? { exe: this.o.exe, prefixArgs: [] } : undefined);
     const session = ClaudeSession.start({
@@ -344,10 +400,19 @@ export class MissionEngine extends EventEmitter implements BridgeHandlers {
       try { this.onConductorEvent(c, ev); } catch (e) { this.warn(`conductor event ${ev.kind}: ${(e as Error).message}`); }
     });
     session.on('exit', (info: { code: number | null }) => this.onConductorExit(c, info.code));
-    const row = sessions.start(this.db, { missionId: m.id, taskId: null, role: 'conductor', pid: session.pid, logPath });
+    const row = sessions.start(this.db, {
+      missionId: m.id, taskId: null, role: 'conductor', claudeSessionId: resumeSessionId ?? null, pid: session.pid, logPath,
+    });
     c.conductorRowId = row.id;
     this.registry.set(row.id, session);
-    session.send(this.missionBrief(m));
+    session.send(resumeSessionId ? CONDUCTOR_RESUME_MESSAGE : this.missionBrief(m));
+  }
+
+  private confirmConductor(c: MissionCtx, ok: boolean): void {
+    const r = c.conductorResume;
+    if (!r) return;
+    c.conductorResume = null;
+    r.d.resolve(ok);
   }
 
   private missionBrief(m: Mission): string {
@@ -366,6 +431,7 @@ export class MissionEngine extends EventEmitter implements BridgeHandlers {
     if (this.closed) return; // shutting down: the conductor writes nothing more
     switch (ev.kind) {
       case 'init':
+        if (c.conductorResume && ev.sessionId === c.conductorResume.sessionId) this.confirmConductor(c, true);
         if (ev.sessionId) {
           missions.setConductorSession(this.db, c.id, ev.sessionId);
           if (c.conductorRowId) sessions.setClaudeSessionId(this.db, c.conductorRowId, ev.sessionId);
@@ -385,6 +451,7 @@ export class MissionEngine extends EventEmitter implements BridgeHandlers {
         this.inbox.onPermissionCancel(ev.requestId);
         return;
       case 'result':
+        this.confirmConductor(c, true);
         if (c.lingerTimer) this.closeConductor(c); // the mission ended; this was the conductor's last turn
         return;
       default:
@@ -393,7 +460,9 @@ export class MissionEngine extends EventEmitter implements BridgeHandlers {
   }
 
   private onConductorExit(c: MissionCtx, code: number | null): void {
-    if (c.detached) return; // shutdown() ended the row itself and changes nothing else
+    if (c.detached || this.closed) return; // shutdown() ends the row itself and changes nothing else
+    const unconfirmed = c.conductorResume !== null;
+    this.confirmConductor(c, false);
     if (c.conductorRowId) {
       this.registry.delete(c.conductorRowId);
       try { sessions.end(this.db, c.conductorRowId, code === 0 ? 'ended' : 'failed'); } catch { /* already ended */ }
@@ -401,8 +470,13 @@ export class MissionEngine extends EventEmitter implements BridgeHandlers {
     if (c.lingerTimer) { clearTimeout(c.lingerTimer); c.lingerTimer = null; }
     const m = missions.get(this.db, c.id);
     if (!m || TERMINAL_MISSION_STATES.has(m.state) || c.stopPromise) return;
-    // Spec §12 restart-with-resume belongs to recovery (a later task); record it so it is visible.
-    this.appendEvent(c.id, 'conductor-exited', { code });
+    this.appendEvent(c.id, 'conductor-exited', { code, resumed: c.conductorRestarts > 0 });
+    // Spec §12: restart with --resume once; a resume that never confirmed its session, or a second exit, fails it.
+    if (!unconfirmed && c.conductorRestarts === 0 && m.conductorSessionId) {
+      this.startConductor(c, m, m.conductorSessionId);
+      return;
+    }
+    void this.failMission(c, CONDUCTOR_UNRECOVERABLE);
   }
 
   private closeConductor(c: MissionCtx): void {
@@ -604,7 +678,7 @@ export class MissionEngine extends EventEmitter implements BridgeHandlers {
 
   /** Runs a scheduling pass now (or right after the current one) and re-checks the waiters. */
   private kick(): void {
-    if (this.closed) return;
+    if (this.closed || this.recovering) return;
     if (this.scheduling) { this.scheduleAgain = true; return; }
     this.scheduling = true;
     try {
@@ -876,18 +950,182 @@ export class MissionEngine extends EventEmitter implements BridgeHandlers {
     this.kick();
   }
 
+  // ---- recovery (spec §12) -------------------------------------------------------
+
+  /**
+   * Startup order: construct the engine (no timers run yet), then call recover() once, before anything else:
+   *   1. recoverOnStartup ends stale live session rows, rebuilds each unfinished mission's context and in-memory
+   *      waits, resumes conductors (--resume, once), then resumes or re-queues their running tasks;
+   *   2. only then does scheduling start (the 1 s tick and a first pass) and the 60 s stuck check.
+   * The scheduler stays off while recovery runs, so a re-queued or waiting task cannot start before its mission
+   * is fully recovered. Idempotent: a second call returns the first call's report.
+   */
+  recover(isPidAlive: (pid: number) => boolean = defaultIsPidAlive): Promise<RecoveryReport> {
+    if (!this.recoverPromise) {
+      this.assertOpen();
+      this.recovering = true;
+      this.recoverPromise = recoverOnStartup(this, this.db, isPidAlive).finally(() => {
+        this.recovering = false;
+        if (this.closed) return;
+        if (this.ctxs.size > 0) this.startTick();
+        this.kick();
+      });
+    }
+    return this.recoverPromise;
+  }
+
+  private confirmWait(p: Promise<boolean>): Promise<boolean> {
+    const ms = this.o.recoveryConfirmMs ?? RECOVERY_CONFIRM_MS;
+    return new Promise<boolean>(res => {
+      const t = setTimeout(() => res(true), ms); // still starting: treat as resumed; an exit fails it later
+      t.unref();
+      p.then(ok => { clearTimeout(t); res(ok); }, () => { clearTimeout(t); res(false); });
+    });
+  }
+
+  /**
+   * Recovery: rebuilds the context of a mission that has not ended. Open plan_approval (awaiting_approval) and
+   * merge_decision (finishing) entries get their in-memory waits back, so approvePlan / replan /
+   * answerMergeDecision work and the resumed conductor's re-call re-attaches. The conductor's old questions and
+   * permission requests expire: the resumed conductor asks again, and a dead process can take no answer.
+   */
+  async attachForRecovery(missionId: string): Promise<void> {
+    this.assertOpen();
+    if (this.ctxs.has(missionId)) return;
+    const m = this.mission(missionId);
+    const project = projects.list(this.db).find(p => p.id === m.projectId);
+    if (!project) throw new Error(`Unknown project: ${m.projectId}`);
+    const bridge = await this.ensureBridge();
+    const c = this.createCtx(m, project.path, bridge);
+
+    const open = inboxRepo.listOpenForMission(this.db, missionId).filter(e => e.taskId === null);
+    const latest = (kind: InboxEntry['kind']): InboxEntry | undefined => open.filter(e => e.kind === kind).at(-1);
+    const expire = (e: InboxEntry): void => { inboxRepo.expire(this.db, e.id); };
+
+    const plan = latest('plan_approval');
+    for (const e of open) if (e.kind === 'plan_approval' && (e !== plan || m.state !== 'awaiting_approval')) expire(e);
+    if (plan && m.state === 'awaiting_approval') {
+      const p = plan.payload as { planVersionId: string; planPath: string };
+      const pv = this.db.prepare('SELECT plan_path, plan_md FROM plan_versions WHERE id = ?').get(p.planVersionId) as
+        { plan_path: string; plan_md: string } | undefined;
+      if (pv) {
+        c.planWait = {
+          planPath: p.planPath ?? pv.plan_path, hash: sha256(pv.plan_md), versionId: p.planVersionId, entryId: plan.id,
+          d: deferred<PlanResult>(),
+        };
+      } else expire(plan);
+    }
+    if (m.state === 'running') {
+      const pv = this.db.prepare(`SELECT plan_path, plan_md FROM plan_versions WHERE mission_id = ? AND approved_at IS NOT NULL
+        ORDER BY version DESC LIMIT 1`).get(missionId) as { plan_path: string; plan_md: string } | undefined;
+      if (pv) c.lastPlan = { planPath: pv.plan_path, hash: sha256(pv.plan_md), result: { approved: true } };
+    }
+
+    const merge = latest('merge_decision');
+    for (const e of open) if (e.kind === 'merge_decision' && (e !== merge || m.state !== 'finishing')) expire(e);
+    if (merge && m.state === 'finishing') {
+      const summary = (merge.payload as { summary?: string }).summary ?? '';
+      c.mergeWait = { entryId: merge.id, summary, merging: null, d: deferred<'merge' | 'keep'>() };
+    }
+
+    for (const e of open) if (e.kind === 'question' || e.kind === 'permission') expire(e);
+    this.emit('inbox');
+    this.flushEvents();
+  }
+
+  /** Recovery: --resume the conductor once; false (and the mission failed) when it exits before confirming. */
+  async resumeConductor(missionId: string, sessionId: string): Promise<boolean> {
+    this.assertOpen();
+    const c = this.ctx(missionId);
+    this.startConductor(c, this.mission(missionId), sessionId);
+    const ok = await this.confirmWait(c.conductorResume!.d.promise);
+    if (!ok && c.stopPromise) await c.stopPromise.catch(() => undefined);
+    return ok;
+  }
+
+  /** Recovery: a mission whose conductor never got a session id did no conductor work: start it afresh. */
+  startConductorForRecovery(missionId: string): void {
+    this.assertOpen();
+    const c = this.ctx(missionId);
+    if (c.conductor && c.conductor.status !== 'exited') return;
+    this.startConductor(c, this.mission(missionId));
+  }
+
+  /** Recovery: a running task with no Claude session goes back to ready (the scheduler starts it). */
+  requeueTask(taskId: string): void {
+    this.assertOpen();
+    const t = tasks.get(this.db, taskId);
+    if (!t) throw new Error(`Unknown task: ${taskId}`);
+    this.ctx(t.missionId).runner.requeueAfterCrash(taskId);
+    this.flushEvents();
+  }
+
+  /** Recovery: resumeAfterCrash; false when the resume failed (the task is then failed 'unrecoverable'). */
+  async resumeTask(taskId: string): Promise<boolean> {
+    this.assertOpen();
+    const t = tasks.get(this.db, taskId);
+    if (!t) throw new Error(`Unknown task: ${taskId}`);
+    const runner = this.ctx(t.missionId).runner;
+    await runner.resumeAfterCrash(taskId);
+    const ok = await this.confirmWait(runner.whenResumed(taskId));
+    this.flushEvents();
+    return ok;
+  }
+
+  /**
+   * Spec §12: one "<KEY> seems stuck" question per running task with no event for stuckAfterMs, with the options
+   * Stop task (stops the task) and Keep waiting (no new entry for that task until another stuckAfterMs passes).
+   * Never duplicates an open stuck entry. Runs every 60 s; public so tests can pass `now`.
+   */
+  checkStuckTasks(now: number = Date.now()): void {
+    if (this.closed || this.recovering) return;
+    const after = this.o.stuckAfterMs ?? DEFAULT_STUCK_AFTER_MS;
+    for (const id of checkStuck(this.db, now, after)) {
+      if (this.stuckOpen.has(id)) continue;
+      if ((this.stuckSnoozed.get(id) ?? 0) > now) continue;
+      const t = tasks.get(this.db, id);
+      const c = t && this.ctxs.get(t.missionId);
+      if (!t || !c || c.stopPromise) continue;
+      const minutes = Math.max(1, Math.round((now - lastActivity(this.db, id)) / 60_000));
+      const question = `${t.taskKey} seems stuck — no activity for ${minutes} minutes`;
+      this.stuckOpen.add(id);
+      const asked = this.inbox.ask(t.missionId, id, question, [STOP_TASK, KEEP_WAITING]);
+      asked.then(answer => {
+        this.stuckOpen.delete(id);
+        if (this.closed) return;
+        if (answer === STOP_TASK) {
+          c.runner.stop(id).catch(e => this.warn(`stop ${t.taskKey}: ${(e as Error).message}`));
+        } else {
+          this.stuckSnoozed.set(id, Date.now() + after);
+        }
+      }, () => { this.stuckOpen.delete(id); }); // expired (the task ended or was resumed) or shutdown
+    }
+  }
+
   // ---- stop / shutdown ---------------------------------------------------------
 
   /** Stops every task run and the conductor, expires open entries, mission `stop`. Idempotent. */
   stop(missionId: string): Promise<void> {
     const c = this.ctxs.get(missionId);
     if (!c) return Promise.reject(new Error(`Unknown mission: ${missionId}`));
+    if (!c.stopPromise && this.closed) return Promise.reject(new Error(SHUTTING_DOWN)); // shutdown writes no states
     // Set before runStop starts, so every handler sees the stop at once.
     if (!c.stopPromise) c.stopPromise = Promise.resolve().then(() => this.runStop(c));
     return c.stopPromise;
   }
 
-  private async runStop(c: MissionCtx): Promise<void> {
+  /**
+   * Like stop(), but the mission ends `failed` and a 'mission-failed' event records why. Tasks keep their worktrees
+   * and branches; live task runs are stopped (cancelled) so nothing stays half-alive.
+   */
+  private failMission(c: MissionCtx, reason: string): Promise<void> {
+    if (c.stopPromise) return c.stopPromise;
+    if (this.closed) return Promise.resolve();
+    c.stopPromise = Promise.resolve().then(() => this.runStop(c, 'fail', reason));
+    return c.stopPromise;
+  }
+
+  private async runStop(c: MissionCtx, ev: 'stop' | 'fail' = 'stop', reason?: string): Promise<void> {
     // A base merge in flight finishes first: the mission then ends merged, or stops with the base untouched.
     const merging = c.mergeWait?.merging;
     if (merging) await merging.catch(() => undefined);
@@ -912,13 +1150,17 @@ export class MissionEngine extends EventEmitter implements BridgeHandlers {
     this.inbox.expireForMission(c.id);
     for (const t of list) this.inbox.expireForTask(t.id);
     const m = missions.get(this.db, c.id);
-    if (m && !TERMINAL_MISSION_STATES.has(m.state)) this.transition(c.id, 'stop');
+    if (m && !TERMINAL_MISSION_STATES.has(m.state)) {
+      this.transition(c.id, ev);
+      if (ev === 'fail') this.appendEvent(c.id, 'mission-failed', { reason });
+    }
     for (const w of [...this.waiters]) w.check();
     this.flushEvents();
   }
 
   /** Stops every mission that has not ended (e.g. for tests). Unlike shutdown(), this changes states. */
   async stopAll(): Promise<void> {
+    this.assertOpen();
     await Promise.all([...this.ctxs.values()].map(async c => {
       const m = missions.get(this.db, c.id);
       if (m && !TERMINAL_MISSION_STATES.has(m.state)) await this.stop(c.id).catch(() => undefined);
@@ -939,6 +1181,8 @@ export class MissionEngine extends EventEmitter implements BridgeHandlers {
   private async runShutdown(): Promise<void> {
     this.closed = true;
     if (this.tick) { clearInterval(this.tick); this.tick = null; }
+    if (this.stuckTimer) { clearInterval(this.stuckTimer); this.stuckTimer = null; }
+    if (this.recoverPromise) await bounded(this.recoverPromise, SHUTDOWN_WAIT_MS);
     const all = [...this.ctxs.values()];
     // In-flight work that writes the database settles first (a merge bails out at its next check unless git is
     // already merging; a stop finishes its transitions).

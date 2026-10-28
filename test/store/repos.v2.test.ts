@@ -51,7 +51,7 @@ describe('migration 2', () => {
 
       const db = openDb(file);
       try {
-        expect(db.pragma('user_version', { simple: true })).toBe(2);
+        expect(db.pragma('user_version', { simple: true })).toBe(MIGRATIONS.length); // 2, then any later migrations
         expect(db.pragma('foreign_keys', { simple: true })).toBe(1);
         expect(db.pragma('foreign_key_check')).toEqual([]);
         expect(projects.list(db).map(p => p.path)).toEqual(['C:\\Demo\\']);

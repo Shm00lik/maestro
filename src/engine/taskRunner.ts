@@ -30,6 +30,10 @@ const CLOSE_WAIT_MS = 10_000;
 const DETACHED = '\u0000detached';
 const CRASH_LOG_LINES = 50;
 const CRASH_LOG_MAX = 4096;
+/** A task's stream activity is recorded as an 'activity' event at most this often (stuck detection reads it). */
+const ACTIVITY_EVERY_MS = 60_000;
+/** failureReason of a task whose `--resume` process could not continue its session. */
+export const UNRECOVERABLE = 'unrecoverable';
 
 export type RoleModel = 'opus' | 'sonnet' | 'haiku';
 export interface RoleConfig {
@@ -60,6 +64,8 @@ export interface TaskRunnerDeps {
   /** Directory with the role files; defaults to `<maestro>/agents`. */
   rolesDir?: string;
   stopTimeoutMs?: number;
+  /** Minimum gap between 'activity' events of one task (default 60 s). */
+  activityEveryMs?: number;
 }
 
 export interface TaskFinished { taskId: string; outcome: 'done' | 'failed' | 'cancelled'; reason?: string }
@@ -173,6 +179,11 @@ interface Run {
   finishing: Promise<void> | null;
   /** Settles when failing (incl. stopping the process) is over. Never rejects. */
   failing: Promise<void> | null;
+  /** resumeAfterCrash: the session id being resumed, until an init with that id or a result confirms it. */
+  resumeId: string | null;
+  /** Settles true when the resume is confirmed, false when the run ends first. */
+  resumeConfirm: { promise: Promise<boolean>; resolve(ok: boolean): void } | null;
+  lastActivityAt: number;
 }
 
 export class TaskRunner extends EventEmitter {
@@ -216,6 +227,7 @@ export class TaskRunner extends EventEmitter {
       taskId: task.id, missionId: task.missionId, role: null, phase: 'starting', session: null, rowId: null,
       rowEnded: false, logPath: null, reminded: false, turns: [], lastAssistantText: '', lastError: null,
       finished: false, detached: false, stopRequested: false, ready: Promise.resolve(), stopPromise: null, finishing: null, failing: null,
+      resumeId: null, resumeConfirm: null, lastActivityAt: 0,
     };
     this.runs.set(task.id, run);
     return run;
@@ -259,6 +271,10 @@ export class TaskRunner extends EventEmitter {
     let task = this.task(taskId);
     if (task.state !== 'running' && task.state !== 'needs_you') throw new Error(`Task ${task.taskKey} is ${task.state}, not running`);
     const run = this.newRun(task);
+    let confirm!: (ok: boolean) => void;
+    const confirmed = new Promise<boolean>(r => { confirm = r; });
+    run.resumeConfirm = { promise: confirmed, resolve: confirm };
+    run.resumeId = task.sessionId;
     const release = this.holdReady(run);
     try {
       // The old process is gone: its permission requests can never be answered.
@@ -267,7 +283,7 @@ export class TaskRunner extends EventEmitter {
       task = this.task(taskId);
       if (task.state === 'needs_you') task = this.transition(taskId, 'answered');
       if (!task.sessionId || !task.worktreePath || !existsSync(task.worktreePath)) {
-        await this.fail(run, 'crashed: no session or worktree to resume');
+        await this.failUnrecoverable(run, 'no session or worktree to resume');
         return;
       }
       let role: RoleConfig;
@@ -278,11 +294,50 @@ export class TaskRunner extends EventEmitter {
       this.spawn(run, role, task.worktreePath, task.sessionId);
       this.sendOwn(run, RESUME_MESSAGE);
     } catch (e) {
-      if (run.phase === 'starting' || run.phase === 'running') await this.fail(run, `resume: ${(e as Error).message}`);
+      if (run.phase === 'starting' || run.phase === 'running') await this.failUnrecoverable(run, `resume: ${(e as Error).message}`);
       else this.warn(`resume ${task.taskKey}: ${(e as Error).message}`);
     } finally {
       release();
     }
+  }
+
+  /**
+   * After resumeAfterCrash: true once the resumed process confirmed the session (an init with the same session id,
+   * or a result), false when the run ended first (it then failed with reason 'unrecoverable', or was stopped).
+   */
+  whenResumed(taskId: string): Promise<boolean> {
+    return this.runs.get(taskId)?.resumeConfirm?.promise ?? Promise.resolve(false);
+  }
+
+  /**
+   * Recovery only: the task was running but never got a Claude session (the app stopped while its worktree was being
+   * prepared). Ends its stale rows, expires its entries and puts it back to ready, so the scheduler starts it
+   * through the normal start path. No Claude work is lost: there was none.
+   */
+  requeueAfterCrash(taskId: string): Task {
+    const run = this.runs.get(taskId);
+    if (run && run.phase !== 'ended') throw new Error(`Task ${taskId} is already running`);
+    this.endLiveRows(taskId, 'ended');
+    this.deps.inbox.expireForTask(taskId);
+    const t = tasks.requeue(this.db, taskId);
+    this.emit('state', t);
+    return t;
+  }
+
+  private settleResume(run: Run, ok: boolean): void {
+    if (!run.resumeConfirm) return;
+    const c = run.resumeConfirm;
+    run.resumeConfirm = null;
+    run.resumeId = null;
+    c.resolve(ok);
+  }
+
+  /** A resume that never confirmed its session: reason 'unrecoverable', the detail in a 'resume-failed' event. */
+  private failUnrecoverable(run: Run, detail: string): Promise<void> {
+    this.safe('resume-failed event', () => events.append(this.db, {
+      missionId: run.missionId, taskId: run.taskId, type: 'resume-failed', data: { detail },
+    }));
+    return this.fail(run, UNRECOVERABLE);
   }
 
   /** Sends a user message to the task's live session. Its turn never triggers a handoff reminder. */
@@ -341,6 +396,7 @@ export class TaskRunner extends EventEmitter {
     if (run.phase === 'ended') return;
     run.phase = 'ended';
     run.finished = true;
+    this.settleResume(run, false);
     const s = run.session;
     if (s && s.status !== 'exited') {
       try { await s.kill(); } catch (e) { this.warn(`detach kill: ${(e as Error).message}`); }
@@ -375,6 +431,7 @@ export class TaskRunner extends EventEmitter {
       }
     } finally {
       run.phase = 'ended';
+      this.settleResume(run, false);
       if (cancelled) this.finish(run, { taskId: run.taskId, outcome: 'cancelled' });
     }
   }
@@ -455,8 +512,14 @@ export class TaskRunner extends EventEmitter {
   }
 
   private handleEvent(run: Run, ev: StreamEvent): void {
+    const now = Date.now();
+    if (run.phase === 'running' && now - run.lastActivityAt >= (this.deps.activityEveryMs ?? ACTIVITY_EVERY_MS)) {
+      run.lastActivityAt = now;
+      events.append(this.db, { missionId: run.missionId, taskId: run.taskId, type: 'activity', data: { kind: ev.kind } });
+    }
     switch (ev.kind) {
       case 'init': {
+        if (run.resumeId && ev.sessionId === run.resumeId) this.settleResume(run, true);
         if (ev.sessionId) {
           tasks.setRuntime(this.db, run.taskId, { sessionId: ev.sessionId });
           if (run.rowId) sessions.setClaudeSessionId(this.db, run.rowId, ev.sessionId);
@@ -475,6 +538,7 @@ export class TaskRunner extends EventEmitter {
         this.deps.inbox.onPermissionCancel(ev.requestId);
         return;
       case 'result': {
+        this.settleResume(run, true);
         tasks.addUsage(this.db, run.taskId, ev.usage);
         if (run.phase !== 'running') return; // e.g. the interrupt result of our own stop
         // One result can answer every queued message (the CLI folds queued input into the running turn), so the
@@ -504,6 +568,10 @@ export class TaskRunner extends EventEmitter {
     const tail = this.logTail(run);
     let reason = `crashed (exit code ${code ?? 'none'}${run.lastError ? `, ${run.lastError}` : ''})`;
     if (tail) reason += `\n${tail}`;
+    if (run.resumeId) { // the --resume process ended before it confirmed the session
+      this.failUnrecoverable(run, reason).catch(e => this.warn(`fail: ${(e as Error)?.message ?? e}`));
+      return;
+    }
     this.failLater(run, reason);
   }
 
@@ -534,6 +602,7 @@ export class TaskRunner extends EventEmitter {
 
   /** Emits 'finished' at most once per run; a throwing listener is logged, never propagated. */
   private finish(run: Run, f: TaskFinished): void {
+    this.settleResume(run, false);
     if (run.finished) return;
     run.finished = true;
     try { this.emit('finished', f); } catch (e) { this.warn(`finished listener: ${(e as Error)?.message ?? e}`); }
@@ -584,6 +653,7 @@ export class TaskRunner extends EventEmitter {
             this.safe('end session row', () => this.endSessionRow(run, 'ended'));
             run.phase = 'ended';
             run.finished = true;
+            this.settleResume(run, false);
             return;
           }
           f = reason === null ? { taskId: run.taskId, outcome: 'done' } : { taskId: run.taskId, outcome: 'failed', reason };

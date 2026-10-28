@@ -130,9 +130,13 @@ CREATE TABLE usage_window (
 );
 `;
 
+/** Migration 3 (Plan 2 recovery): stuck detection reads each running task's latest event. */
+const MIGRATION_3 = `CREATE INDEX IF NOT EXISTS idx_events_task ON events(task_id, ts);`;
+
 export const MIGRATIONS: readonly string[] = [
   readFileSync(new URL('./schema.sql', import.meta.url), 'utf8'), // 1: baseline
   MIGRATION_2, // 2: Plan 2 engine
+  MIGRATION_3, // 3: events by task
 ];
 
 /** Pre-flight for migration 2: fail with a readable message instead of a raw UNIQUE error. */

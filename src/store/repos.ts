@@ -338,6 +338,23 @@ export const tasks = {
       return getTask(db, id);
     })();
   },
+  /**
+   * Recovery only: a task left running/needs_you with no Claude session (caught before its session started) goes
+   * back to ready, outside the state machine, so the scheduler starts it through the normal path. Recorded as a
+   * 'state' event with event 'recover'.
+   */
+  requeue(db: Db, id: string): Task {
+    return db.transaction(() => {
+      const r = db.prepare('SELECT * FROM tasks WHERE id = ?').get(id) as Row | undefined;
+      if (!r) throw new Error(`Task not found: ${id}`);
+      const from = checkState<TaskState>('task', TASK_STATES, r.state);
+      if (from !== 'running' && from !== 'needs_you') throw new Error(`Task ${id} is ${from}; only running tasks can be requeued`);
+      if (r.session_id) throw new Error(`Task ${id} has a Claude session; resume it instead`);
+      db.prepare("UPDATE tasks SET state = 'ready' WHERE id = ?").run(id);
+      appendEvent(db, { missionId: r.mission_id, taskId: id, type: 'state', data: { from, to: 'ready', event: 'recover' } });
+      return getTask(db, id);
+    })();
+  },
   listByMission(db: Db, missionId: string): Task[] {
     return (db.prepare('SELECT * FROM tasks WHERE mission_id = ? ORDER BY rowid').all(missionId) as Row[]).map(toTask);
   },
@@ -416,6 +433,11 @@ export const inbox = {
       db.prepare("UPDATE inbox SET state = 'expired' WHERE id = ?").run(r.id);
       return toInbox({ ...r, state: 'expired' });
     })();
+  },
+  /** Every open entry of a mission (snoozed or not), oldest first. */
+  listOpenForMission(db: Db, missionId: string): InboxEntry[] {
+    return (db.prepare("SELECT * FROM inbox WHERE mission_id = ? AND state = 'open' ORDER BY created_at, rowid")
+      .all(missionId) as Row[]).map(toInbox);
   },
   openCountForTask(db: Db, taskId: string): number {
     return (db.prepare("SELECT COUNT(*) AS n FROM inbox WHERE task_id = ? AND state = 'open'").get(taskId) as Row).n;
