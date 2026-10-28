@@ -25,6 +25,12 @@ describe('validatePlan', () => {
     expect(validatePlan([]).map(e => e.code)).toEqual(['empty-plan']);
     expect(codes(plan('### Task 1: A\nAgent: qa\nAcceptance: x\n### Task 1: B\nAgent: qa\nAcceptance: y\n'))).toContain('duplicate-key');
   });
+  it('treats keys that differ only by case as duplicates', () => {
+    const t = (key: string) => ({ key, title: key, body: '', dependsOn: [], agent: 'qa', owns: [`${key}/**`], acceptance: 'x', estimate: 1 });
+    const errs = validatePlan([t('T1'), t('t1')]).filter(e => e.code === 'duplicate-key');
+    expect(errs).toHaveLength(1);
+    expect(errs[0].message).toMatch(/T1/i);
+  });
   it('reports unknown and self dependencies', () => {
     const u = validatePlan(plan(task(1, { deps: 'T9' }))).find(e => e.code === 'unknown-dependency')!;
     expect(u.taskKeys).toEqual(['T1']);

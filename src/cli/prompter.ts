@@ -207,13 +207,15 @@ export class Prompter {
     const p = e.payload as {
       version?: number; planPath?: string; taskKeys?: string[]; waves?: string[][]; criticalPath?: string[];
       cancelled?: string[]; runningUnplanned?: string[];
+      tasks?: { key: string; title: string; agent: string; dependsOn: string[]; owns: string[] }[];
     };
     const keys = p.taskKeys ?? [];
     const waves = p.waves ?? [];
     this.o.out(`[plan] ${keys.length} tasks in ${waves.length} waves`);
     this.o.out(`#${n} Plan approval (version ${p.version ?? '?'})${p.planPath ? `: ${p.planPath}` : ''}`);
     for (const k of keys) {
-      const t = tasks.getByKey(this.o.db, e.missionId, k);
+      // The plan is applied only on approval: its tasks come from the entry, not from the tasks table.
+      const t = p.tasks?.find(x => x.key === k) ?? tasks.getByKey(this.o.db, e.missionId, k);
       const deps = t && t.dependsOn.length > 0 ? t.dependsOn.join(', ') : 'none';
       const owns = t && t.owns.length > 0 ? t.owns.join(', ') : '-';
       this.o.out(`   ${k}  ${t?.title ?? ''}  [${t?.agent ?? '?'}]  depends on: ${deps}  owns: ${owns}`);

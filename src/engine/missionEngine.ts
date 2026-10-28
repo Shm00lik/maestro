@@ -15,7 +15,7 @@ import {
 } from '../store/repos.js';
 import { parsePlan } from '../core/plan/parsePlan.js';
 import { validatePlan, type PlanError } from '../core/plan/validatePlan.js';
-import { buildGraph } from '../core/plan/graph.js';
+import { buildGraph, type PlanGraph } from '../core/plan/graph.js';
 import { DEFAULT_GLOBAL_PARALLEL, pickTasksToStart, type ReadyTask } from '../core/scheduler/scheduler.js';
 import { TERMINAL_MISSION_STATES, type MissionEvent } from '../core/state/missionMachine.js';
 import type { PlanTask } from '../core/types.js';
@@ -113,7 +113,38 @@ function deferred<T>(): Deferred<T> {
   return { promise, resolve, reject };
 }
 
-interface PlanWait { planPath: string; hash: string; versionId: string; entryId: string; d: Deferred<PlanResult> }
+/** A validated plan waiting for the user. Nothing of it is in the database (besides its entry) until approvePlan. */
+interface PlanWait {
+  planPath: string; hash: string; md: string; planTasks: PlanTask[]; graph: PlanGraph; entryId: string; d: Deferred<PlanResult>;
+}
+
+/**
+ * Plan keys that cannot be (re)planned: an ad-hoc task's key, a cancelled task's key, or an existing key that differs
+ * only by case (keys name worktree folders, and Windows ignores case).
+ */
+function planConflicts(existing: Task[], planTasks: PlanTask[]): string[] {
+  const exact = new Map(existing.map(t => [t.taskKey, t]));
+  const lower = new Map(existing.map(t => [t.taskKey.toLowerCase(), t]));
+  return planTasks.filter(t => {
+    const cur = exact.get(t.key);
+    if (cur) return cur.planVersionId === null || cur.state === 'cancelled';
+    return lower.has(t.key.toLowerCase());
+  }).map(t => t.key);
+}
+
+const conflictErrors = (keys: string[]): { errors: PlanError[] } => ({
+  errors: keys.map(k => ({ code: 'duplicate-key' as const, taskKeys: [k], message: `${k} conflicts with an existing task; rename it` })),
+});
+
+/** What applying the plan would do to planned tasks it drops (shown with the approval; applied on approval). */
+function replanPreview(existing: Task[], planTasks: PlanTask[]): { cancelled: string[]; runningUnplanned: string[] } {
+  const keys = new Set(planTasks.map(t => t.key));
+  const dropped = existing.filter(t => t.planVersionId !== null && !keys.has(t.taskKey));
+  return {
+    cancelled: dropped.filter(t => t.state === 'planned' || t.state === 'waiting' || t.state === 'ready').map(t => t.taskKey),
+    runningUnplanned: dropped.filter(t => t.state === 'running' || t.state === 'needs_you').map(t => t.taskKey),
+  };
+}
 interface MergeWait {
   entryId: string; summary: string; d: Deferred<'merge' | 'keep'>;
   /** The base merge in flight (stop() waits for it). */
@@ -547,38 +578,13 @@ export class MissionEngine extends EventEmitter implements BridgeHandlers {
     const errors = validatePlan(planTasks);
     if (errors.length > 0) return { errors };
 
-    const conflictErrors = (keys: string[]): { errors: PlanError[] } => ({
-      errors: keys.map(k => ({ code: 'duplicate-key' as const, taskKeys: [k], message: `${k} conflicts with an existing task; rename it` })),
-    });
+    // Conflicts are found now (pre-check); nothing is written until the user approves (approvePlan applies it).
     const existing = tasks.listByMission(this.db, missionId);
-    const byKey = new Map(existing.map(t => [t.taskKey, t]));
-    const conflicts = planTasks.filter(t => {
-      const cur = byKey.get(t.key);
-      return cur !== undefined && (cur.planVersionId === null || cur.state === 'cancelled');
-    }).map(t => t.key);
+    const conflicts = planConflicts(existing, planTasks);
     if (conflicts.length > 0) return conflictErrors(conflicts);
-
-    // Plan version and tasks in one transaction: a conflict rolls both back, so no orphan version remains.
     const graph = buildGraph(planTasks);
-    class Conflict extends Error { constructor(public keys: string[]) { super('conflict'); } }
-    let applied: { pvId: string; version: number; cancelled: string[]; runningUnplanned: string[] };
-    try {
-      applied = this.db.transaction(() => {
-        const max = (this.db.prepare('SELECT COALESCE(MAX(version), 0) AS v FROM plan_versions WHERE mission_id = ?')
-          .get(missionId) as { v: number }).v;
-        const pv = planVersions.create(this.db, { missionId, version: max + 1, planPath: abs, planMd: md });
-        if (max === 0 && existing.length === 0) {
-          tasks.insertPlan(this.db, missionId, pv.id, planTasks, graph);
-          return { pvId: pv.id, version: max + 1, cancelled: [], runningUnplanned: [] };
-        }
-        const r = tasks.applyReplan(this.db, missionId, pv.id, planTasks, graph);
-        if (r.conflicts.length > 0) throw new Conflict(r.conflicts);
-        return { pvId: pv.id, version: max + 1, cancelled: r.cancelled, runningUnplanned: r.runningUnplanned };
-      })();
-    } catch (e) {
-      if (e instanceof Conflict) return conflictErrors(e.keys);
-      throw e;
-    }
+    const preview = replanPreview(existing, planTasks);
+    const version = this.nextPlanVersion(missionId);
 
     // A different plan (or the same file with new content) while one is pending supersedes it.
     if (c.planWait) {
@@ -595,24 +601,54 @@ export class MissionEngine extends EventEmitter implements BridgeHandlers {
     this.flushEvents();
 
     const entry = this.addEntry(missionId, 'plan_approval', {
-      planVersionId: applied.pvId, version: applied.version, planPath: abs, taskKeys: planTasks.map(t => t.key),
+      version, planPath: abs, planMd: md, taskKeys: planTasks.map(t => t.key),
+      tasks: planTasks.map(t => ({ key: t.key, title: t.title, agent: t.agent, dependsOn: t.dependsOn, owns: t.owns })),
       waves: graph.waves, criticalPath: graph.criticalPath,
-      cancelled: applied.cancelled, runningUnplanned: applied.runningUnplanned,
+      cancelled: preview.cancelled, runningUnplanned: preview.runningUnplanned,
     });
     const d = deferred<PlanResult>();
-    c.planWait = { planPath: abs, hash, versionId: applied.pvId, entryId: entry.id, d };
+    c.planWait = { planPath: abs, hash, md, planTasks, graph, entryId: entry.id, d };
     this.kick();
     return d.promise;
   }
 
+  private nextPlanVersion(missionId: string): number {
+    return (this.db.prepare('SELECT COALESCE(MAX(version), 0) AS v FROM plan_versions WHERE mission_id = ?')
+      .get(missionId) as { v: number }).v + 1;
+  }
+
+  /**
+   * Spec §6: the plan is applied only now. In one transaction: the mission moves to running, the plan version is
+   * created and approved, its tasks are inserted (first plan) or applied as a re-plan, and the entry is answered. A
+   * conflict that appeared since submit_plan (e.g. a task was cancelled meanwhile) rolls everything back and leaves
+   * the entry open: the user can send a re-plan note instead.
+   */
   approvePlan(missionId: string): void {
     this.assertOpen();
     const c = this.ctx(missionId);
     const w = c.planWait;
     if (!w) throw new Error(`Mission ${missionId} has no plan waiting for approval`);
-    this.transition(missionId, 'approve'); // first: an illegal transition leaves the entry open
-    inboxRepo.answer(this.db, w.entryId, { approved: true });
-    planVersions.approve(this.db, w.versionId);
+    let m!: Mission;
+    this.db.transaction(() => {
+      m = missions.transition(this.db, missionId, 'approve'); // first: an illegal transition changes nothing
+      const existing = tasks.listByMission(this.db, missionId);
+      const conflicts = planConflicts(existing, w.planTasks);
+      if (conflicts.length > 0) {
+        throw new Error(`The plan now conflicts with existing tasks (${conflicts.join(', ')}); send a re-plan note instead`);
+      }
+      const pv = planVersions.create(this.db, { missionId, version: this.nextPlanVersion(missionId), planPath: w.planPath, planMd: w.md });
+      if (existing.length === 0) tasks.insertPlan(this.db, missionId, pv.id, w.planTasks, w.graph);
+      else {
+        const r = tasks.applyReplan(this.db, missionId, pv.id, w.planTasks, w.graph);
+        if (r.conflicts.length > 0) {
+          throw new Error(`The plan now conflicts with existing tasks (${r.conflicts.join(', ')}); send a re-plan note instead`);
+        }
+      }
+      planVersions.approve(this.db, pv.id);
+      inboxRepo.answer(this.db, w.entryId, { approved: true });
+    })();
+    this.emit('mission', m);
+    this.flushEvents();
     c.planWait = null;
     c.lastPlan = { planPath: w.planPath, hash: w.hash, result: { approved: true } };
     this.emit('inbox');
@@ -1015,15 +1051,15 @@ export class MissionEngine extends EventEmitter implements BridgeHandlers {
     const plan = latest('plan_approval');
     for (const e of open) if (e.kind === 'plan_approval' && (e !== plan || m.state !== 'awaiting_approval')) expire(e);
     if (plan && m.state === 'awaiting_approval') {
-      const p = plan.payload as { planVersionId: string; planPath: string };
-      const pv = this.db.prepare('SELECT plan_path, plan_md FROM plan_versions WHERE id = ?').get(p.planVersionId) as
-        { plan_path: string; plan_md: string } | undefined;
-      if (pv) {
+      // The plan is applied only on approval, so the wait is rebuilt from the plan text kept in the entry.
+      const p = plan.payload as { planPath?: string; planMd?: string };
+      const planTasks = typeof p.planMd === 'string' ? parsePlan(p.planMd) : [];
+      if (p.planPath && planTasks.length > 0 && validatePlan(planTasks).length === 0) {
         c.planWait = {
-          planPath: p.planPath ?? pv.plan_path, hash: sha256(pv.plan_md), versionId: p.planVersionId, entryId: plan.id,
-          d: deferred<PlanResult>(),
+          planPath: p.planPath, hash: sha256(p.planMd!), md: p.planMd!, planTasks, graph: buildGraph(planTasks),
+          entryId: plan.id, d: deferred<PlanResult>(),
         };
-      } else expire(plan);
+      } else expire(plan); // the resumed conductor submits it again
     }
     if (m.state === 'running') {
       const pv = this.db.prepare(`SELECT plan_path, plan_md FROM plan_versions WHERE mission_id = ? AND approved_at IS NOT NULL

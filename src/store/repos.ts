@@ -195,6 +195,8 @@ export const planVersions = {
 };
 
 const AD_HOC_KEY = /^[A-Za-z0-9-]{1,24}$/;
+/** `integration` names the mission's integration worktree; `*-integration` is kept free alongside it. */
+export const isReservedKey = (key: string): boolean => /(^|-)integration$/i.test(key);
 const getTask = (db: Db, id: string): Task => toTask(db.prepare('SELECT * FROM tasks WHERE id = ?').get(id) as Row);
 const isPreRun = (s: TaskState): boolean => s === 'planned' || s === 'waiting' || s === 'ready';
 
@@ -266,6 +268,11 @@ export const tasks = {
       return { cancelled, runningUnplanned, conflicts };
     })();
   },
+  /** A task of the mission whose key equals `key` ignoring case (keys name worktree folders; Windows ignores case). */
+  findKeyIgnoringCase(db: Db, missionId: string, key: string): Task | undefined {
+    const lower = key.toLowerCase();
+    return tasks.listByMission(db, missionId).find(t => t.taskKey.toLowerCase() === lower);
+  },
   getByKey(db: Db, missionId: string, key: string): Task | undefined {
     const r = db.prepare('SELECT * FROM tasks WHERE mission_id = ? AND task_key = ?').get(missionId, key) as Row | undefined;
     return r && toTask(r);
@@ -289,6 +296,11 @@ export const tasks = {
       }
       if (cur) return { task: cur, created: false };
       if (!AD_HOC_KEY.test(d.key)) throw new Error(`Invalid ad-hoc task key: "${d.key}"`);
+      if (isReservedKey(d.key)) {
+        throw new Error(`Task key "${d.key}" is reserved (integration and *-integration name Maestro's own worktrees); choose another`);
+      }
+      const clash = tasks.findKeyIgnoringCase(db, missionId, d.key);
+      if (clash) throw new Error(`Task key "${d.key}" already exists as ${clash.taskKey} (keys ignore case); choose another`);
       checkDeps();
       const byKey = new Map(tasks.listByMission(db, missionId).map(t => [t.taskKey, t]));
       const depth = d.dependsOn.reduce((m, k) => Math.max(m, (byKey.get(k)?.depth ?? 0) + 1), 1);

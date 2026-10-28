@@ -115,6 +115,28 @@ describe('tasks v2', () => {
     expect(() => tasks.dispatch(s.db, s.m.id, { key: 'x'.repeat(25), agent: 'a', prompt: 'p', dependsOn: [], owns: [] })).toThrow(/invalid/i);
   });
 
+  it('dispatch rejects the reserved ad-hoc key integration (and *-integration)', () => {
+    const s = setup();
+    for (const key of ['integration', 'Integration', 'api-integration', 'X-INTEGRATION']) {
+      expect(() => tasks.dispatch(s.db, s.m.id, { key, agent: 'implementer', prompt: 'p', dependsOn: [], owns: [] }), key)
+        .toThrow(/reserved/i);
+    }
+    expect(tasks.listByMission(s.db, s.m.id)).toHaveLength(0);
+    expect(tasks.dispatch(s.db, s.m.id, { key: 'integrate-api', agent: 'implementer', prompt: 'p', dependsOn: [], owns: [] }).created).toBe(true);
+  });
+
+  it('dispatch rejects an ad-hoc key that differs from an existing key only by case', () => {
+    const s = setup();
+    const { pv, graph } = plan(s, [pt('T1')]);
+    tasks.insertPlan(s.db, s.m.id, pv.id, [pt('T1')], graph);
+    tasks.dispatch(s.db, s.m.id, { key: 'fix-a', agent: 'implementer', prompt: 'p', dependsOn: [], owns: [] });
+    expect(() => tasks.dispatch(s.db, s.m.id, { key: 't1', agent: 'implementer', prompt: 'p', dependsOn: [], owns: [] }))
+      .toThrow(/already exists.*T1/i);
+    expect(() => tasks.dispatch(s.db, s.m.id, { key: 'FIX-A', agent: 'implementer', prompt: 'p', dependsOn: [], owns: [] }))
+      .toThrow(/already exists.*fix-a/i);
+    expect(tasks.listByMission(s.db, s.m.id).map(t => t.taskKey)).toEqual(['T1', 'fix-a']);
+  });
+
   it('dispatch of an existing non-failed task returns created:false', () => {
     const s = setup();
     const { pv, graph } = plan(s, [pt('T1')]);

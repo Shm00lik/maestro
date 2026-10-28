@@ -90,6 +90,18 @@ describe('Prompter', () => {
     }
   });
 
+  it('plan approval shows the tasks from the entry (they are not in the database before approval)', async () => {
+    const s = setup();
+    inbox.add(s.db, { missionId: s.m.id, taskId: null, kind: 'plan_approval', payload: {
+      version: 2, taskKeys: ['T7'], waves: [['T7']],
+      tasks: [{ key: 'T7', title: 'New part', agent: 'debugger', dependsOn: ['T1'], owns: ['n/**'] }],
+    } });
+    s.prompter.refresh();
+    await waitFor(() => s.prompts.length === 1);
+    expect(s.lines.join('\n')).toContain('T7  New part  [debugger]  depends on: T1  owns: n/**');
+    s.prompter.close();
+  });
+
   it('plan approval: any other text asks before sending it as a re-plan note', async () => {
     const s = setup();
     inbox.add(s.db, { missionId: s.m.id, taskId: null, kind: 'plan_approval', payload: { version: 1, taskKeys: ['T1'], waves: [['T1']] } });

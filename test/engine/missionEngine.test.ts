@@ -210,8 +210,9 @@ describe('MissionEngine', () => {
     expect(await pending(res)).toBe(true);
     const entry = await until(() => openEntry(m.id, 'plan_approval'));
     expect(mission(m.id).state).toBe('awaiting_approval');
-    expect(tasks.listByMission(db, m.id).map(t => [t.taskKey, t.state])).toEqual(
-      [['T1', 'planned'], ['T2', 'planned'], ['T3', 'planned']]);
+    // Nothing is applied until approval (spec §6).
+    expect(tasks.listByMission(db, m.id)).toEqual([]);
+    expect(versions(m.id)).toBe(0);
 
     e.approvePlan(m.id);
     expect(await res).toEqual({ approved: true });
@@ -232,18 +233,24 @@ describe('MissionEngine', () => {
     const second = e.submitPlan(m.id, path);
     expect(await pending(second)).toBe(true);
     expect(inbox.listOpen(db, Date.now()).filter(x => x.kind === 'plan_approval')).toHaveLength(1);
-    expect((db.prepare('SELECT COUNT(*) AS n FROM plan_versions WHERE mission_id = ?').get(m.id) as { n: number }).n).toBe(1);
+    expect(versions(m.id)).toBe(0); // created only on approval
 
     e.replan(m.id, 'Split part A');
     expect(await second).toEqual({ approved: false, note: 'Split part A' });
     expect(await first).toEqual({ approved: false, note: 'Split part A' });
     expect(mission(m.id).state).toBe('planning');
+    expect(versions(m.id)).toBe(0);
 
-    // The revised plan becomes version 2 and is applied as a re-plan.
-    const third = e.submitPlan(m.id, writePlan(PLAN_SRC, 'plan2.md'));
+    // The resubmitted plan becomes version 1; a later, smaller plan becomes version 2 and is applied as a re-plan.
+    const third = e.submitPlan(m.id, writePlan(PLAN, 'plan2.md'));
     await until(() => openEntry(m.id, 'plan_approval'));
     e.approvePlan(m.id);
     expect(await third).toEqual({ approved: true });
+    const fourth = e.submitPlan(m.id, writePlan(PLAN_SRC, 'plan2b.md'));
+    await until(() => openEntry(m.id, 'plan_approval'));
+    e.approvePlan(m.id);
+    expect(await fourth).toEqual({ approved: true });
+    expect(versions(m.id)).toBe(2);
     expect(tasks.listByMission(db, m.id).map(t => [t.taskKey, t.state])).toEqual(
       [['T1', 'planned'], ['T2', 'cancelled'], ['T3', 'cancelled']]);
 
@@ -270,10 +277,52 @@ describe('MissionEngine', () => {
     expect(inbox.get(db, firstEntry.id)!.state).toBe('expired');
     const entry = await until(() => openEntry(m.id, 'plan_approval'));
     expect(entry.id).not.toBe(firstEntry.id);
-    expect(versions(m.id)).toBe(2);
+    expect(versions(m.id)).toBe(0); // neither plan is applied before approval
     e.approvePlan(m.id);
     expect(await second).toEqual({ approved: true });
+    expect(versions(m.id)).toBe(1);
     expect(tasks.listByMission(db, m.id).filter(t => t.state === 'planned').map(t => t.taskKey)).toEqual(['T1']);
+  }, T);
+
+  it('a re-plan is applied only on approval; a rejected re-plan changes no task rows', async () => {
+    const e = makeEngine(TASK_HANG);
+    const m = await start(e);
+    await approved(e, m, PLAN);
+    const r1 = ref(await e.dispatchTask(m.id, { task_id: 'T1', agent: 'implementer', prompt: 'p', depends_on: [], owns: ['a/**'] }));
+    await until(() => tasks.get(db, r1)!.state === 'running');
+    const rows = (): string => JSON.stringify(db.prepare('SELECT * FROM tasks ORDER BY rowid').all());
+    const before = rows();
+
+    const first = e.submitPlan(m.id, writePlan(PLAN_SRC, 'replan.md'));
+    const entry = await until(() => openEntry(m.id, 'plan_approval'));
+    expect(entry.payload).toMatchObject({ taskKeys: ['T1'], cancelled: ['T2', 'T3'], runningUnplanned: [] });
+    expect(rows()).toBe(before); // nothing applied while the approval is pending
+    expect(versions(m.id)).toBe(1);
+    e.replan(m.id, 'Keep all three');
+    expect(await first).toEqual({ approved: false, note: 'Keep all three' });
+    expect(rows()).toBe(before); // rejected: no task row changed
+    expect(versions(m.id)).toBe(1);
+
+    const second = e.submitPlan(m.id, writePlan(PLAN_SRC, 'replan2.md'));
+    await until(() => openEntry(m.id, 'plan_approval'));
+    expect(rows()).toBe(before);
+    e.approvePlan(m.id);
+    expect(await second).toEqual({ approved: true });
+    expect(tasks.listByMission(db, m.id).map(t => [t.taskKey, t.state])).toEqual(
+      [['T1', 'running'], ['T2', 'cancelled'], ['T3', 'cancelled']]);
+    expect(versions(m.id)).toBe(2);
+    expect(mission(m.id).state).toBe('running');
+  }, T);
+
+  it('a plan key that matches an ad-hoc key ignoring case is a plan error', async () => {
+    const e = makeEngine(TASK_HANG);
+    const m = await start(e);
+    await approved(e, m, PLAN_SRC);
+    await e.dispatchTask(m.id, { task_id: 't2', agent: 'implementer', prompt: 'p', depends_on: [], owns: ['x/**'] });
+    const r = await e.submitPlan(m.id, writePlan(PLAN, 'replan.md'));
+    expect('errors' in r && r.errors.map(x => x.message)).toEqual(['T2 conflicts with an existing task; rename it']);
+    expect(versions(m.id)).toBe(1);
+    expect(mission(m.id).state).toBe('running');
   }, T);
 
   it('dispatch_task rejects ownership overlap with a running task', async () => {

@@ -51,9 +51,13 @@ export function validatePlan(tasks: PlanTask[]): PlanError[] {
   const errors: PlanError[] = [];
   const add = (code: PlanErrorCode, taskKeys: string[], message: string) => errors.push({ code, taskKeys, message });
 
-  const seen = new Set<string>(), dups = new Set<string>();
-  for (const t of tasks) (seen.has(t.key) ? dups : seen).add(t.key);
-  for (const k of dups) add('duplicate-key', [k], `Task key ${k} is used more than once.`);
+  // Keys are compared case-insensitively: they name worktree folders, and Windows paths ignore case.
+  const seen = new Set<string>(), dups = new Map<string, string>();
+  for (const t of tasks) {
+    const k = t.key.toLowerCase();
+    if (seen.has(k)) { if (!dups.has(k)) dups.set(k, t.key); } else seen.add(k);
+  }
+  for (const k of dups.values()) add('duplicate-key', [k], `Task key ${k} is used more than once (keys ignore case).`);
 
   const unique = [...new Map(tasks.slice().reverse().map(t => [t.key, t])).values()].reverse();
   const keys = unique.map(t => t.key);
