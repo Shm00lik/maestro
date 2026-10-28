@@ -1,7 +1,7 @@
 # Maestro — Design Spec
 
 - **Date:** 2026-10-28 · **v2:** 2026-10-28, updated with what the Plan 1 spikes found
-- **Status:** v1 approved. v2 changes are waiting for review. Product choices Claude made on the user's behalf are marked **[Claude's call — review]**.
+- **Status:** v1 approved. v2's product decisions were answered by the user on 2026-10-28 (§17). The technical changes are waiting for the user's later review.
 - **Mockups:** [Maestro UI Concepts v2](https://claude.ai/artifact/MkiLHvsCJoP6ZphxbWFkFA) (7 screens)
 - **Evidence:** `docs/superpowers/spikes/2026-10-28-{r1-conductor,r2-stream,r3-permissions,r5-windows}.md`
 
@@ -124,7 +124,7 @@ Checked against the Claude Code docs (2026-10-27) and in the Plan 1 spikes (clau
 | running | `pause` / paused `resume` | paused / running |
 | running | `finish_requested` (the conductor called `finish_mission`) | finishing |
 | finishing | `merged` | done (outcome `merged`) |
-| finishing | `kept` | done (outcome `kept`) — the branch is left for the user **[Claude's call — review]** |
+| finishing | `kept` | done (outcome `kept`) — the branch is left for the user (decided by user, 2026-10-28) |
 | any non-terminal | `stop` / `fail` | stopped / failed |
 
 - **"Needs you" is not a state.** It is derived from open inbox entries, so a running mission can need the user at the same time.
@@ -214,7 +214,7 @@ cwd = <project root>; env MCP_TOOL_TIMEOUT=86400000
 | `ask_user` | `{ question, options[]?, context? }` | Blocks until the user answers. With `options`, the answer is always exactly one of them (the UI enforces it). |
 | `finish_mission` | `{ summary }` | Moves the mission to `finishing` and creates a `merge_decision` inbox entry (Merge / Keep branch). Returns the user's choice. |
 
-**Task sessions get a bridge with `ask_user` only** **[Claude's call — review]**, so a task can ask the user a question directly (→ `needs_you`) instead of failing or guessing.
+**Task sessions get a bridge with `ask_user` only** (decided by user, 2026-10-28), so a task can ask the user a question directly (→ `needs_you`) instead of failing or guessing.
 
 ## 8. Task execution
 
@@ -266,7 +266,7 @@ cwd = <project>/.claude/worktrees/<mission8>-<key>   env MCP_TOOL_TIMEOUT=864000
   - **Allow:** `{"behavior":"allow","updatedInput":<input>}`
   - **Deny:** `{"behavior":"deny","message":"<text>"}`
   - Both go back on stdin as a `control_response` with the same `request_id`. (R3)
-- **"Always allow for this mission"** **[Claude's call — review]** stores a rule in Maestro (tool name plus an exact command prefix for Bash) and auto-answers matching requests in that mission. Maestro never answers with `permission_suggestions`, because that could write settings files into a worktree, which would then be merged.
+- **"Always allow for this mission"** (decided by user, 2026-10-28) stores a rule in Maestro (tool name plus an exact command prefix for Bash) and auto-answers matching requests in that mission. Maestro never answers with `permission_suggestions`, because that could write settings files into a worktree, which would then be merged.
 - **Inbox entry types:** `question`, `plan_approval`, `permission`, `review_decision`, `merge_decision`.
 - **Inbox states:** `open`, `answered`, `expired`. An entry expires when its task is cancelled or its process dies, or when its request no longer applies.
 - **Answering:** an answer applies exactly once (a second click gets `AlreadyAnswered`). A task can have several open entries at once, for example parallel tool calls.
@@ -379,10 +379,11 @@ The Stats page is out of scope for v1.
 2. The final merge into the base branch always asks first.
 3. Usage is shown in tokens only, with no dollar figures. (v2 adds the 5-hour usage window, a percentage that comes from Claude itself.)
 
-**Claude's calls in v2, for review:**
-4. **Pause now** keeps the task's process alive and idle (`interrupted`) and resumes with "Continue.", rather than killing it and resuming later. It is faster, and context stays warm.
-5. **A mission can end with "Keep branch"** (`done`, outcome `kept`) as well as Merge.
-6. **Task sessions can ask the user questions** through a bridge that has only `ask_user`.
+4. **Pause now** keeps the task's process alive and idle (`interrupted`) and resumes with "Continue."
+5. **A mission can end with Merge or Keep branch** (`done`, with outcome `merged` or `kept`).
+6. **Task sessions can ask the user questions** directly, through a bridge that has only `ask_user`.
 7. **"Always allow" is mission-scoped**, stored in Maestro, and limited to the tool name plus an exact command prefix.
+
+**Technical calls (Claude, for later review):**
 8. **The interrupt fallback is 5 s**, then a forced kill. In the spike the interrupt answered in about 0.1 s.
 9. **A missing handoff gets one reminder**, then the task fails with reason `no-handoff`.
