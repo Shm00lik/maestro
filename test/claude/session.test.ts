@@ -288,6 +288,47 @@ describe('ClaudeSession', () => {
     }
   }, 10000);
 
+  it('stop ends stdin only after the snapshot settles, then kills the survivor', async () => {
+    const survivor = spawn('ping', ['-n', '60', '127.0.0.1'], { stdio: 'ignore', windowsHide: true });
+    const spid = survivor.pid!;
+    const pidKills: number[] = [];
+    let resolvedAt = 0;
+    try {
+      const s = start('interrupt', [], {
+        listTree: pid => new Promise(r => setTimeout(() => { resolvedAt = Date.now(); r([pid, spid]); }, 300)),
+        killPid: pid => { pidKills.push(pid); return killPidAsync(pid); },
+      });
+      await until(s, 'init');
+      s.send('go');
+      let exitAt = 0;
+      s.once('exit', () => { exitAt = Date.now(); });
+      expect(await s.stop(5000)).toBe('exited');
+      expect(fakeLogLines().filter(l => l?.request?.subtype === 'interrupt')).toHaveLength(1);
+      expect(resolvedAt).toBeGreaterThan(0);
+      expect(exitAt).toBeGreaterThanOrEqual(resolvedAt); // stdin was ended only after the snapshot
+      expect(pidKills).toEqual([spid]);
+      await waitUntil(() => !alive(spid), 3000);
+      expect(alive(spid)).toBe(false);
+    } finally {
+      killTree(spid);
+    }
+  }, 10000);
+
+  it('a hung snapshot releases step 3 after snapshotWaitMs and skips step 5', async () => {
+    const pidKills: number[] = [];
+    const s = start('init-result', [], {
+      listTree: () => new Promise<number[]>(() => { /* never settles */ }),
+      snapshotWaitMs: 300,
+      killPid: pid => { pidKills.push(pid); return killPidAsync(pid); },
+    });
+    await until(s, 'result');
+    const t0 = Date.now();
+    expect(await s.stop(5000)).toBe('exited');
+    expect(Date.now() - t0).toBeLessThan(3000);
+    expect(pidKills).toEqual([]);
+    expect(readFileSync(join(dir, 'logs', 's.log'), 'utf8')).toMatch(/snapshot timed out after 300ms; skipping snapshot kills/);
+  }, 10000);
+
   it('stdin EPIPE without an error listener does not throw and is logged', async () => {
     const s = start('idle');
     await until(s, 'init');

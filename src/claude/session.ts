@@ -168,8 +168,9 @@ export class ClaudeSession extends EventEmitter {
   /**
    * Stop per spec 8.3: snapshot the tree (started, not awaited, so it never delays the interrupt);
    * if busy write ONE interrupt and wait up to timeoutMs for a result (skipped if the write fails);
-   * end stdin and wait up to timeoutMs for exit; else killTree; then await the snapshot (bounded by
-   * snapshotWaitMs from the start) and kill each snapshot PID still alive (by pid, no /T).
+   * wait for the snapshot to settle (bounded by snapshotWaitMs from the start), so it still holds the
+   * root and its tool children; end stdin and wait up to timeoutMs for exit; else killTree; then kill
+   * each snapshot PID still alive (by pid, no /T).
    * Concurrent calls share one run. After this starts, send/answerPermission throw SessionClosed.
    * Resolves 'killed' exactly when the exit info says killed.
    */
@@ -225,7 +226,7 @@ export class ClaudeSession extends EventEmitter {
       if (this.finalized) done(true);
     });
 
-    // Step 1: start the snapshot now; it is only awaited (bounded) before step 5.
+    // Step 1: start the snapshot now; it is awaited (bounded) only before step 3, never before the interrupt.
     const snapshot = this.snapshotTree();
 
     // Step 2: one interrupt if mid-turn. A result can only arrive on a later tick, so waiting after the write is safe.
@@ -236,6 +237,10 @@ export class ClaudeSession extends EventEmitter {
       if (wrote) await waitFor(timeoutMs, e => e.kind === 'result');
     }
 
+    // Hold step 3 until the snapshot settles (listed, failed or timed out): ending stdin lets the root exit,
+    // and a listing taken after that has no root and would be discarded.
+    const survivors = await snapshot;
+
     // Steps 3-4: end stdin and wait for exit, else kill the tree (bounded).
     if (!hasExited()) {
       if (!this.stdinEnded && !this.child.stdin.destroyed) { this.stdinEnded = true; this.child.stdin.end(); }
@@ -243,7 +248,7 @@ export class ClaudeSession extends EventEmitter {
     }
 
     // Step 5: kill snapshot PIDs still alive. Each descendant is in the list, so no /T (limits PID-reuse damage).
-    for (const pid of await snapshot) {
+    for (const pid of survivors) {
       let up = true;
       try { process.kill(pid, 0); } catch { up = false; }
       if (up) { try { await this.killPidFn(pid); } catch { /* never throws */ } }
