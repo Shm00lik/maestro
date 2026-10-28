@@ -159,6 +159,10 @@ export const missions = {
     const res = db.prepare('UPDATE missions SET outcome = ? WHERE id = ?').run(outcome, id);
     if (res.changes === 0) throw new Error(`Mission not found: ${id}`);
   },
+  setMissionBranch(db: Db, id: string, branch: string): void {
+    const res = db.prepare('UPDATE missions SET mission_branch = ? WHERE id = ?').run(branch, id);
+    if (res.changes === 0) throw new Error(`Mission not found: ${id}`);
+  },
   setConductorSession(db: Db, id: string, sessionId: string): void {
     const res = db.prepare('UPDATE missions SET conductor_session_id = ? WHERE id = ?').run(sessionId, id);
     if (res.changes === 0) throw new Error(`Mission not found: ${id}`);
@@ -388,6 +392,20 @@ export const inbox = {
       db.prepare("UPDATE inbox SET state = 'expired' WHERE task_id = ? AND state = 'open'").run(taskId);
       return rows.map(r => toInbox({ ...r, state: 'expired' }));
     })();
+  },
+  /** Expires every open mission-level entry (task_id NULL) of a mission and returns them (expired). */
+  expireMissionLevel(db: Db, missionId: string): InboxEntry[] {
+    return db.transaction(() => {
+      const rows = db.prepare(
+        "SELECT * FROM inbox WHERE mission_id = ? AND task_id IS NULL AND state = 'open' ORDER BY created_at, rowid",
+      ).all(missionId) as Row[];
+      db.prepare("UPDATE inbox SET state = 'expired' WHERE mission_id = ? AND task_id IS NULL AND state = 'open'").run(missionId);
+      return rows.map(r => toInbox({ ...r, state: 'expired' }));
+    })();
+  },
+  /** Expires one open entry; false when it was not open. */
+  expire(db: Db, id: string): boolean {
+    return db.prepare("UPDATE inbox SET state = 'expired' WHERE id = ? AND state = 'open'").run(id).changes > 0;
   },
   /** Expires the open entry created for a permission request id (used on permission-cancel). */
   expireByRequestId(db: Db, requestId: string): InboxEntry | undefined {

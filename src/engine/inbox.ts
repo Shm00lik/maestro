@@ -141,6 +141,13 @@ export class InboxService extends EventEmitter {
     for (const e of expired) this.changed(e.missionId, e.taskId);
   }
 
+  /** Expires the mission-level (task_id NULL) open entries, e.g. the conductor's questions, when the mission stops. */
+  expireForMission(missionId: string): void {
+    const expired = inbox.expireMissionLevel(this.db, missionId);
+    this.rejectPending(expired);
+    if (expired.length > 0) this.changed(missionId, null);
+  }
+
   private rejectPending(entries: InboxEntry[]): void {
     for (const e of entries) {
       const pend = this.pending.get(e.id);

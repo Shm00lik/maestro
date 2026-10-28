@@ -1,7 +1,8 @@
 // Scenario-driven stand-in for claude.exe (stream-json over stdio). See test/fake-claude/fake-claude.test.ts.
 // Run: node --import tsx test/fake-claude/fake-claude.ts <claude args...>
 // Env: FAKE_CLAUDE_SCENARIO=<scenario json>, FAKE_CLAUDE_LOG=<jsonl log path>.
-import { appendFileSync, readFileSync } from 'node:fs';
+import { appendFileSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { dirname, resolve } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { spawn } from 'node:child_process';
 import { createInterface } from 'node:readline';
@@ -11,6 +12,8 @@ export type Step =
   | { waitFor: 'user' | 'interrupt' | 'permission-answer' | 'stdin-close'; timeoutMs?: number }
   | { sleepMs: number }
   | { spawnChild: 'ping' }
+  /** Writes a file relative to the cwd; `$SESSION` in the path is replaced by the session id. */
+  | { writeFile: string; content?: string }
   | { exit: number };
 export interface Scenario { steps: Step[] }
 
@@ -133,6 +136,11 @@ async function run(): Promise<void> {
       const child = spawn('ping', ['-n', '120', '127.0.0.1'], { stdio: 'ignore', windowsHide: true });
       child.on('error', () => { /* ignore */ });
       log({ spawnedChild: child.pid });
+    } else if ('writeFile' in step) {
+      const p = resolve(process.cwd(), step.writeFile.split('$SESSION').join(sessionId));
+      mkdirSync(dirname(p), { recursive: true });
+      writeFileSync(p, step.content ?? 'fake\n');
+      log({ wroteFile: p });
     } else if ('exit' in step) {
       return exit(step.exit);
     }

@@ -127,8 +127,28 @@ async function ensureIntegrationWorktree(
   return dir;
 }
 
-/** Merges taskBranch into missionBranch with --no-ff inside the mission's integration worktree (named by missionId). */
-export async function mergeTaskBranch(
+/** Per-repo queue: git operations on one repository's worktrees run one at a time (index.lock, shared worktree). */
+const repoQueues = new Map<string, Promise<unknown>>();
+function serialized<T>(key: string, fn: () => Promise<T>): Promise<T> {
+  const prev = repoQueues.get(key) ?? Promise.resolve();
+  const run = prev.then(fn, fn);
+  const tail = run.catch(() => undefined);
+  repoQueues.set(key, tail);
+  void tail.then(() => { if (repoQueues.get(key) === tail) repoQueues.delete(key); });
+  return run;
+}
+
+/**
+ * Merges taskBranch into missionBranch with --no-ff inside the mission's integration worktree (named by missionId).
+ * Merges into the same repository are serialized: parallel tasks often finish together.
+ */
+export function mergeTaskBranch(
+  projectRoot: string, missionBranch: string, taskBranch: string, message: string, missionId: string,
+): Promise<{ ok: true; commit: string } | { ok: false; reason: 'conflict'; files: string[] }> {
+  return serialized(norm(projectRoot), () => mergeTaskBranchNow(projectRoot, missionBranch, taskBranch, message, missionId));
+}
+
+async function mergeTaskBranchNow(
   projectRoot: string, missionBranch: string, taskBranch: string, message: string, missionId: string,
 ): Promise<{ ok: true; commit: string } | { ok: false; reason: 'conflict'; files: string[] }> {
   const dir = await ensureIntegrationWorktree(projectRoot, missionBranch, missionId);

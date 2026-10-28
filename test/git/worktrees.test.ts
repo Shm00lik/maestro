@@ -88,6 +88,23 @@ describe('worktrees', () => {
     expect(existsSync(worktreeDirFor(root, MID, 'integration'))).toBe(false);
   });
 
+  it('serializes parallel merges into the same mission branch', async () => {
+    const root = makeRepo();
+    await ensureMissionBranch(root, 'main', 'mission/m1');
+    const d1 = worktreeDirFor(root, MID, 'T1');
+    const d2 = worktreeDirFor(root, MID, 'T2');
+    await createTaskWorktree(root, 'mission/m1', 'task/T1', d1);
+    await createTaskWorktree(root, 'mission/m1', 'task/T2', d2);
+    commitIn(d1, 'b.txt', 'b\n', 'b');
+    commitIn(d2, 'c.txt', 'c\n', 'c');
+    const [r1, r2] = await Promise.all([
+      mergeTaskBranch(root, 'mission/m1', 'task/T1', 'm1', MID),
+      mergeTaskBranch(root, 'mission/m1', 'task/T2', 'm2', MID),
+    ]);
+    expect([r1.ok, r2.ok]).toEqual([true, true]);
+    expect(git(root, 'ls-tree', '--name-only', 'mission/m1').split('\n').sort()).toEqual(['a.txt', 'b.txt', 'c.txt']);
+  });
+
   it('reports conflicts and leaves the mission branch unchanged', async () => {
     const root = makeRepo();
     await ensureMissionBranch(root, 'main', 'mission/m1');
