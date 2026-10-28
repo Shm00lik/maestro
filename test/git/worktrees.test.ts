@@ -6,6 +6,7 @@ import { execFileSync } from 'node:child_process';
 import {
   MAX_WORKTREE_PATH, worktreeDirFor, ensureMissionBranch, createTaskWorktree,
   mergeTaskBranch, branchCommits, removeWorktree, removeIntegrationWorktree,
+  addExistingBranchWorktree, isRegisteredWorktree, branchExists, pruneWorktrees,
 } from '../../src/git/worktrees.js';
 
 const git = (cwd: string, ...args: string[]) =>
@@ -171,5 +172,22 @@ describe('worktrees', () => {
     expect(git(root, 'config', '--local', '--get', 'core.longpaths')).toBe('true');
     expect(gitOr(root, '', 'config', '--global', '--get', 'core.longpaths')).toBe(globalBefore);
     expect(readFileSync(join(root, '.git', 'info', 'exclude'), 'utf8')).toContain('.claude/worktrees/');
+  });
+  it('re-adds a worktree for an existing branch after its folder was removed', async () => {
+    const root = makeRepo();
+    await ensureMissionBranch(root, 'main', 'm/x');
+    const dir = worktreeDirFor(root, MID, 'T1');
+    await createTaskWorktree(root, 'm/x', 'm/x--T1', dir);
+    commitIn(dir, 'b.txt', 'kept', 'task work');
+    expect(await isRegisteredWorktree(root, dir)).toBe(true);
+    rmSync(dir, { recursive: true, force: true });
+    await pruneWorktrees(root);
+    expect(await isRegisteredWorktree(root, dir)).toBe(false);
+    expect(await branchExists(root, 'm/x--T1')).toBe(true);
+    expect(await branchExists(root, 'm/nope')).toBe(false);
+    await addExistingBranchWorktree(root, 'm/x--T1', dir);
+    expect(readFileSync(join(dir, 'b.txt'), 'utf8')).toBe('kept');
+    expect(git(dir, 'rev-parse', '--abbrev-ref', 'HEAD')).toBe('m/x--T1');
+    expect(await isRegisteredWorktree(root, dir)).toBe(true);
   });
 });

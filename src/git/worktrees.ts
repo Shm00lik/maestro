@@ -38,7 +38,7 @@ export function worktreeDirFor(projectRoot: string, missionId: string, key: stri
   );
 }
 
-async function branchExists(projectRoot: string, branch: string): Promise<boolean> {
+export async function branchExists(projectRoot: string, branch: string): Promise<boolean> {
   try {
     await git(projectRoot, ['rev-parse', '--verify', '--quiet', `refs/heads/${branch}`]);
     return true;
@@ -72,6 +72,21 @@ export async function createTaskWorktree(
   await prepare(projectRoot);
   mkdirSync(dirname(dir), { recursive: true });
   await git(projectRoot, ['worktree', 'add', '-b', taskBranch, dir, missionBranch]);
+}
+
+/** Adds a worktree at dir for a branch that already exists (e.g. a retried task whose folder was removed). */
+export async function addExistingBranchWorktree(projectRoot: string, branch: string, dir: string): Promise<void> {
+  await prepare(projectRoot);
+  mkdirSync(dirname(dir), { recursive: true });
+  await git(projectRoot, ['worktree', 'add', dir, branch]);
+}
+
+export async function pruneWorktrees(projectRoot: string): Promise<void> {
+  await git(projectRoot, ['worktree', 'prune']);
+}
+
+export async function isRegisteredWorktree(projectRoot: string, dir: string): Promise<boolean> {
+  return (await listWorktrees(projectRoot)).some((w) => norm(w) === norm(dir));
 }
 
 async function listWorktrees(projectRoot: string): Promise<string[]> {

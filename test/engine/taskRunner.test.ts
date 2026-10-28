@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { execFileSync } from 'node:child_process';
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -18,8 +18,8 @@ import {
 const FAKE = fileURLToPath(new URL('../fake-claude/fake-claude.ts', import.meta.url));
 const TSX = import.meta.resolve('tsx');
 const command = { exe: process.execPath, prefixArgs: ['--import', TSX, FAKE] };
-const MISSION_BRANCH = 'mission/fix-login';
-const TASK_BRANCH = 'maestro/fix-login/T1';
+const MISSION_BRANCH = 'maestro/fix-login';
+const TASK_BRANCH = 'maestro/fix-login--T1';
 
 const git = (cwd: string, ...args: string[]): string =>
   execFileSync('git', args, { cwd, windowsHide: true, encoding: 'utf8' }).trim();
@@ -117,8 +117,13 @@ function setup(steps: object[], agent = 'implementer'): Ctx {
   return c;
 }
 
-const finished = (c: Ctx): Promise<TaskFinished> =>
-  c.finished.length ? Promise.resolve(c.finished[0]) : new Promise(res => c.runner.once('finished', res));
+const finished = (c: Ctx, nth = 1): Promise<TaskFinished> => new Promise(res => {
+  if (c.finished.length >= nth) { res(c.finished[nth - 1]); return; }
+  const f = (): void => { if (c.finished.length >= nth) { c.runner.off('finished', f); res(c.finished[nth - 1]); } };
+  c.runner.on('finished', f);
+});
+const alive = (pid: number): boolean => { try { process.kill(pid, 0); return true; } catch { return false; } };
+const writeScenario = (steps: object[]): void => writeFileSync(join(dir, 'scenario.json'), JSON.stringify({ steps }));
 const waitState = (c: Ctx, state: string, nth = 1): Promise<void> => new Promise(res => {
   const check = (): boolean => c.states.filter(s => s === state).length >= nth;
   if (check()) { res(); return; }
@@ -196,6 +201,7 @@ describe('TaskRunner', () => {
     expect(merged?.data.commit).toBe(git(root, 'rev-parse', MISSION_BRANCH));
     expect(git(root, 'show', `${MISSION_BRANCH}:b.txt`)).toBe('made by agent');
     expect(git(root, 'show', `${MISSION_BRANCH}:c.txt`)).toBe('left over');
+    expect(git(root, 'log', '-1', '--format=%s', TASK_BRANCH)).toBe('maestro: uncommitted changes from T1');
     expect(c.states).toEqual(['running', 'done']);
     const prompt = userTexts()[0];
     expect(prompt).toContain('Do the thing.');
@@ -342,23 +348,125 @@ describe('TaskRunner', () => {
     expect(await finished(c)).toEqual({ taskId: c.task.id, outcome: 'failed', reason: 'error_max_turns' });
   }, 15000);
 
-  it('fails clearly when the task branch would clash with the mission branch', async () => {
-    const c = setup([STDIN_CLOSE]);
-    const runner = new TaskRunner({
-      db: c.db, inbox: c.inboxSvc, projectRoot: root, missionBranch: 'maestro/fix-login',
-      bridgeAskConfig: () => 'b.json', logDir: join(dir, 'logs'), command,
-    });
-    const done = new Promise<TaskFinished>(res => runner.once('finished', res));
-    await runner.start(c.task.id, []);
-    expect((await done).reason).toMatch(/clashes with mission branch maestro\/fix-login/);
-    expect(argvs()).toHaveLength(0);
-    runner.dispose();
-  });
-
   it('stop on a task that never started cancels it', async () => {
     const c = setup([STDIN_CLOSE]);
     await c.runner.stop(c.task.id);
     expect(getTask(c).state).toBe('cancelled');
     expect(existsSync(worktreeDirFor(root, c.missionId, 'T1'))).toBe(false);
   });
+  it('a read-only role is an allow-list: any extra built-in fails with unsafe-tools', async () => {
+    const c = setup([INIT(['Read', 'Glob', 'Grep', 'MultiEdit', 'Task', 'mcp__maestro__ask_user']), STDIN_CLOSE], 'spec-reviewer');
+    await c.runner.start(c.task.id, []);
+    expect((await finished(c)).reason).toBe('unsafe-tools: MultiEdit,Task');
+  }, 15000);
+
+  it('retry after the worktree folder was removed reuses the existing branch', async () => {
+    const c = setup([INIT(), USER, USER, { exit: 1 }]);
+    await c.runner.start(c.task.id, []);
+    const wt = getTask(c).worktreePath!;
+    writeFileSync(join(wt, 'b.txt'), 'first attempt\n');
+    git(wt, 'add', '.');
+    git(wt, 'commit', '-m', 'attempt 1');
+    c.runner.message(c.task.id, 'go');
+    expect((await finished(c)).reason).toMatch(/^crashed/);
+    rmSync(wt, { recursive: true, force: true });
+    tasks.transition(c.db, c.task.id, 'retry');
+    tasks.transition(c.db, c.task.id, 'deps_met');
+    writeScenario([INIT(), USER, RESULT(HANDOFF), STDIN_CLOSE]);
+    await c.runner.start(c.task.id, []);
+    expect((await finished(c, 2)).outcome).toBe('done');
+    expect(getTask(c).branch).toBe(TASK_BRANCH);
+    expect(git(root, 'show', `${MISSION_BRANCH}:b.txt`)).toBe('first attempt');
+  }, 15000);
+
+  it('replaces a worktree folder that is not a registered worktree', async () => {
+    const c = setup([INIT(), USER, RESULT(HANDOFF), STDIN_CLOSE]);
+    const wt = worktreeDirFor(root, c.missionId, 'T1');
+    mkdirSync(wt, { recursive: true });
+    writeFileSync(join(wt, 'junk.txt'), 'junk');
+    await c.runner.start(c.task.id, []);
+    expect(existsSync(join(wt, 'junk.txt'))).toBe(false);
+    expect(git(wt, 'rev-parse', '--abbrev-ref', 'HEAD')).toBe(TASK_BRANCH);
+    expect((await finished(c)).outcome).toBe('done');
+  }, 15000);
+
+  it('stop during an in-progress fail waits until the process is dead', async () => {
+    const c = setup([INIT(['Read', 'Glob', 'Grep', 'Edit']), STDIN_CLOSE], 'code-reviewer');
+    let stopped: Promise<void> | null = null;
+    c.runner.on('state', (t: Task) => { if (t.state === 'failed') stopped = c.runner.stop(c.task.id); });
+    await c.runner.start(c.task.id, []);
+    while (!stopped) await sleep(20);
+    await stopped;
+    const { pid } = c.db.prepare('SELECT pid FROM sessions WHERE task_id = ?').get(c.task.id) as { pid: number };
+    expect(alive(pid)).toBe(false);
+    expect(c.finished).toHaveLength(1);
+    expect(c.finished[0].outcome).toBe('failed');
+    expect(getTask(c).state).toBe('failed');
+  }, 15000);
+
+  it('a throwing state listener on done still gives exactly one finished and no unhandled rejection', async () => {
+    const unhandled: unknown[] = [];
+    const onUnhandled = (e: unknown): void => { unhandled.push(e); };
+    process.on('unhandledRejection', onUnhandled);
+    try {
+      const c = setup([INIT(), USER, RESULT(HANDOFF), STDIN_CLOSE]);
+      c.runner.on('state', (t: Task) => { if (t.state === 'done') throw new Error('listener boom'); });
+      await c.runner.start(c.task.id, []);
+      expect(await finished(c)).toEqual({ taskId: c.task.id, outcome: 'done' });
+      await sleep(300);
+      expect(c.finished).toHaveLength(1);
+      expect(getTask(c).state).toBe('done');
+      expect(unhandled).toEqual([]);
+    } finally { process.off('unhandledRejection', onUnhandled); }
+  }, 15000);
+
+  it('a throwing state listener on running fails the task exactly once', async () => {
+    const unhandled: unknown[] = [];
+    const onUnhandled = (e: unknown): void => { unhandled.push(e); };
+    process.on('unhandledRejection', onUnhandled);
+    try {
+      const c = setup([INIT(), USER, RESULT(HANDOFF), STDIN_CLOSE]);
+      c.runner.on('state', (t: Task) => { if (t.state === 'running') throw new Error('listener boom'); });
+      await c.runner.start(c.task.id, []);
+      const f = await finished(c);
+      expect(f.outcome).toBe('failed');
+      expect(f.reason).toMatch(/listener boom/);
+      await sleep(300);
+      expect(c.finished).toHaveLength(1);
+      expect(getTask(c).state).toBe('failed');
+      expect(unhandled).toEqual([]);
+    } finally { process.off('unhandledRejection', onUnhandled); }
+  }, 15000);
+
+  it('stop right after start spawns no process', async () => {
+    const c = setup([INIT(), USER, RESULT(HANDOFF), STDIN_CLOSE]);
+    const started = c.runner.start(c.task.id, []);
+    const stopped = c.runner.stop(c.task.id);
+    await started;
+    await stopped;
+    expect(getTask(c).state).toBe('cancelled');
+    expect(argvs()).toHaveLength(0);
+    expect(c.finished).toEqual([{ taskId: c.task.id, outcome: 'cancelled' }]);
+  }, 15000);
+
+  it('stop with no run ends live session rows, expires inbox entries and cancels', async () => {
+    const c = setup([STDIN_CLOSE]);
+    tasks.transition(c.db, c.task.id, 'start');
+    sessions.start(c.db, { missionId: c.missionId, taskId: c.task.id, role: 'implementer', pid: null, logPath: 'x.log' });
+    inbox.add(c.db, { missionId: c.missionId, taskId: c.task.id, kind: 'question', payload: { question: 'q' } });
+    await c.runner.stop(c.task.id);
+    await c.runner.stop(c.task.id);
+    expect(sessions.listLive(c.db)).toHaveLength(0);
+    expect(inbox.openCountForTask(c.db, c.task.id)).toBe(0);
+    expect(getTask(c).state).toBe('cancelled');
+    expect(c.finished).toEqual([{ taskId: c.task.id, outcome: 'cancelled' }]);
+  });
+
+  it('a result for a turn started by message() without a handoff neither reminds nor fails', async () => {
+    const c = setup([INIT(), USER, RESULT('first'), USER, RESULT('reply to user'), USER, RESULT(HANDOFF), STDIN_CLOSE]);
+    await c.runner.start(c.task.id, []);
+    c.runner.message(c.task.id, 'hi');
+    expect(await finished(c)).toEqual({ taskId: c.task.id, outcome: 'done' });
+    expect(userTexts().slice(1)).toEqual(['hi', 'Finish with a ## Handoff section.']);
+  }, 15000);
 });

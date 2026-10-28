@@ -4,7 +4,7 @@ import { EventEmitter } from 'node:events';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { randomUUID } from 'node:crypto';
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type { Db } from '../store/db.js';
@@ -13,7 +13,10 @@ import type { TaskEvent } from '../core/state/taskMachine.js';
 import { AGENT_ROLES, type AgentRole } from '../core/types.js';
 import { ClaudeSession, SessionClosed } from '../claude/session.js';
 import { lastHandoff, type StreamEvent } from '../claude/protocol.js';
-import { createTaskWorktree, mergeTaskBranch, worktreeDirFor } from '../git/worktrees.js';
+import {
+  addExistingBranchWorktree, branchExists, createTaskWorktree, isRegisteredWorktree, mergeTaskBranch, pruneWorktrees,
+  worktreeDirFor,
+} from '../git/worktrees.js';
 import type { InboxChanged, InboxService, SessionRegistry } from './inbox.js';
 
 const execFileP = promisify(execFile);
@@ -23,7 +26,6 @@ export const RESUME_MESSAGE =
   'Maestro restarted while you were working. Continue the task where you left off and finish with a ## Handoff section.';
 /** Tools of Maestro's own bridge MCP server (named `maestro` in the bridge config). Any other mcp__* tool is unsafe. */
 export const BRIDGE_TOOL_PREFIX = 'mcp__maestro__';
-const READ_ONLY_FORBIDDEN = ['Bash', 'PowerShell', 'Edit', 'Write', 'NotebookEdit'];
 const CLOSE_WAIT_MS = 10_000;
 const CRASH_LOG_LINES = 50;
 const CRASH_LOG_MAX = 4096;
@@ -113,10 +115,16 @@ export function buildTaskArgs(role: RoleConfig, systemPromptFile: string, bridge
   return args;
 }
 
-/** Tools from `init` that the session must not have: foreign MCP tools always, write/shell tools for read-only roles. */
+/**
+ * Tools from `init` the session must not have: any mcp__* tool not from Maestro's bridge (all roles), and for roles
+ * with an explicit `tools` allow-list, any other tool not on that list.
+ */
 export function unsafeTools(role: RoleConfig, tools: string[]): string[] {
-  return tools.filter(t =>
-    (t.startsWith('mcp__') && !t.startsWith(BRIDGE_TOOL_PREFIX)) || (role.tools !== undefined && READ_ONLY_FORBIDDEN.includes(t)));
+  return tools.filter(t => {
+    if (t.startsWith(BRIDGE_TOOL_PREFIX)) return false;
+    if (t.startsWith('mcp__')) return true;
+    return role.tools !== undefined && !role.tools.includes(t);
+  });
 }
 
 export function buildTaskPrompt(task: Task, upstream: { key: string; handoff: string }[]): string {
@@ -132,7 +140,11 @@ export function buildTaskPrompt(task: Task, upstream: { key: string; handoff: st
 
 // ---- runner ----------------------------------------------------------------
 
-type Phase = 'starting' | 'running' | 'finishing' | 'stopping' | 'ended';
+
+type Phase = 'starting' | 'running' | 'finishing' | 'failing' | 'stopping' | 'ended';
+/** Who started a turn: Maestro (prompt, reminder, resume nudge) or the user (`message()`). */
+type TurnOrigin = 'maestro' | 'user';
+const TERMINAL: readonly string[] = ['done', 'failed', 'cancelled'];
 
 interface Run {
   taskId: string;
@@ -144,14 +156,20 @@ interface Run {
   rowEnded: boolean;
   logPath: string | null;
   reminded: boolean;
+  /** Origins of the turns sent and not yet answered by a result, oldest first. */
+  turns: TurnOrigin[];
   lastAssistantText: string;
   lastError: string | null;
   finished: boolean;
+  /** Set synchronously by stop(); start/resume check it before spawning. */
+  stopRequested: boolean;
   /** Settles when start/resume finished spawning (or failed). */
   ready: Promise<void>;
   stopPromise: Promise<void> | null;
-  /** Settles when finishing (close + merge) is over. */
+  /** Settles when finishing (close + merge) is over. Never rejects. */
   finishing: Promise<void> | null;
+  /** Settles when failing (incl. stopping the process) is over. Never rejects. */
+  failing: Promise<void> | null;
 }
 
 export class TaskRunner extends EventEmitter {
@@ -168,6 +186,13 @@ export class TaskRunner extends EventEmitter {
   dispose(): void { this.deps.inbox.off('changed', this.onInboxChanged); }
 
   private get db(): Db { return this.deps.db; }
+
+  private warn(msg: string): void { console.error(`[maestro task-runner] ${msg}`); }
+
+  /** Runs fn; logs instead of throwing. */
+  private safe(label: string, fn: () => void): void {
+    try { fn(); } catch (e) { this.warn(`${label}: ${(e as Error)?.message ?? String(e)}`); }
+  }
 
   private task(id: string): Task {
     const t = tasks.get(this.db, id);
@@ -186,45 +211,41 @@ export class TaskRunner extends EventEmitter {
     if (prev && prev.phase !== 'ended') throw new Error(`Task ${task.taskKey} is already running`);
     const run: Run = {
       taskId: task.id, missionId: task.missionId, role: null, phase: 'starting', session: null, rowId: null,
-      rowEnded: false, logPath: null, reminded: false, lastAssistantText: '', lastError: null, finished: false,
-      ready: Promise.resolve(), stopPromise: null, finishing: null,
+      rowEnded: false, logPath: null, reminded: false, turns: [], lastAssistantText: '', lastError: null,
+      finished: false, stopRequested: false, ready: Promise.resolve(), stopPromise: null, finishing: null, failing: null,
     };
     this.runs.set(task.id, run);
     return run;
+  }
+
+  private holdReady(run: Run): () => void {
+    let release!: () => void;
+    run.ready = new Promise<void>(r => { release = r; });
+    return release;
   }
 
   async start(taskId: string, upstreamHandoffs: { key: string; handoff: string }[]): Promise<void> {
     const task = this.task(taskId);
     if (task.state !== 'ready') throw new Error(`Task ${task.taskKey} is ${task.state}, expected ready`);
     const run = this.newRun(task);
-    let release!: () => void;
-    run.ready = new Promise<void>(r => { release = r; });
+    const release = this.holdReady(run);
     try {
       this.transition(taskId, 'start');
       let role: RoleConfig;
       try { role = loadRole(task.agent as AgentRole, this.deps.rolesDir); }
       catch (e) { await this.fail(run, `unknown-agent: ${(e as Error).message}`); return; }
       run.role = role;
-      const slug = this.deps.missionBranch.slice(this.deps.missionBranch.lastIndexOf('/') + 1);
-      const branch = `maestro/${slug}/${task.taskKey}`;
-      if (branch.startsWith(`${this.deps.missionBranch}/`)) {
-        // git keeps refs as files: refs/heads/a/b cannot exist next to refs/heads/a/b/T1.
-        await this.fail(run, `worktree: task branch ${branch} clashes with mission branch ${this.deps.missionBranch}; `
-          + 'the mission branch must not be named maestro/<slug>');
-        return;
-      }
+      const branch = `${this.deps.missionBranch}--${task.taskKey}`;
       let dir: string;
-      try {
-        dir = worktreeDirFor(this.deps.projectRoot, task.missionId, task.taskKey);
-        if (!existsSync(dir)) await createTaskWorktree(this.deps.projectRoot, this.deps.missionBranch, branch, dir);
-      } catch (e) { await this.fail(run, `worktree: ${(e as Error).message}`); return; }
+      try { dir = await this.ensureWorktree(task, branch); }
+      catch (e) { await this.fail(run, `worktree: ${(e as Error).message}`); return; }
       tasks.setRuntime(this.db, taskId, { worktreePath: dir, branch });
-      if (run.phase !== 'starting') return; // stopped meanwhile
+      if (run.stopRequested) return; // stop() cancels it once ready settles
       this.spawn(run, role, dir);
-      run.session!.send(buildTaskPrompt(task, upstreamHandoffs));
+      this.sendOwn(run, buildTaskPrompt(task, upstreamHandoffs));
     } catch (e) {
       if (run.phase === 'starting' || run.phase === 'running') await this.fail(run, `start: ${(e as Error).message}`);
-      else throw e;
+      else this.warn(`start ${task.taskKey}: ${(e as Error).message}`);
     } finally {
       release();
     }
@@ -235,11 +256,10 @@ export class TaskRunner extends EventEmitter {
     let task = this.task(taskId);
     if (task.state !== 'running' && task.state !== 'needs_you') throw new Error(`Task ${task.taskKey} is ${task.state}, not running`);
     const run = this.newRun(task);
-    let release!: () => void;
-    run.ready = new Promise<void>(r => { release = r; });
+    const release = this.holdReady(run);
     try {
       // The old process is gone: its permission requests can never be answered.
-      for (const s of sessions.listLive(this.db)) if (s.taskId === taskId) sessions.end(this.db, s.id, 'failed');
+      this.endLiveRows(taskId, 'failed');
       this.deps.inbox.expireForTask(taskId);
       task = this.task(taskId);
       if (task.state === 'needs_you') task = this.transition(taskId, 'answered');
@@ -251,50 +271,88 @@ export class TaskRunner extends EventEmitter {
       try { role = loadRole(task.agent as AgentRole, this.deps.rolesDir); }
       catch (e) { await this.fail(run, `unknown-agent: ${(e as Error).message}`); return; }
       run.role = role;
+      if (run.stopRequested) return;
       this.spawn(run, role, task.worktreePath, task.sessionId);
-      run.session!.send(RESUME_MESSAGE);
+      this.sendOwn(run, RESUME_MESSAGE);
     } catch (e) {
       if (run.phase === 'starting' || run.phase === 'running') await this.fail(run, `resume: ${(e as Error).message}`);
-      else throw e;
+      else this.warn(`resume ${task.taskKey}: ${(e as Error).message}`);
     } finally {
       release();
     }
   }
 
-  /** Sends a user message to the task's live session. */
+  /** Sends a user message to the task's live session. Its turn never triggers a handoff reminder. */
   message(taskId: string, text: string): void {
     const run = this.runs.get(taskId);
     if (!run || run.phase !== 'running' || !run.session) throw new SessionClosed(`Task ${taskId} has no live session`);
     run.session.send(text);
+    run.turns.push('user');
   }
 
-  /** Spec §8.3: interrupt, close, kill; task `cancelled`; open inbox entries expire. Idempotent. */
+  private sendOwn(run: Run, text: string): void {
+    run.session!.send(text);
+    run.turns.push('maestro');
+  }
+
+  /**
+   * Spec §8.3: interrupt, close, kill; task `cancelled`; open inbox entries expire. Idempotent.
+   * Waits for an in-progress start, finish or fail first. Works without a run too (e.g. after a restart).
+   */
   stop(taskId: string): Promise<void> {
-    const run = this.runs.get(taskId);
+    let run = this.runs.get(taskId);
     if (run?.stopPromise) return run.stopPromise;
-    const p = this.runStop(taskId, run);
-    if (run) run.stopPromise = p;
-    return p;
+    if (!run) {
+      const task = tasks.get(this.db, taskId);
+      if (!task) return Promise.reject(new Error(`Task not found: ${taskId}`));
+      run = this.newRun(task);
+    }
+    run.stopRequested = true;
+    const r = run;
+    run.stopPromise = this.runStop(r).catch(e => this.warn(`stop ${taskId}: ${(e as Error)?.message ?? e}`));
+    return run.stopPromise;
   }
 
-  private async runStop(taskId: string, run: Run | undefined): Promise<void> {
-    if (run) {
-      await run.ready;
-      if (run.finishing) { await run.finishing; return; }
-      if (run.phase === 'ended') return;
-      run.phase = 'stopping';
+  private async runStop(run: Run): Promise<void> {
+    await run.ready;
+    if (run.finishing) await run.finishing;
+    if (run.failing) await run.failing;
+    if (run.phase === 'ended') return;
+    run.phase = 'stopping';
+    let cancelled = false;
+    try {
       if (run.session) {
-        try { await run.session.stop(this.deps.stopTimeoutMs ?? 5000); } catch { /* best effort */ }
+        try { await run.session.stop(this.deps.stopTimeoutMs ?? 5000); }
+        catch (e) { this.warn(`session stop: ${(e as Error).message}`); }
       }
-      this.endSessionRow(run, 'ended');
-    }
-    this.deps.inbox.expireForTask(taskId);
-    const t = tasks.get(this.db, taskId);
-    if (t && !['done', 'failed', 'cancelled'].includes(t.state)) this.transition(taskId, 'cancel');
-    if (run) {
+      this.safe('end session row', () => this.endSessionRow(run, 'ended'));
+      this.safe('end live session rows', () => this.endLiveRows(run.taskId, 'ended'));
+      this.safe('expire inbox', () => this.deps.inbox.expireForTask(run.taskId));
+      const t = tasks.get(this.db, run.taskId);
+      if (t && !TERMINAL.includes(t.state)) {
+        cancelled = true;
+        this.safe('cancel', () => this.transition(run.taskId, 'cancel'));
+      }
+    } finally {
       run.phase = 'ended';
-      this.finish(run, { taskId, outcome: 'cancelled' });
+      if (cancelled) this.finish(run, { taskId: run.taskId, outcome: 'cancelled' });
     }
+  }
+
+  // ---- worktree ------------------------------------------------------------
+
+  /** Reuses a registered worktree; replaces a stray folder; re-adds an existing branch (retry); else cuts a new branch. */
+  private async ensureWorktree(task: Task, branch: string): Promise<string> {
+    const root = this.deps.projectRoot;
+    const dir = worktreeDirFor(root, task.missionId, task.taskKey);
+    if (existsSync(dir)) {
+      if (await isRegisteredWorktree(root, dir)) return dir;
+      rmSync(dir, { recursive: true, force: true });
+    }
+    await pruneWorktrees(root);
+    if (await branchExists(root, branch)) await addExistingBranchWorktree(root, branch, dir);
+    else await createTaskWorktree(root, this.deps.missionBranch, branch, dir);
+    return dir;
   }
 
   // ---- session plumbing ----------------------------------------------------
@@ -311,16 +369,16 @@ export class TaskRunner extends EventEmitter {
     const command = this.deps.command ?? (this.deps.exe ? { exe: this.deps.exe, prefixArgs: [] } : undefined);
     const session = ClaudeSession.start({ args, cwd, logPath, env: this.deps.env, command });
     run.session = session;
+    session.on('event', (ev: StreamEvent) => this.onEvent(run, ev));
+    session.on('error', (e: Error) => { run.lastError = e.message; });
+    session.on('exit', (info: { code: number | null }) => this.onExit(run, info.code));
+    run.phase = 'running';
     const row = sessions.start(this.db, {
       missionId: run.missionId, taskId: run.taskId, role: role.name, claudeSessionId: resumeSessionId ?? null,
       pid: session.pid, logPath,
     });
     run.rowId = row.id;
     this.registry.set(row.id, session);
-    session.on('event', (ev: StreamEvent) => this.onEvent(run, ev));
-    session.on('error', (e: Error) => { run.lastError = e.message; });
-    session.on('exit', (info: { code: number | null }) => this.onExit(run, info.code));
-    run.phase = 'running';
   }
 
   private endSessionRow(run: Run, state: 'ended' | 'failed'): void {
@@ -330,11 +388,26 @@ export class TaskRunner extends EventEmitter {
     sessions.end(this.db, run.rowId, state);
   }
 
+  /** Ends every live session row of a task (rows of processes this runner does not hold, e.g. before a restart). */
+  private endLiveRows(taskId: string, state: 'ended' | 'failed'): void {
+    for (const s of sessions.listLive(this.db)) {
+      if (s.taskId !== taskId) continue;
+      this.registry.delete(s.id);
+      sessions.end(this.db, s.id, state);
+    }
+  }
+
+  /** fail() for fire-and-forget call sites. */
+  private failLater(run: Run, reason: string): void {
+    this.fail(run, reason).catch(e => this.warn(`fail: ${(e as Error)?.message ?? e}`));
+  }
+
   private onEvent(run: Run, ev: StreamEvent): void {
     try {
       this.handleEvent(run, ev);
     } catch (e) {
-      if (run.phase === 'running') void this.fail(run, `internal: ${(e as Error).message}`);
+      if (run.phase === 'running') this.failLater(run, `internal: ${(e as Error).message}`);
+      else this.warn(`event ${ev.kind}: ${(e as Error).message}`);
     }
   }
 
@@ -346,7 +419,7 @@ export class TaskRunner extends EventEmitter {
           if (run.rowId) sessions.setClaudeSessionId(this.db, run.rowId, ev.sessionId);
         }
         const bad = run.role ? unsafeTools(run.role, ev.tools) : [];
-        if (bad.length > 0 && run.phase === 'running') void this.fail(run, `unsafe-tools: ${bad.join(',')}`);
+        if (bad.length > 0 && run.phase === 'running') this.failLater(run, `unsafe-tools: ${bad.join(',')}`);
         return;
       }
       case 'assistant':
@@ -361,19 +434,18 @@ export class TaskRunner extends EventEmitter {
       case 'result': {
         tasks.addUsage(this.db, run.taskId, ev.usage);
         if (run.phase !== 'running') return; // e.g. the interrupt result of our own stop
-        if (!ev.ok) { void this.fail(run, ev.subtype || 'error'); return; }
+        const origin = run.turns.shift() ?? 'user';
+        if (!ev.ok) { this.failLater(run, ev.subtype || 'error'); return; }
         const handoff = lastHandoff(ev.text ?? '') ?? lastHandoff(run.lastAssistantText);
-        if (handoff !== null) {
-          run.finishing = this.complete(run, handoff).catch(e => this.fail(run, `internal: ${(e as Error).message}`));
-          return;
-        }
+        if (handoff !== null) { this.complete(run, handoff); return; }
+        if (origin !== 'maestro') return; // a reply to the user's message: no reminder, no failure
         if (!run.reminded) {
           run.reminded = true;
-          try { run.session?.send(HANDOFF_REMINDER); }
-          catch (e) { void this.fail(run, `no-handoff (${(e as Error).message})`); }
+          try { this.sendOwn(run, HANDOFF_REMINDER); }
+          catch (e) { this.failLater(run, `no-handoff (${(e as Error).message})`); }
           return;
         }
-        void this.fail(run, 'no-handoff');
+        this.failLater(run, 'no-handoff');
         return;
       }
       default:
@@ -386,7 +458,7 @@ export class TaskRunner extends EventEmitter {
     const tail = this.logTail(run);
     let reason = `crashed (exit code ${code ?? 'none'}${run.lastError ? `, ${run.lastError}` : ''})`;
     if (tail) reason += `\n${tail}`;
-    void this.fail(run, reason);
+    this.failLater(run, reason);
   }
 
   private logTail(run: Run): string {
@@ -400,46 +472,86 @@ export class TaskRunner extends EventEmitter {
 
   private inboxChanged(e: InboxChanged): void {
     if (!e.taskId) return;
-    const run = this.runs.get(e.taskId);
+    const taskId = e.taskId;
+    const run = this.runs.get(taskId);
     if (!run || run.phase !== 'running') return;
-    const open = inboxRepo.openCountForTask(this.db, e.taskId);
-    const t = tasks.get(this.db, e.taskId);
-    if (!t) return;
-    if (open > 0 && t.state === 'running') this.transition(e.taskId, 'needs_user');
-    else if (open === 0 && t.state === 'needs_you') this.transition(e.taskId, 'answered');
+    this.safe('needs-you', () => {
+      const open = inboxRepo.openCountForTask(this.db, taskId);
+      const t = tasks.get(this.db, taskId);
+      if (!t) return;
+      if (open > 0 && t.state === 'running') this.transition(taskId, 'needs_user');
+      else if (open === 0 && t.state === 'needs_you') this.transition(taskId, 'answered');
+    });
   }
 
   // ---- endings -------------------------------------------------------------
 
+  /** Emits 'finished' at most once per run; a throwing listener is logged, never propagated. */
   private finish(run: Run, f: TaskFinished): void {
     if (run.finished) return;
     run.finished = true;
-    this.emit('finished', f);
+    try { this.emit('finished', f); } catch (e) { this.warn(`finished listener: ${(e as Error)?.message ?? e}`); }
   }
 
-  /** Expires leftover entries; a task in needs_you returns to running so that `complete` is legal. */
-  private settleInbox(run: Run): void {
-    this.deps.inbox.expireForTask(run.taskId);
-    if (this.task(run.taskId).state === 'needs_you') this.transition(run.taskId, 'answered');
+  /** Fails the run once. The work runs on a later microtask, so `run.failing` is set before any listener fires. */
+  private fail(run: Run, reason: string): Promise<void> {
+    if (run.failing) return run.failing;
+    if (run.phase !== 'starting' && run.phase !== 'running') return Promise.resolve();
+    run.phase = 'failing';
+    run.failing = Promise.resolve()
+      .then(async () => {
+        try { await this.failSteps(run, reason); }
+        finally {
+          run.phase = 'ended';
+          this.finish(run, { taskId: run.taskId, outcome: 'failed', reason });
+        }
+      })
+      .catch(e => this.warn(`fail: ${(e as Error)?.message ?? e}`));
+    return run.failing;
   }
 
-  private async fail(run: Run, reason: string): Promise<void> {
-    if (run.phase === 'ended' || run.phase === 'stopping') return;
-    run.phase = 'ended';
-    tasks.setRuntime(this.db, run.taskId, { failureReason: reason });
-    this.deps.inbox.expireForTask(run.taskId);
-    const t = this.task(run.taskId);
-    if (t.state === 'running' || t.state === 'needs_you') this.transition(run.taskId, 'fail');
+  /** Each step is guarded, so this never throws. */
+  private async failSteps(run: Run, reason: string): Promise<void> {
+    this.safe('failure reason', () => tasks.setRuntime(this.db, run.taskId, { failureReason: reason }));
+    this.safe('expire inbox', () => this.deps.inbox.expireForTask(run.taskId));
+    this.safe('fail transition', () => {
+      const t = this.task(run.taskId);
+      if (t.state === 'running' || t.state === 'needs_you') this.transition(run.taskId, 'fail');
+    });
     if (run.session) {
-      try { await run.session.stop(this.deps.stopTimeoutMs ?? 5000); } catch { /* best effort */ }
+      try { await run.session.stop(this.deps.stopTimeoutMs ?? 5000); }
+      catch (e) { this.warn(`session stop: ${(e as Error).message}`); }
     }
-    this.endSessionRow(run, 'failed');
-    this.finish(run, { taskId: run.taskId, outcome: 'failed', reason });
+    this.safe('end session row', () => this.endSessionRow(run, 'failed'));
   }
 
   /** Spec §8.1: handoff found. Close stdin, wait for exit, commit leftovers, merge --no-ff into the mission branch. */
-  private async complete(run: Run, handoff: string): Promise<void> {
+  private complete(run: Run, handoff: string): void {
     run.phase = 'finishing';
+    run.finishing = Promise.resolve()
+      .then(async () => {
+        let f: TaskFinished;
+        try {
+          const reason = await this.completeSteps(run, handoff);
+          f = reason === null ? { taskId: run.taskId, outcome: 'done' } : { taskId: run.taskId, outcome: 'failed', reason };
+        } catch (e) {
+          // A throw after the task reached done (e.g. a 'state' listener) must not turn it into a failure.
+          f = tasks.get(this.db, run.taskId)?.state === 'done'
+            ? { taskId: run.taskId, outcome: 'done' }
+            : { taskId: run.taskId, outcome: 'failed', reason: `internal: ${(e as Error)?.message ?? e}` };
+          if (f.outcome === 'done') this.warn(`after completion: ${(e as Error)?.message ?? e}`);
+        }
+        try { if (f.outcome === 'failed') await this.failSteps(run, f.reason!); }
+        finally {
+          run.phase = 'ended';
+          this.finish(run, f);
+        }
+      })
+      .catch(e => this.warn(`complete: ${(e as Error)?.message ?? e}`));
+  }
+
+  /** Returns null when merged and done, or a failure reason. */
+  private async completeSteps(run: Run, handoff: string): Promise<string | null> {
     tasks.setRuntime(this.db, run.taskId, { handoffMd: handoff });
     const session = run.session!;
     const exited = new Promise<boolean>(res => {
@@ -450,26 +562,26 @@ export class TaskRunner extends EventEmitter {
     let closed = false;
     try { session.close(); closed = true; } catch { /* busy (a user message raced in): stop instead */ }
     if (!closed || !(await exited)) {
-      try { await session.stop(this.deps.stopTimeoutMs ?? 5000); } catch { /* best effort */ }
+      try { await session.stop(this.deps.stopTimeoutMs ?? 5000); }
+      catch (e) { this.warn(`session stop: ${(e as Error).message}`); }
     }
     this.endSessionRow(run, 'ended');
 
     const task = this.task(run.taskId);
-    const failAfterClose = (reason: string): Promise<void> => this.fail(run, reason);
-    try {
-      await this.commitLeftovers(task);
-    } catch (e) { await failAfterClose(`commit: ${(e as Error).message}`); return; }
+    try { await this.commitLeftovers(task); }
+    catch (e) { return `commit: ${(e as Error).message}`; }
     let merged: Awaited<ReturnType<typeof mergeTaskBranch>>;
     try {
       merged = await mergeTaskBranch(this.deps.projectRoot, this.deps.missionBranch, task.branch!,
         `Merge ${task.taskKey}: ${task.title}`, task.missionId);
-    } catch (e) { await failAfterClose(`merge: ${(e as Error).message}`); return; }
-    if (!merged.ok) { await failAfterClose(`conflict: ${merged.files.join(', ')}`); return; }
+    } catch (e) { return `merge: ${(e as Error).message}`; }
+    if (!merged.ok) return `conflict: ${merged.files.join(', ')}`;
     events.append(this.db, { missionId: task.missionId, taskId: task.id, type: 'merged', data: { commit: merged.commit, branch: task.branch } });
-    this.settleInbox(run);
+    // Leftover entries expire; a task in needs_you returns to running so that `complete` is legal.
+    this.deps.inbox.expireForTask(run.taskId);
+    if (this.task(run.taskId).state === 'needs_you') this.transition(run.taskId, 'answered');
     this.transition(run.taskId, 'complete');
-    run.phase = 'ended';
-    this.finish(run, { taskId: run.taskId, outcome: 'done' });
+    return null;
   }
 
   /** Commits anything the agent left uncommitted in its worktree, so the merge carries all of its work. */
@@ -479,7 +591,6 @@ export class TaskRunner extends EventEmitter {
     const { stdout } = await git(['status', '--porcelain']);
     if (stdout.trim() === '') return;
     await git(['add', '-A']);
-    await git(['commit', '-m', `chore(${task.taskKey}): uncommitted changes left by the agent`]);
+    await git(['commit', '-m', `maestro: uncommitted changes from ${task.taskKey}`]);
   }
 }
-
