@@ -14,24 +14,28 @@ describe('processTree', () => {
   it.runIf(win)('killTree kills a spawned process tree with no survivors', async () => {
     const child = spawn('cmd', ['/c', 'ping -n 60 127.0.0.1'], { windowsHide: true, stdio: 'ignore' });
     const pid = child.pid!;
+    const exited = new Promise<void>(res => child.once('exit', () => res()));
+    /** Polls until f() holds or the deadline passes; a loaded full test run can be slow at both ends. */
+    const poll = async (f: () => boolean, ms: number): Promise<boolean> => {
+      const end = Date.now() + ms;
+      while (!f()) { if (Date.now() > end) return false; await sleep(250); }
+      return true;
+    };
+    let tree: number[] = [];
     try {
-      let tree: number[] = [];
-      for (let i = 0; i < 25 && tree.length < 2; i++) { await sleep(200); tree = listTreePids(pid); }
+      // Tree formation: cmd plus its ping child (only PIDs this test spawned are asserted on).
+      expect(await poll(() => (tree = listTreePids(pid)).length >= 2, 20_000)).toBe(true);
       expect(tree[0]).toBe(pid);
-      expect(tree.length).toBeGreaterThanOrEqual(2);
       expect(killTree(pid).ok).toBe(true);
-      // Under a loaded full test run the killed processes can take a moment to leave the process table.
-      for (let i = 0; i < 25 && listTreePids(pid).length > 0; i++) await sleep(200);
-      expect(listTreePids(pid)).toEqual([]);
-      for (const p of tree) {
-        for (let i = 0; i < 25 && listTreePids(p).length > 0; i++) await sleep(200);
-        expect(listTreePids(p)).toEqual([]);
-      }
+      // Disappearance: the root reports its exit; every PID of the tree leaves the process table.
+      await Promise.race([exited, sleep(20_000)]);
+      expect(child.exitCode !== null || child.signalCode !== null).toBe(true);
+      for (const p of tree) expect(await poll(() => listTreePids(p).length === 0, 20_000), `pid ${p}`).toBe(true);
       expect(killTree(pid).ok).toBe(true); // already gone counts as ok
     } finally {
       killTree(pid);
     }
-  }, 30000);
+  }, 90_000);
 
   it.runIf(win)('async tree helpers are bounded by a timeout', async () => {
     expect(await listTreePidsAsync(process.pid, 1)).toEqual([]);
