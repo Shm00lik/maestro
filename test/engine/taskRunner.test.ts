@@ -217,12 +217,15 @@ describe('TaskRunner', () => {
     expect(argv.join(' ')).toContain(`--mcp-config ${join(dir, `bridge-${c.task.id}.json`)}`);
   }, 15000);
 
-  it('a task with nothing left over lists no auto-committed files', async () => {
+  it('a task with no commits skips the merge and emits no-changes', async () => {
     const c = setup([INIT(), USER, RESULT(HANDOFF), STDIN_CLOSE]);
+    const before = git(root, 'rev-parse', MISSION_BRANCH);
     await c.runner.start(c.task.id, []);
     expect((await finished(c)).outcome).toBe('done');
-    const merged = events.list(c.db, c.missionId, { taskId: c.task.id }).find(e => e.type === 'merged');
-    expect(merged?.data.autoCommitted).toEqual([]);
+    const evs = events.list(c.db, c.missionId, { taskId: c.task.id });
+    expect(evs.some(e => e.type === 'merged')).toBe(false);
+    expect(evs.some(e => e.type === 'no-changes')).toBe(true);
+    expect(git(root, 'rev-parse', MISSION_BRANCH)).toBe(before);
   }, 15000);
 
   it('a leftover commit that hangs is bounded by the commit timeout', async () => {

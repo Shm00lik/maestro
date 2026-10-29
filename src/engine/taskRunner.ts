@@ -14,7 +14,7 @@ import { AGENT_ROLES, type AgentRole } from '../core/types.js';
 import { ClaudeSession, SessionClosed, type SessionOptions } from '../claude/session.js';
 import { lastHandoff, type StreamEvent } from '../claude/protocol.js';
 import {
-  addExistingBranchWorktree, branchExists, createTaskWorktree, isRegisteredWorktree, mergeTaskBranch, pruneWorktrees,
+  addExistingBranchWorktree, branchCommits, branchExists, createTaskWorktree, isRegisteredWorktree, mergeTaskBranch, pruneWorktrees,
   withRepoLock, worktreeDirFor, worktreeHead,
 } from '../git/worktrees.js';
 import type { InboxChanged, InboxService, SessionRegistry } from './inbox.js';
@@ -736,13 +736,17 @@ export class TaskRunner extends EventEmitter {
     let autoCommitted: string[];
     try { autoCommitted = await this.commitLeftovers(task); }
     catch (e) { return `commit: ${(e as Error).message}`; }
-    let merged: Awaited<ReturnType<typeof mergeTaskBranch>>;
+    let merged: Awaited<ReturnType<typeof mergeTaskBranch>> | null = null;
     try {
-      merged = await mergeTaskBranch(this.deps.projectRoot, this.deps.missionBranch, task.branch!,
-        `Merge ${task.taskKey}: ${task.title}`, task.missionId);
+      // A read-only task has no commits beyond the mission branch: nothing to merge (no empty merge commit).
+      if ((await branchCommits(this.deps.projectRoot, this.deps.missionBranch, task.branch!)).length > 0) {
+        merged = await mergeTaskBranch(this.deps.projectRoot, this.deps.missionBranch, task.branch!,
+          `Merge ${task.taskKey}: ${task.title}`, task.missionId);
+      }
     } catch (e) { return `merge: ${(e as Error).message}`; }
-    if (!merged.ok) return `conflict: ${merged.files.join(', ')}`;
-    events.append(this.db, { missionId: task.missionId, taskId: task.id, type: 'merged', data: { commit: merged.commit, branch: task.branch, autoCommitted } });
+    if (merged && !merged.ok) return `conflict: ${merged.files.join(', ')}`;
+    if (merged) events.append(this.db, { missionId: task.missionId, taskId: task.id, type: 'merged', data: { commit: merged.commit, branch: task.branch, autoCommitted } });
+    else events.append(this.db, { missionId: task.missionId, taskId: task.id, type: 'no-changes', data: { branch: task.branch } });
     // Leftover entries expire; a task in needs_you returns to running so that `complete` is legal.
     this.deps.inbox.expireForTask(run.taskId);
     if (this.task(run.taskId).state === 'needs_you') this.transition(run.taskId, 'answered');
