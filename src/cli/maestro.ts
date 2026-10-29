@@ -14,6 +14,7 @@ import { MissionEngine } from '../engine/missionEngine.js';
 import { resolveClaudeCommand } from '../claude/exe.js';
 import { LineReader } from './lineReader.js';
 import { Prompter } from './prompter.js';
+import { createTerminalOut } from './terminalOut.js';
 import { formatEvent, tokenLine } from './format.js';
 import { loadTestHooks } from './testConductor.js';
 
@@ -70,14 +71,10 @@ function ensureProject(db: Db, path: string): string {
   return found ? found.id : projects.add(db, { name: basename(path), path }).id;
 }
 
-/** A prompt waiting for its answer: lines printed meanwhile go above it, and the prompt is shown again. */
-let openPrompt: string | null = null;
-const out = (line: string): void => {
-  if (openPrompt === null) { process.stdout.write(`${line}\n`); return; }
-  process.stdout.write(`\n${line}\n${openPrompt}`);
-};
-const showPrompt = (text: string): void => { openPrompt = text; process.stdout.write(text); };
-const promptDone = (): void => { openPrompt = null; };
+/** A prompt waiting for its answer: lines printed meanwhile go above it (see terminalOut). */
+const term = createTerminalOut(s => { process.stdout.write(s); });
+const { out, promptDone } = term;
+const showPrompt = term.showPrompt;
 
 export async function main(argv: string[], env: NodeJS.ProcessEnv = process.env): Promise<number> {
   let args: RunArgs;
