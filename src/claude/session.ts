@@ -1,6 +1,6 @@
 // One long-lived claude.exe stream-json process. Stopping is only via stdin interrupt / stdin end / killTree
 // (never child.kill() or SIGINT: they orphan grandchildren on Windows).
-import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
+import { spawn, type ChildProcessWithoutNullStreams, type SpawnOptions } from 'node:child_process';
 import { EventEmitter } from 'node:events';
 import { randomUUID } from 'node:crypto';
 import { appendFileSync, mkdirSync } from 'node:fs';
@@ -34,6 +34,22 @@ export interface SessionOptions {
 }
 export type SessionStatus = 'starting' | 'busy' | 'idle' | 'exited';
 export interface ExitInfo { code: number | null; killed: boolean }
+
+/**
+ * Spawn options for claude.exe. `detached`: its own process group (on Windows a new, hidden console), so the Ctrl+C
+ * a user presses in Maestro's terminal reaches Maestro only, never claude and its tool children; Maestro stops them
+ * itself (stdin, interrupt, taskkill by PID). The child is never unref'd: Maestro keeps waiting for it.
+ */
+export function sessionSpawnOptions(cwd: string, env?: Record<string, string>): SpawnOptions {
+  return {
+    cwd,
+    env: { ...process.env, MCP_TOOL_TIMEOUT: '86400000', ...env },
+    shell: false,
+    windowsHide: true,
+    detached: true,
+    stdio: ['pipe', 'pipe', 'pipe'],
+  };
+}
 
 export class SessionClosed extends Error {
   constructor(message = 'Claude session is closed') { super(message); this.name = 'SessionClosed'; }
@@ -80,13 +96,8 @@ export class ClaudeSession extends EventEmitter {
     this.snapshotWaitMs = opts.snapshotWaitMs ?? ASYNC_TIMEOUT_MS;
     mkdirSync(dirname(opts.logPath), { recursive: true });
     const command = opts.command ?? resolveClaudeCommand();
-    this.child = spawn(command.exe, [...command.prefixArgs, ...BASE_ARGS, ...opts.args], {
-      cwd: opts.cwd,
-      env: { ...process.env, MCP_TOOL_TIMEOUT: '86400000', ...opts.env },
-      shell: false,
-      windowsHide: true,
-      stdio: ['pipe', 'pipe', 'pipe'],
-    });
+    this.child = spawn(command.exe, [...command.prefixArgs, ...BASE_ARGS, ...opts.args],
+      sessionSpawnOptions(opts.cwd, opts.env)) as ChildProcessWithoutNullStreams;
     this.pid = this.child.pid ?? -1;
 
     this.child.stdout.setEncoding('utf8');

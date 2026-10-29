@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { BASE_ARGS, ClaudeSession, SessionClosed, type SessionOptions } from '../../src/claude/session.js';
+import { BASE_ARGS, ClaudeSession, SessionClosed, sessionSpawnOptions, type SessionOptions } from '../../src/claude/session.js';
 import { killPidAsync, killTree, killTreeAsync } from '../../src/claude/processTree.js';
 import type { StreamEvent } from '../../src/claude/protocol.js';
 
@@ -348,4 +348,25 @@ describe('ClaudeSession', () => {
     priv.child.stdin.emit('error', new Error('EPIPE 2'));
     expect(errs).toHaveLength(1);
   }, 10000);
+});
+
+describe('ClaudeSession process group', () => {
+  it('spawns claude detached (own process group / console, hidden), with piped stdio and no unref', () => {
+    const o = sessionSpawnOptions('C:\work', { A: '1' });
+    expect(o.detached).toBe(true); // Ctrl+C in the Maestro console does not reach claude and its children
+    expect(o.windowsHide).toBe(true);
+    expect(o.shell).toBe(false);
+    expect(o.stdio).toEqual(['pipe', 'pipe', 'pipe']);
+    expect(o.cwd).toBe('C:\work');
+    expect(o.env).toMatchObject({ A: '1', MCP_TOOL_TIMEOUT: '86400000' });
+  });
+
+  it('a detached session still streams over its pipes and ends on stdin close', async () => {
+    const s = start({ steps: [{ emit: INIT }, { waitFor: 'stdin-close' }] });
+    await new Promise<void>(res => s.on('event', (e: StreamEvent) => { if (e.kind === 'init') res(); }));
+    const exited = new Promise<void>(res => s.once('exit', () => res()));
+    s.close();
+    await exited;
+    expect(s.exitConfirmed).toBe(true);
+  }, 15000);
 });
