@@ -145,6 +145,22 @@ describe('isSafeTaskCommand', () => {
     expect(isSafeTaskCommand(cmd, { ...FULL, scope: 'reviewer' })).toBe(false);
   });
 
+  it.each([
+    'git diff --submodule=diff', 'git diff --submodule', 'git show --submodule=diff', 'git log -p --submodule',
+    'git log -p --submodule=log', 'git diff --sub=diff', 'git diff --subm', 'git show --su=diff', 'git status --s',
+    'git add sub/.git/config', 'git add .git', 'git add .GIT/hooks', 'git add sub/.Git', 'git add a/.git./x',
+    'git add sub/.git /x', 'git add src && git add sub/.git/HEAD',
+  ])('rejects submodule diff options and .git paths: %j', cmd => {
+    expect(isSafeTaskCommand(cmd, FULL)).toBe(false);
+  });
+
+  it('still allows look-alikes that are not submodule options or .git paths', () => {
+    for (const cmd of ['git diff --stat', 'git status --short', 'git diff --ignore-submodules', 'git add .gitignore',
+      'git add src/.github/x.yml', 'git add sub', 'git add a.git/b']) {
+      expect(isSafeTaskCommand(cmd, FULL), cmd).toBe(true);
+    }
+  });
+
   it('the scope follows the role tools: no edit tools means the reviewer scope', () => {
     expect(safeScopeFor(['Read', 'Glob', 'Grep', 'Bash'])).toBe('reviewer');
     expect(safeScopeFor(['Read', 'Glob', 'Grep'])).toBe('reviewer');

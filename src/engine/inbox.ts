@@ -40,8 +40,26 @@ export interface TaskRequestContext {
 
 /** The only input keys a safe shell request may carry (e.g. never dangerouslyDisableSandbox). */
 const SAFE_INPUT_KEYS: ReadonlySet<string> = new Set(['command', 'description', 'timeout', 'run_in_background']);
-/** Commands that change the shell's directory (Bash and PowerShell, with aliases). */
-const CHANGES_DIR = /(^|[\s;&|(){}`])(cd|chdir|pushd|popd|set-location|push-location|pop-location|sl)(?=$|[\s;&|(){}`])/i;
+/**
+ * Commands that change (or may change) the shell's directory, in Bash and PowerShell: cd and its aliases (also
+ * PowerShell's `cd..`), anything that evaluates a string (eval, iex, Invoke-Expression) and sourcing a script.
+ */
+const CHANGES_DIR =
+  /(^|[\s;&|(){}`'"])(cd|chdir|pushd|popd|set-location|push-location|pop-location|sl|eval|iex|invoke-expression|source)(?=$|[\s;&|(){}`'".\\/])/i;
+/** `. ./script` (source) in command position. */
+const SOURCES_SCRIPT = /(^|[;&|(){}`])\s*\.\s/;
+/** Characters that end or escape a single-quoted string in Bash or PowerShell (incl. its smart quotes), or controls. */
+const UNQUOTABLE_PATH = /['‘’‚‛\x00-\x1f]/;
+
+/**
+ * The auto-allowed command, made to start in the task's worktree whatever the session's cwd is now (spec §9).
+ * Null when the path cannot be single-quoted safely.
+ */
+export function pinToWorktree(toolName: string, worktree: string, command: string): string | null {
+  if (UNQUOTABLE_PATH.test(worktree)) return null;
+  if (toolName === 'PowerShell') return `Set-Location -LiteralPath '${worktree}'; ${command}`;
+  return `cd -- '${worktree.replace(/\\/g, '/')}' && ${command}`;
+}
 
 export class InboxService extends EventEmitter {
   private pending = new Map<string, Pending>();
@@ -68,8 +86,8 @@ export class InboxService extends EventEmitter {
     if (taskId !== null) {
       const safe = ctx?.safeScope ? this.safeCommand(missionId, taskId, sessionRowId, ev, ctx.safeScope) : null;
       if (safe !== null) {
-        events.append(this.db, { missionId, taskId, type: 'auto-allowed', data: { taskId, command: safe } });
-        this.allow(sessionRowId, ev);
+        events.append(this.db, { missionId, taskId, type: 'auto-allowed', data: { taskId, command: safe.command } });
+        this.allow(sessionRowId, ev, safe.input);
         this.emit('auto-allowed', { missionId, taskId } satisfies AutoAllowed);
         return;
       }
@@ -86,10 +104,10 @@ export class InboxService extends EventEmitter {
     this.changed(missionId, taskId);
   }
 
-  /** Allows a request without an inbox entry, exactly as a user's "allow once" would. */
-  private allow(sessionRowId: string, ev: PermissionRequestEvent): void {
+  /** Allows a request without an inbox entry, as a user's "allow once" would (with `input` as updatedInput). */
+  private allow(sessionRowId: string, ev: PermissionRequestEvent, input: unknown = ev.input): void {
     try {
-      this.sessions.get(sessionRowId)?.answerPermission(ev.requestId, { allow: true, input: ev.input });
+      this.sessions.get(sessionRowId)?.answerPermission(ev.requestId, { allow: true, input });
     } catch (e) {
       if (!(e instanceof SessionClosed)) throw e;
     }
@@ -99,17 +117,18 @@ export class InboxService extends EventEmitter {
   private noteDirChange(sessionRowId: string, toolName: string, input: unknown): void {
     if (!SHELL_TOOLS.has(toolName)) return;
     const cmd = typeof input === 'object' && input !== null ? (input as Record<string, unknown>).command : undefined;
-    if (typeof cmd === 'string' && CHANGES_DIR.test(cmd)) this.movedSessions.add(sessionRowId);
+    if (typeof cmd === 'string' && (CHANGES_DIR.test(cmd) || SOURCES_SCRIPT.test(cmd))) this.movedSessions.add(sessionRowId);
   }
 
   /**
    * Spec §9: the command of a Bash/PowerShell request from a task session when it is on the safe list for the
    * session's scope and the mission has auto-allow on (settings.autoAllow === true, set by the engine); otherwise
    * null. Test runs also need settings.autoRunTests === true; npm/pnpm/yarn test also a package.json in the worktree.
+   * `input` is what goes back as updatedInput: the same input with the command pinned to the worktree.
    */
   private safeCommand(
     missionId: string, taskId: string, sessionRowId: string, ev: PermissionRequestEvent, scope: SafeScope,
-  ): string | null {
+  ): { command: string; input: Record<string, unknown> } | null {
     if (!SHELL_TOOLS.has(ev.toolName) || this.movedSessions.has(sessionRowId)) return null;
     const settings = missions.get(this.db, missionId)?.settings as Record<string, unknown> | null | undefined;
     if (typeof settings !== 'object' || settings === null || settings.autoAllow !== true) return null;
@@ -122,7 +141,9 @@ export class InboxService extends EventEmitter {
     const ok = typeof cmd === 'string' && isSafeTaskCommand(cmd, {
       scope, runTests: settings.autoRunTests === true, packageJson: existsSync(join(task.worktreePath, 'package.json')),
     });
-    return ok ? cmd : null;
+    if (!ok) return null;
+    const pinned = pinToWorktree(ev.toolName, task.worktreePath, cmd);
+    return pinned === null ? null : { command: cmd, input: { ...input, command: pinned } };
   }
 
   /** The CLI cancelled a pending request (e.g. after an interrupt): expire the entry, write nothing to the session. */

@@ -19,7 +19,14 @@ export function ensureEmptyHooksDir(dir: string = EMPTY_HOOKS_DIR): string {
 
 /** The config pairs Maestro forces. */
 export function safeGitConfig(hooksDir: string = ensureEmptyHooksDir()): [string, string][] {
-  return [['core.hooksPath', hooksDir], ['core.fsmonitor', 'false']];
+  return [
+    ['core.hooksPath', hooksDir],
+    ['core.fsmonitor', 'false'],
+    // No inline submodule diffs or recursion: they run git inside a nested repo, under that repo's own config
+    // (e.g. a planted diff.external).
+    ['diff.submodule', 'short'],
+    ['submodule.recurse', 'false'],
+  ];
 }
 
 /**

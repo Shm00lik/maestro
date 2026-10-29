@@ -5,7 +5,7 @@ import { join } from 'node:path';
 import { openDb } from '../../src/store/db.js';
 import { projects, missions, planVersions, tasks, inbox, permissionRules, Expired, AlreadyAnswered } from '../../src/store/repos.js';
 import { buildGraph } from '../../src/core/plan/graph.js';
-import { InboxService } from '../../src/engine/inbox.js';
+import { InboxService, pinToWorktree } from '../../src/engine/inbox.js';
 import { SessionClosed } from '../../src/claude/session.js';
 
 type Call = { requestId: string; decision: any };
@@ -240,34 +240,66 @@ describe('InboxService', () => {
     const REVIEWER = { safeScope: 'reviewer' as const };
 
     /** setup() plus a real worktree folder for the task (with a package.json unless told otherwise). */
-    function safeSetup(o: { settings?: unknown; packageJson?: boolean; session?: ReturnType<typeof fakeSession> } = {}) {
+    function safeSetup(o: {
+      settings?: unknown; packageJson?: boolean; session?: ReturnType<typeof fakeSession>; wtPrefix?: string;
+    } = {}) {
       const s = setup(o.session ?? fakeSession(), { settings: o.settings ?? { autoAllow: true } });
-      const wt = mkdtempSync(join(tmpdir(), 'maestro-inbox-wt-'));
+      const wt = mkdtempSync(join(tmpdir(), o.wtPrefix ?? 'maestro-inbox-wt-'));
       if (o.packageJson !== false) writeFileSync(join(wt, 'package.json'), '{}');
       tasks.setRuntime(s.db, s.t.id, { worktreePath: wt });
-      return s;
+      return { ...s, wt };
     }
     const bash = (requestId: string, command: string, extra: Record<string, unknown> = {}) =>
       req(requestId, 'Bash', { command, ...extra });
+    /** The command Maestro sends back for an auto-allowed Bash command: pinned to the worktree. */
+    const pinnedBash = (wt: string, command: string) => `cd -- '${wt.split(String.fromCharCode(92)).join('/')}' && ${command}`;
 
-    it('auto-allows a safe task command, answers like the human path and records an auto-allowed event', () => {
+    it('auto-allows a safe task command pinned to the worktree and records an auto-allowed event', () => {
       const s = safeSetup();
       const auto: any[] = [];
       s.svc.on('auto-allowed', e => auto.push(e));
       const input = { command: 'mkdir -p src test', description: 'make dirs' };
       s.svc.onPermissionRequest(s.m.id, s.t.id, 's1', req('r1', 'Bash', input), TASK);
-      expect(s.session.calls).toEqual([{ requestId: 'r1', decision: { allow: true, input } }]);
+      expect(s.session.calls).toEqual([{
+        requestId: 'r1', decision: { allow: true, input: { command: pinnedBash(s.wt, 'mkdir -p src test'), description: 'make dirs' } },
+      }]);
       expect(inbox.listOpen(s.db, Date.now())).toHaveLength(0);
       expect(autoEvents(s.db)).toEqual([{ taskId: s.t.id, data: { taskId: s.t.id, command: 'mkdir -p src test' } }]);
       expect(auto).toEqual([{ missionId: s.m.id, taskId: s.t.id }]);
       expect(s.changed).toHaveLength(0);
     });
 
-    it('covers PowerShell too', () => {
+    it('covers PowerShell too, pinned with Set-Location -LiteralPath', () => {
       const s = safeSetup();
-      s.svc.onPermissionRequest(s.m.id, s.t.id, 's1', req('r1', 'PowerShell', { command: 'git status' }), TASK);
-      expect(s.session.calls).toHaveLength(1);
+      s.svc.onPermissionRequest(s.m.id, s.t.id, 's1', req('r1', 'PowerShell', { command: 'git status', timeout: 5 }), TASK);
+      expect(s.session.calls).toEqual([{
+        requestId: 'r1', decision: { allow: true, input: { command: `Set-Location -LiteralPath '${s.wt}'; git status`, timeout: 5 } },
+      }]);
       expect(inbox.listOpen(s.db, Date.now())).toHaveLength(0);
+    });
+
+    it('a worktree path with a single quote gets no auto-allow', () => {
+      const s = safeSetup({ wtPrefix: "maestro-it's-" });
+      s.svc.onPermissionRequest(s.m.id, s.t.id, 's1', bash('r1', 'git status'), TASK);
+      expect(s.session.calls).toHaveLength(0);
+      expect(inbox.listOpen(s.db, Date.now()).map(e => e.requestId)).toEqual(['r1']);
+    });
+
+    it('pinToWorktree quotes the path and refuses quote characters and controls', () => {
+      expect(pinToWorktree('Bash', 'C:\\Users\\me\\wt', 'git status')).toBe("cd -- 'C:/Users/me/wt' && git status");
+      expect(pinToWorktree('PowerShell', 'C:\\Users\\me\\wt', 'git status')).toBe("Set-Location -LiteralPath 'C:\\Users\\me\\wt'; git status");
+      expect(pinToWorktree('Bash', 'C:\\a b $x;`(y)', 'ls')).toBe("cd -- 'C:/a b $x;`(y)' && ls");
+      for (const bad of ["C:\\it's", 'C:\\it\u2019s', 'C:\\it\u2018s', 'C:\\a\nb', 'C:\\a\u201bb']) {
+        expect(pinToWorktree('Bash', bad, 'ls')).toBeNull();
+        expect(pinToWorktree('PowerShell', bad, 'ls')).toBeNull();
+      }
+    });
+
+    it('a user "allow once" still sends the input unchanged', () => {
+      const s = safeSetup();
+      s.svc.onPermissionRequest(s.m.id, s.t.id, 's1', bash('r1', 'npm install'), TASK);
+      s.svc.answerPermission(inbox.listOpen(s.db, Date.now())[0].id, { allow: true });
+      expect(s.session.calls[0].decision).toEqual({ allow: true, input: { command: 'npm install' } });
     });
 
     it('an unsafe command still goes to the inbox', () => {
@@ -347,7 +379,11 @@ describe('InboxService', () => {
       expect(inbox.listOpen(s.db, Date.now()).map(e => e.requestId)).toEqual(['r2', 'r3', 'r4']);
     });
 
-    it.each(['cd ..', 'cd /tmp && ls', 'Set-Location C:\\', 'pushd src', 'chdir x', 'sl ..', 'git status; cd x'])(
+    it.each([
+      'cd ..', 'cd /tmp && ls', 'Set-Location C:\\', 'pushd src', 'chdir x', 'sl ..', 'git status; cd x',
+      'cd..', 'cd../x', 'CD..', 'eval "cd .."', 'iex "cd .."', 'Invoke-Expression $c', 'source ./env.sh', '. ./x.sh',
+      'npm test; . ./x.sh', 'x && . x.sh', '.\tenv.sh',
+    ])(
       'after the user allows %j, that session gets no more auto-allows (other sessions still do)', cmd => {
         const s = safeSetup();
         s.reg.set('s2', s.session);
@@ -366,8 +402,11 @@ describe('InboxService', () => {
       s.svc.answerPermission(inbox.listOpen(s.db, Date.now())[0].id, { allow: false });
       s.svc.onPermissionRequest(s.m.id, s.t.id, 's1', bash('r2', 'npm install abcd'), TASK);
       s.svc.answerPermission(inbox.listOpen(s.db, Date.now())[0].id, { allow: true });
-      s.svc.onPermissionRequest(s.m.id, s.t.id, 's1', bash('r3', 'git status'), TASK);
-      expect(s.session.calls.map(c => c.requestId)).toEqual(['r1', 'r2', 'r3']);
+      // '.' only counts as a command (source), not as an argument.
+      s.svc.onPermissionRequest(s.m.id, s.t.id, 's1', bash('r3', 'npx prettier --check . ./src'), TASK);
+      s.svc.answerPermission(inbox.listOpen(s.db, Date.now())[0].id, { allow: true });
+      s.svc.onPermissionRequest(s.m.id, s.t.id, 's1', bash('r4', 'git status'), TASK);
+      expect(s.session.calls.map(c => c.requestId)).toEqual(['r1', 'r2', 'r3', 'r4']);
     });
 
     it('an always-allow rule that covers cd also stops auto-allow for the session', () => {

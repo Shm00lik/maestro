@@ -230,6 +230,9 @@ cd $scratch; npm test; cd D:\Desktop\Programming\maestro
 6. The outcome (`merged` or `kept`), the `git log --graph` output, and whether `npm test` passes on the result.
 7. Tokens: per task and the task total (5b), plus the conductor's usage and cost (its last `result` line).
 8. Anything odd: warnings, re-prompts, stuck questions, crashes, and anything you had to work around.
+9. Env check: in one task, approve (`y`) a Bash `git config core.hooksPath` and confirm the output is Maestro's
+   empty hooks folder (`<maestro>\.maestro-empty-hooks`), which shows the git env reaches claude's shell tools. Also
+   check that auto-allowed commands ran in the task's worktree (the `cd -- '<worktree>' &&` prefix in the task log).
 
 Then commit it: `git add docs/superpowers/runs/2026-10-28-e2e.md; git commit -m "docs: first real end-to-end mission"`.
 

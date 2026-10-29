@@ -52,7 +52,12 @@ const GIT_BANNED_WORDS: ReadonlySet<string> = new Set([
 const GIT_DANGEROUS_LONG = [
   'output', 'ext-diff', 'textconv', 'exec-path', 'git-dir', 'work-tree', 'namespace', 'config-env', 'super-prefix',
   'no-index', 'open-files-in-pager', 'paginate',
+  // --submodule=diff runs `git diff` inside a nested repo, whose own config (e.g. diff.external) an agent can plant.
+  'submodule',
 ];
+
+/** A path segment that names a .git folder (any case; Windows also ignores trailing dots and spaces). */
+const GIT_DIR_SEGMENT = /^\.git[. ]*$/i;
 
 /** A relative path: no leading '-', no '..', no '/' at the start (the charset has no ':', '~', '\', '*' or '?'). */
 const PATH_RE = /^[A-Za-z0-9_.+,/][A-Za-z0-9_.+,/@=-]*$/;
@@ -164,6 +169,7 @@ function gitAddArgs(rest: Token[]): boolean {
     if (!t.quoted && GIT_ADD_OTHER_FLAGS.has(t.value)) continue;
     if (!t.quoted && GIT_ADD_TARGET_FLAGS.has(t.value)) { targets++; continue; }
     if (!isPath(t) || t.value.startsWith('-') || GIT_BANNED_WORDS.has(t.value)) return false;
+    if (t.value.split('/').some(seg => GIT_DIR_SEGMENT.test(seg))) return false;
     targets++;
   }
   return targets > 0;
