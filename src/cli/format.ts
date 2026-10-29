@@ -39,6 +39,8 @@ export function formatEvent(db: Db, ev: EventRow): string | null {
       return `[${key} merged] into the mission branch${d.commit ? ` (${String(d.commit).slice(0, 7)})` : ''}`
         + (auto.length > 0 ? `; auto-committed leftovers: ${short(auto.join(', '), 400)}` : '');
     }
+    case 'auto-allowed':
+      return `[${key}] auto-allowed: ${short(String(d.command ?? ''), 160)}`;
     case 'no-changes':
       return `[${key}] no changes to merge`;
     case 'replan':

@@ -1,15 +1,19 @@
 // Routes Claude permission requests and questions into the user's inbox, auto-approves task-session requests that
-// match mission "always allow" rules (never the conductor's), and delivers each answer back to the right session once.
+// are on the pre-approved safe list or match mission "always allow" rules (never the conductor's), and delivers each
+// answer back to the right session once.
 import { EventEmitter } from 'node:events';
 import type { Db } from '../store/db.js';
-import { inbox, permissionRules, Expired, SHELL_TOOLS, UNSAFE_SHELL, type InboxEntry } from '../store/repos.js';
+import { events, inbox, missions, permissionRules, tasks, Expired, SHELL_TOOLS, UNSAFE_SHELL, type InboxEntry } from '../store/repos.js';
 import { SessionClosed, type ClaudeSession } from '../claude/session.js';
 import type { StreamEvent } from '../claude/protocol.js';
+import { isSafeTaskCommand, safeScopeFor } from './safeCommands.js';
 
 export interface SessionRegistry { get(sessionRowId: string): ClaudeSession | undefined }
 
 export type PermissionRequestEvent = Extract<StreamEvent, { kind: 'permission-request' }>;
 export interface InboxChanged { missionId: string; taskId: string | null }
+/** Emitted as 'auto-allowed' after a safe-list approval (its 'auto-allowed' event row is already written). */
+export interface AutoAllowed { missionId: string; taskId: string }
 export interface PermissionAnswerResult {
   /** True when the answer reached the session; false when the session was gone and the entry was expired instead. */
   delivered: boolean;
@@ -42,20 +46,50 @@ export class InboxService extends EventEmitter {
   }
 
   onPermissionRequest(missionId: string, taskId: string | null, sessionRowId: string, ev: PermissionRequestEvent): void {
-    // Always-allow rules cover task sessions only: a conductor request (taskId null) always goes to the user.
-    if (taskId !== null && permissionRules.match(this.db, missionId, ev.toolName, ev.input)) {
-      try {
-        this.sessions.get(sessionRowId)?.answerPermission(ev.requestId, { allow: true, input: ev.input });
-      } catch (e) {
-        if (!(e instanceof SessionClosed)) throw e;
+    // The safe list and always-allow rules cover task sessions only: a conductor request (taskId null) always goes
+    // to the user.
+    if (taskId !== null) {
+      const safe = this.safeCommand(missionId, taskId, ev);
+      if (safe !== null) {
+        events.append(this.db, { missionId, taskId, type: 'auto-allowed', data: { taskId, command: safe } });
+        this.allow(sessionRowId, ev);
+        this.emit('auto-allowed', { missionId, taskId } satisfies AutoAllowed);
+        return;
       }
-      return;
+      if (permissionRules.match(this.db, missionId, ev.toolName, ev.input)) {
+        this.allow(sessionRowId, ev);
+        return;
+      }
     }
     const payload: PermissionPayload = {
       toolName: ev.toolName, input: ev.input, description: ev.description, toolUseId: ev.toolUseId, sessionRowId,
     };
     inbox.add(this.db, { missionId, taskId, kind: 'permission', payload, requestId: ev.requestId });
     this.changed(missionId, taskId);
+  }
+
+  /** Allows a request without an inbox entry, exactly as a user's "allow once" would. */
+  private allow(sessionRowId: string, ev: PermissionRequestEvent): void {
+    try {
+      this.sessions.get(sessionRowId)?.answerPermission(ev.requestId, { allow: true, input: ev.input });
+    } catch (e) {
+      if (!(e instanceof SessionClosed)) throw e;
+    }
+  }
+
+  /**
+   * Spec §9: the command of a Bash/PowerShell request from a task session when it is on the safe list for the task's
+   * role and the mission has auto-allow on (settings.autoAllow === true, set by the engine); otherwise null.
+   */
+  private safeCommand(missionId: string, taskId: string, ev: PermissionRequestEvent): string | null {
+    if (!SHELL_TOOLS.has(ev.toolName)) return null;
+    const settings = missions.get(this.db, missionId)?.settings;
+    if (typeof settings !== 'object' || settings === null || (settings as Record<string, unknown>).autoAllow !== true) return null;
+    const task = tasks.get(this.db, taskId);
+    if (!task || task.missionId !== missionId) return null;
+    const cmd = typeof ev.input === 'object' && ev.input !== null ? (ev.input as Record<string, unknown>).command : undefined;
+    if (typeof cmd !== 'string' || !isSafeTaskCommand(cmd, safeScopeFor(task.agent))) return null;
+    return cmd;
   }
 
   /** The CLI cancelled a pending request (e.g. after an interrupt): expire the entry, write nothing to the session. */

@@ -48,6 +48,12 @@ const TASK_PERMISSION = [
   { writeFile: 'out-$SESSION.txt', content: 'work\n' }, RESULT('Did it.\n\n## Handoff\nMade a file.'), { waitFor: 'stdin-close' },
 ];
 const TASK_HANG = [INIT, USER, ...UNTIL_INTERRUPT];
+/** Asks to run `npm test` (on the safe list), then finishes like TASK_PERMISSION. */
+const TASK_SAFE_COMMAND = [
+  INIT, USER,
+  { ...PERMISSION, emit: { ...PERMISSION.emit, request: { ...PERMISSION.emit.request, input: { command: 'npm test', description: 'Run tests' } } } },
+  ...TASK_PERMISSION.slice(3),
+];
 
 const PLAN = `# Plan
 
@@ -177,6 +183,36 @@ describe('maestro run', () => {
     expect(m.outcome).toBe('kept');
     expect(m.maxParallel).toBe(2);
     expect(git(root, 'rev-parse', 'main')).not.toBe(git(root, 'rev-parse', m.missionBranch));
+  }, T);
+
+  it('cli auto-allows a safe task command and prints it; --no-auto-allow asks instead', async () => {
+    const script = [
+      { op: 'submit_plan', plan: 'plan.md' },
+      { op: 'dispatch', task_id: 'T1', owns: ['a/**'] },
+      { op: 'wait', tasks: ['T1'] },
+      { op: 'finish', summary: 'Done.' },
+    ];
+    // Plan: y. Merge: k. No permission prompt.
+    const r = await runCli({ taskSteps: TASK_SAFE_COMMAND, script, answers: 'y\nk\n' });
+    expect(r.code, r.out + r.err).toBe(0);
+    expect(r.out).toContain('[T1] auto-allowed: npm test');
+    expect(r.out).not.toMatch(/Permission/);
+    expect(onlyMission().settings).toEqual({ autoAllow: true });
+  }, T);
+
+  it('cli --no-auto-allow asks about a safe task command', async () => {
+    const script = [
+      { op: 'submit_plan', plan: 'plan.md' },
+      { op: 'dispatch', task_id: 'T1', owns: ['a/**'] },
+      { op: 'wait', tasks: ['T1'] },
+      { op: 'finish', summary: 'Done.' },
+    ];
+    const r = await runCli({ taskSteps: TASK_SAFE_COMMAND, script, answers: 'y\ny\nk\n', extraArgs: ['--no-auto-allow'] });
+    expect(r.code, r.out + r.err).toBe(0);
+    expect(r.out).toMatch(/Bash: npm test/);
+    expect(r.out).not.toContain('auto-allowed');
+    expect(r.out).toContain('Auto-allow is off');
+    expect(onlyMission().settings).toEqual({ autoAllow: false });
   }, T);
 
   it('cli exits 1 when the mission is stopped', async () => {

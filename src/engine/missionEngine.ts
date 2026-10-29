@@ -86,12 +86,19 @@ export interface MissionEngineOptions {
   stuckCheckMs?: number;
   /** recover(): how long to wait for a resumed session to confirm itself (default 30 s). */
   recoveryConfirmMs?: number;
+  /**
+   * Default for new missions: auto-allow task-session shell commands on the pre-approved safe list (spec §9; default
+   * true). Stored per mission as settings.autoAllow; never read from the project repository.
+   */
+  autoAllow?: boolean;
 }
 
 export type StartMissionInput = Omit<NewMission, 'missionBranch'> & {
   /** Derived from the title (`maestro/<slug>`) when omitted or empty. */
   missionBranch?: string;
   quick?: boolean;
+  /** Overrides the engine's autoAllow default for this mission. */
+  autoAllow?: boolean;
 };
 
 export type MergeDecisionResult =
@@ -280,6 +287,7 @@ export class MissionEngine extends EventEmitter implements BridgeHandlers {
     this.registry = new EngineRegistry(s => this.hookRateLimits(s));
     this.inbox = new InboxService(o.db, this.registry);
     this.inbox.on('changed', () => { this.emit('inbox'); this.kick(); });
+    this.inbox.on('auto-allowed', () => this.flushEvents());
     const row = this.db.prepare('SELECT COALESCE(MAX(id), 0) AS n FROM events').get() as { n: number };
     this.lastEventId = row.n;
   }
@@ -397,7 +405,11 @@ export class MissionEngine extends EventEmitter implements BridgeHandlers {
 
   async startMission(input: StartMissionInput): Promise<Mission> {
     this.assertOpen();
-    const { quick, missionBranch: givenBranch, ...rest } = input;
+    const { quick, missionBranch: givenBranch, autoAllow, ...rest } = input;
+    if (rest.settings !== undefined && (typeof rest.settings !== 'object' || rest.settings === null || Array.isArray(rest.settings))) {
+      throw new Error('Mission settings must be an object');
+    }
+    rest.settings = { ...(rest.settings as Record<string, unknown> | undefined), autoAllow: autoAllow ?? this.o.autoAllow ?? true };
     const project = projects.list(this.db).find(p => p.id === input.projectId);
     if (!project) throw new Error(`Unknown project: ${input.projectId}`);
     const root = project.path;
@@ -495,7 +507,12 @@ export class MissionEngine extends EventEmitter implements BridgeHandlers {
       `- Isolation: ${m.isolation}`,
       `- Parallel tasks: up to ${m.maxParallel}`,
     ];
-    if (m.settings !== null && m.settings !== undefined) settings.push(`- Other settings: ${JSON.stringify(m.settings)}`);
+    // autoAllow is Maestro's own permission setting (spec §9), not something the conductor plans with.
+    const other = typeof m.settings === 'object' && m.settings !== null && !Array.isArray(m.settings)
+      ? Object.fromEntries(Object.entries(m.settings).filter(([k]) => k !== 'autoAllow'))
+      : m.settings;
+    const hasOther = other !== null && other !== undefined && !(typeof other === 'object' && Object.keys(other).length === 0);
+    if (hasOther) settings.push(`- Other settings: ${JSON.stringify(other)}`);
     return `# Mission: ${m.title}\n\n${m.brief.trim()}\n\n## Settings\n\n${settings.join('\n')}\n`;
   }
 

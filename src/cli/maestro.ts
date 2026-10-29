@@ -1,6 +1,7 @@
 // `maestro run`: drives one mission from the terminal. Prints one line per engine event and turns every inbox entry
 // (permission, question, plan approval, merge decision) into a numbered prompt answered on stdin.
 //   npm run maestro -- run --project <path> --brief <file> [--title <t>] [--quick] [--base main] [--parallel 3] [--db <path>]
+//     [--no-auto-allow]
 // Exit code: 0 when the mission ends done, 1 when it is stopped or failed (or cannot start).
 import { existsSync, mkdirSync, readFileSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
@@ -28,6 +29,7 @@ Options:
   --base <branch>    base branch (default: main)
   --parallel <n>     tasks running at the same time (default: 3)
   --db <path>        database file (default: %APPDATA%\\Maestro\\maestro.db; logs then go to <db folder>\\logs)
+  --no-auto-allow    ask about every task shell command, also those on the safe list (npm test, git status, ...)
 `;
 
 /** Conductor text lines are cut to this many characters. */
@@ -35,6 +37,8 @@ const CONDUCTOR_LINE_MAX = 300;
 
 export interface RunArgs {
   project: string; brief: string; title?: string; quick: boolean; base: string; parallel: number; db?: string;
+  /** Auto-allow task shell commands on the safe list (spec §9); false with --no-auto-allow. */
+  autoAllow: boolean;
   conductorScript?: string;
 }
 
@@ -46,6 +50,7 @@ export function parseRunArgs(argv: string[]): RunArgs {
     options: {
       project: { type: 'string' }, brief: { type: 'string' }, title: { type: 'string' }, quick: { type: 'boolean' },
       base: { type: 'string' }, parallel: { type: 'string' }, db: { type: 'string' },
+      'no-auto-allow': { type: 'boolean' },
       'conductor-script': { type: 'string' },
     },
   });
@@ -56,7 +61,8 @@ export function parseRunArgs(argv: string[]): RunArgs {
   if (!Number.isInteger(parallel) || parallel < 1 || parallel > 16) throw new Error('--parallel must be a whole number from 1 to 16');
   return {
     project: values.project, brief: values.brief, title: values.title, quick: values.quick ?? false,
-    base: values.base ?? 'main', parallel, db: values.db, conductorScript: values['conductor-script'],
+    base: values.base ?? 'main', parallel, db: values.db, autoAllow: !values['no-auto-allow'],
+    conductorScript: values['conductor-script'],
   };
 }
 
@@ -109,7 +115,7 @@ export async function main(argv: string[], env: NodeJS.ProcessEnv = process.env)
   out(`Logs: ${logDir}`);
 
   const db = openDb(dbPath);
-  const engine = new MissionEngine({ db, logDir, command, conductorEnv: hooks.conductorEnv });
+  const engine = new MissionEngine({ db, logDir, command, conductorEnv: hooks.conductorEnv, autoAllow: args.autoAllow });
   const reader = new LineReader(process.stdin);
 
   let missionId: string | null = null;
@@ -196,6 +202,9 @@ export async function main(argv: string[], env: NodeJS.ProcessEnv = process.env)
       missionId = m.id;
       out(`Mission "${m.title}" (${m.id}) on branch ${m.missionBranch}, base ${m.baseBranch}, up to ${m.maxParallel} tasks at a time`);
       out(`Conductor log: ${join(logDir, 'missions', m.id, 'conductor.log')}`);
+      out(args.autoAllow
+        ? 'Safe task commands (npm test, git status/diff/log/show, git add/commit, mkdir, ...) are allowed without asking; --no-auto-allow turns this off.'
+        : 'Auto-allow is off: every task shell command is asked about.');
       for (const ev of buffered.splice(0)) printEvent(ev);
 
       prompter = new Prompter({
