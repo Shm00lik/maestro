@@ -36,17 +36,18 @@ export type SessionStatus = 'starting' | 'busy' | 'idle' | 'exited';
 export interface ExitInfo { code: number | null; killed: boolean }
 
 /**
- * Spawn options for claude.exe. `detached`: its own process group (on Windows a new, hidden console), so the Ctrl+C
- * a user presses in Maestro's terminal reaches Maestro only, never claude and its tool children; Maestro stops them
- * itself (stdin, interrupt, taskkill by PID). The child is never unref'd: Maestro keeps waiting for it.
+ * Spawn options for claude.exe. On Windows the child is NOT `detached` (DETACHED_PROCESS would override CREATE_NO_WINDOW
+ * and give every program claude starts a visible console): with piped stdio and `windowsHide` it runs in its own hidden
+ * console, so a console Ctrl+C reaches Maestro only. Elsewhere `detached` gives it its own process group, with the same
+ * effect. Maestro stops its sessions itself (stdin, interrupt, taskkill by PID). The child is never unref'd.
  */
-export function sessionSpawnOptions(cwd: string, env?: Record<string, string>): SpawnOptions {
+export function sessionSpawnOptions(cwd: string, env?: Record<string, string>, platform: NodeJS.Platform = process.platform): SpawnOptions {
   return {
     cwd,
     env: { ...process.env, MCP_TOOL_TIMEOUT: '86400000', ...env },
     shell: false,
     windowsHide: true,
-    detached: true,
+    detached: platform !== 'win32',
     stdio: ['pipe', 'pipe', 'pipe'],
   };
 }

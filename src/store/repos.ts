@@ -460,8 +460,8 @@ export const inbox = {
   },
 };
 
-/** Commands with chaining, redirection or substitution (incl. process substitution) never match a stored prefix. */
-export const UNSAFE_SHELL = /[\n\r;&|`>]|\$\(|<\(/;
+/** Commands with chaining, redirection, substitution or grouping never match a stored prefix; a bare "(" also covers $( <( >( and PowerShell @( ). */
+export const UNSAFE_SHELL = /[\n\r;&|`>(]/;
 /** Shell tools: always-allow rules are command prefixes (first two words), never commands with shell operators. */
 export const SHELL_TOOLS: ReadonlySet<string> = new Set(['Bash', 'PowerShell']);
 
@@ -478,6 +478,7 @@ export const permissionRules = {
     if (typeof cmd !== 'string' || UNSAFE_SHELL.test(cmd)) return false;
     return rules.some(r => {
       const p: string = r.input_prefix;
+      if (p === '') return false; // legacy empty-prefix rows never cover shell tools
       return cmd.startsWith(p) && (cmd.length === p.length || /\s/.test(cmd[p.length]));
     });
   },

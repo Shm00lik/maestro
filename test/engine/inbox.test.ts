@@ -83,7 +83,7 @@ describe('InboxService', () => {
   });
 
   it('does not store a rule for unsafe or empty Bash commands and reports why', () => {
-    const cmds = ['npm test && rm x', 'npm test\nrm x', 'echo $(whoami)', 'echo `id`', 'echo hi > f', '   ', ''];
+    const cmds = ['npm test && rm x', 'npm test\nrm x', 'echo $(whoami)', 'echo `id`', 'echo hi > f', 'Get-ChildItem -Recurse (Remove-Item x)', 'Get-ChildItem @(ls)', 'echo (id)', '   ', ''];
     for (const command of cmds) {
       const s = setup();
       s.svc.onPermissionRequest(s.m.id, s.t.id, 's1', req('r1', 'Bash', { command }));

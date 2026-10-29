@@ -265,7 +265,7 @@ cwd = <project>/.claude/worktrees/<mission8>-<key>   env MCP_TOOL_TIMEOUT=864000
   5. The task becomes `cancelled`. Its open inbox entries expire, and its worktree is kept until the user cleans it up.
 - **`--resume <session_id>`** is used only for crash recovery (§12). Maestro re-reads `session_id` from `system/init` after every resume.
 - **Never use SIGINT or `child.kill()`.** On Windows they kill only the root process and orphan its tool processes (R5).
-- **Sessions are spawned detached** (their own process group; on Windows a new, hidden console) and are not unref'd, so a Ctrl+C in Maestro's terminal reaches Maestro only. Maestro then stops its sessions itself as above.
+- **Sessions are not unref'd and are isolated from console Ctrl+C**: on Windows the child runs in its own hidden console (CREATE_NO_WINDOW via `windowsHide` + piped stdio; never `detached`, as DETACHED_PROCESS would give claude's own children visible console windows); on other platforms it gets its own process group. Either way a Ctrl+C in Maestro's terminal reaches Maestro only. Maestro then stops its sessions itself as above.
 
 ### 8.4 Stream protocol
 - Events are dispatched on `type`, then `subtype`. Unknown types, subtypes and keys are ignored and logged, never fatal.
@@ -410,4 +410,4 @@ The Stats page is out of scope for v1.
 13. **Leftovers are auto-committed** before a task's merge, and the files are listed; the merge waits for the process's confirmed exit.
 14. **Usage** is read from `model_usage_since_last_result`, else `usage` (R8).
 15. **Re-plans are applied on approval**; keys are case-insensitive and `integration` / `*-integration` are reserved.
-16. **Plain-text conductor turns become inbox questions**, and claude sessions are spawned detached (Ctrl+C reaches Maestro only).
+16. **Plain-text conductor turns become inbox questions**, and claude sessions run in their own hidden console on Windows (own process group elsewhere), so Ctrl+C reaches Maestro only.

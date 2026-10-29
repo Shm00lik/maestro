@@ -154,6 +154,20 @@ describe('permission rule safety', () => {
       'npm install $(id)', 'npm install pg > f', 'npm install pg | tee', 'npm install pg & ls', 'npm install\rx',
     ]) expect(bash(c), c).toBe(false);
   });
+
+  it('treats grouping parentheses as unsafe, and an empty-prefix shell rule never matches', () => {
+    const s = setup();
+    permissionRules.add(s.db, { missionId: s.m.id, toolName: 'PowerShell', inputPrefix: 'Get-ChildItem -Recurse' });
+    permissionRules.add(s.db, { missionId: s.m.id, toolName: 'Bash', inputPrefix: 'npm test' });
+    const ps = (c: string) => permissionRules.match(s.db, s.m.id, 'PowerShell', { command: c });
+    expect(ps('Get-ChildItem -Recurse src')).toBe(true);
+    expect(ps('Get-ChildItem -Recurse (Remove-Item -Recurse -Force C:/x)')).toBe(false);
+    expect(ps('Get-ChildItem -Recurse @(Remove-Item x)')).toBe(false);
+    expect(permissionRules.match(s.db, s.m.id, 'Bash', { command: 'npm test (id)' })).toBe(false);
+    s.db.prepare("INSERT INTO permission_rules (id, mission_id, tool_name, input_prefix, created_at) VALUES ('x',?,?,?,1)")
+      .run(s.m.id, 'Bash', '');
+    expect(permissionRules.match(s.db, s.m.id, 'Bash', { command: 'rm -rf x' })).toBe(false);
+  });
 });
 
 describe('retry and duplicate project', () => {

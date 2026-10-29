@@ -351,9 +351,12 @@ describe('ClaudeSession', () => {
 });
 
 describe('ClaudeSession process group', () => {
-  it('spawns claude detached (own process group / console, hidden), with piped stdio and no unref', () => {
+  it('spawns claude hidden (detached only off Windows), with piped stdio and no unref', () => {
     const o = sessionSpawnOptions('C:\work', { A: '1' });
-    expect(o.detached).toBe(true); // Ctrl+C in the Maestro console does not reach claude and its children
+    expect(o.detached).toBe(process.platform !== 'win32'); // never DETACHED_PROCESS on Windows (visible consoles)
+    expect(sessionSpawnOptions('c', {}, 'win32').detached).toBe(false);
+    expect(sessionSpawnOptions('c', {}, 'linux').detached).toBe(true);
+    expect(sessionSpawnOptions('c', {}, 'darwin').detached).toBe(true);
     expect(o.windowsHide).toBe(true);
     expect(o.shell).toBe(false);
     expect(o.stdio).toEqual(['pipe', 'pipe', 'pipe']);
