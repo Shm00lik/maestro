@@ -252,7 +252,7 @@ describe('InboxService', () => {
     const bash = (requestId: string, command: string, extra: Record<string, unknown> = {}) =>
       req(requestId, 'Bash', { command, ...extra });
     /** The command Maestro sends back for an auto-allowed Bash command: pinned to the worktree. */
-    const pinnedBash = (wt: string, command: string) => `cd -- '${wt.split(String.fromCharCode(92)).join('/')}' && ${command}`;
+    const pinnedBash = (wt: string, command: string) => `builtin cd -- '${wt.split(String.fromCharCode(92)).join('/')}' && ${command}`;
 
     it('auto-allows a safe task command pinned to the worktree and records an auto-allowed event', () => {
       const s = safeSetup();
@@ -273,7 +273,7 @@ describe('InboxService', () => {
       const s = safeSetup();
       s.svc.onPermissionRequest(s.m.id, s.t.id, 's1', req('r1', 'PowerShell', { command: 'git status', timeout: 5 }), TASK);
       expect(s.session.calls).toEqual([{
-        requestId: 'r1', decision: { allow: true, input: { command: `Set-Location -LiteralPath '${s.wt}'; git status`, timeout: 5 } },
+        requestId: 'r1', decision: { allow: true, input: { command: `Set-Location -LiteralPath '${s.wt}' -ErrorAction Stop; git status`, timeout: 5 } },
       }]);
       expect(inbox.listOpen(s.db, Date.now())).toHaveLength(0);
     });
@@ -286,9 +286,9 @@ describe('InboxService', () => {
     });
 
     it('pinToWorktree quotes the path and refuses quote characters and controls', () => {
-      expect(pinToWorktree('Bash', 'C:\\Users\\me\\wt', 'git status')).toBe("cd -- 'C:/Users/me/wt' && git status");
-      expect(pinToWorktree('PowerShell', 'C:\\Users\\me\\wt', 'git status')).toBe("Set-Location -LiteralPath 'C:\\Users\\me\\wt'; git status");
-      expect(pinToWorktree('Bash', 'C:\\a b $x;`(y)', 'ls')).toBe("cd -- 'C:/a b $x;`(y)' && ls");
+      expect(pinToWorktree('Bash', 'C:\\Users\\me\\wt', 'git status')).toBe("builtin cd -- 'C:/Users/me/wt' && git status");
+      expect(pinToWorktree('PowerShell', 'C:\\Users\\me\\wt', 'git status')).toBe("Set-Location -LiteralPath 'C:\\Users\\me\\wt' -ErrorAction Stop; git status");
+      expect(pinToWorktree('Bash', 'C:\\a b $x;`(y)', 'ls')).toBe("builtin cd -- 'C:/a b $x;`(y)' && ls");
       for (const bad of ["C:\\it's", 'C:\\it\u2019s', 'C:\\it\u2018s', 'C:\\a\nb', 'C:\\a\u201bb']) {
         expect(pinToWorktree('Bash', bad, 'ls')).toBeNull();
         expect(pinToWorktree('PowerShell', bad, 'ls')).toBeNull();

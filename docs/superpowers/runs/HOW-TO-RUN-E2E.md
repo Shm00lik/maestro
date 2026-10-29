@@ -232,7 +232,7 @@ cd $scratch; npm test; cd D:\Desktop\Programming\maestro
 8. Anything odd: warnings, re-prompts, stuck questions, crashes, and anything you had to work around.
 9. Env check: in one task, approve (`y`) a Bash `git config core.hooksPath` and confirm the output is Maestro's
    empty hooks folder (`<maestro>\.maestro-empty-hooks`), which shows the git env reaches claude's shell tools. Also
-   check that auto-allowed commands ran in the task's worktree (the `cd -- '<worktree>' &&` prefix in the task log).
+   check that auto-allowed commands ran in the task's worktree (the `builtin cd -- '<worktree>' &&` prefix in the task log).
 
 Then commit it: `git add docs/superpowers/runs/2026-10-28-e2e.md; git commit -m "docs: first real end-to-end mission"`.
 

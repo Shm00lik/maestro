@@ -57,8 +57,8 @@ const UNQUOTABLE_PATH = /['‘’‚‛\x00-\x1f]/;
  */
 export function pinToWorktree(toolName: string, worktree: string, command: string): string | null {
   if (UNQUOTABLE_PATH.test(worktree)) return null;
-  if (toolName === 'PowerShell') return `Set-Location -LiteralPath '${worktree}'; ${command}`;
-  return `cd -- '${worktree.replace(/\\/g, '/')}' && ${command}`;
+  if (toolName === 'PowerShell') return `Set-Location -LiteralPath '${worktree}' -ErrorAction Stop; ${command}`;
+  return `builtin cd -- '${worktree.replace(/\\/g, '/')}' && ${command}`;
 }
 
 export class InboxService extends EventEmitter {
