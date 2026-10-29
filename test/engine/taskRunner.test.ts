@@ -255,10 +255,9 @@ describe('TaskRunner', () => {
     await c.runner.start(c.task.id, []);
     const wt = getTask(c).worktreePath!;
     writeFileSync(join(wt, 'left.txt'), 'left over\n');
-    // A slow pre-commit hook (hooks live in the shared git dir).
-    const hooks = join(root, '.git', 'hooks');
-    mkdirSync(hooks, { recursive: true });
-    writeFileSync(join(hooks, 'pre-commit'), '#!/bin/sh\nsleep 8\n');
+    // A slow clean filter (hooks no longer run in task worktrees): `git add` hangs on it.
+    git(root, 'config', 'filter.slow.clean', 'sleep 8; cat');
+    writeFileSync(join(wt, '.gitattributes'), 'left.txt filter=slow\n');
     const missionTip = git(root, 'rev-parse', MISSION_BRANCH);
     const t0 = Date.now();
     c.runner.message(c.task.id, 'go');
@@ -267,7 +266,6 @@ describe('TaskRunner', () => {
     expect(f.reason).toMatch(/^commit: .*timed out/);
     expect(Date.now() - t0).toBeLessThan(7000);
     expect(git(root, 'rev-parse', MISSION_BRANCH)).toBe(missionTip);
-    rmSync(join(hooks, 'pre-commit'), { force: true });
   }, 20000);
 
   it('merges only after the process is confirmed exited: a process that never exits fails the task', async () => {
@@ -440,6 +438,82 @@ describe('TaskRunner', () => {
     expect(reason.length).toBeLessThanOrEqual(4200);
     expect(f.reason).toBe(reason);
   }, 15000);
+
+  it("the repo's git hooks run neither for the task's own commit nor for Maestro's leftover commit and merge", async () => {
+    const hooks = join(git(root, 'rev-parse', '--absolute-git-dir'), 'hooks');
+    mkdirSync(hooks, { recursive: true });
+    const marker = join(dir, 'hook-ran.txt').replace(/\\/g, '/');
+    for (const h of ['pre-commit', 'commit-msg', 'post-commit', 'post-checkout', 'post-merge', 'pre-merge-commit']) {
+      writeFileSync(join(hooks, h), `#!/bin/sh\necho ${h} >> "${marker}"\nexit 0\n`, { mode: 0o755 });
+    }
+    const c = setup([
+      INIT(), USER,
+      { writeFile: 'task.txt', content: 'task\n' },
+      { git: ['add', 'task.txt'] },
+      { git: ['-c', 'user.name=T', '-c', 'user.email=t@e', 'commit', '-m', 'task commit'] },
+      { writeFile: 'leftover.txt', content: 'left\n' },
+      RESULT(HANDOFF), STDIN_CLOSE,
+    ]);
+    await c.runner.start(c.task.id, []);
+    const f = await finished(c);
+    expect(f.outcome, f.reason).toBe('done');
+    const commitStep = fakeLogLines().find(l => Array.isArray(l.git) && l.git.includes('commit'));
+    expect(commitStep.status, commitStep.stderr).toBe(0);
+    expect(git(root, 'log', '--format=%s', MISSION_BRANCH)).toMatch(/task commit/);
+    expect(git(root, 'show', `${MISSION_BRANCH}:leftover.txt`)).toBe('left');
+    expect(existsSync(marker) ? readFileSync(marker, 'utf8') : '').toBe('');
+    // The hooks themselves work: a plain git commit outside Maestro runs them.
+    git(root, 'commit', '--allow-empty', '-m', 'outside');
+    expect(readFileSync(marker, 'utf8')).toMatch(/pre-commit/);
+  }, 20000);
+
+  it("a nested repo's fsmonitor is not run by Maestro's git status", async () => {
+    const c = setup([INIT(), USER, RESULT(HANDOFF), STDIN_CLOSE]);
+    tasks.transition(c.db, c.task.id, 'start');
+    const wt = worktreeDirFor(root, c.missionId, 'T1');
+    await createTaskWorktree(root, MISSION_BRANCH, TASK_BRANCH, wt);
+    tasks.setRuntime(c.db, c.task.id, { sessionId: 'S-old', worktreePath: wt, branch: TASK_BRANCH });
+    const marker = join(dir, 'fsmonitor-ran.txt').replace(/\\/g, '/');
+    const script = join(dir, 'fsmon.sh').replace(/\\/g, '/');
+    writeFileSync(script, `#!/bin/sh\necho ran >> "${marker}"\nexit 1\n`, { mode: 0o755 });
+    const sub = join(wt, 'sub');
+    mkdirSync(sub);
+    git(sub, 'init', '-q');
+    writeFileSync(join(sub, 'b.txt'), 'b\n');
+    git(sub, 'add', '.');
+    git(sub, '-c', 'user.name=T', '-c', 'user.email=t@e', 'commit', '-qm', 's');
+    git(sub, 'config', 'core.fsmonitor', script);
+    git(wt, 'add', 'sub'); // a gitlink: plain `git status` in wt would enter sub and run its fsmonitor
+    writeFileSync(join(sub, 'b.txt'), 'changed\n');
+    await c.runner.resumeAfterCrash(c.task.id);
+    expect((await finished(c)).outcome).toBe('done');
+    expect(existsSync(marker)).toBe(false);
+    // The fsmonitor itself works: a plain status outside Maestro runs it.
+    git(wt, 'status', '--porcelain');
+    expect(existsSync(marker)).toBe(true);
+  }, 20000);
+
+  it('a read-only role never auto-commits: its leftovers are discarded with a warning and it ends with no changes', async () => {
+    const c = setup([
+      INIT(['Read', 'Glob', 'Grep', 'Bash']), USER,
+      { writeFile: 'new-dir/created.txt', content: 'x\n' },
+      { writeFile: 'a.txt', content: 'changed by a reviewer\n' },
+      { git: ['add', 'new-dir/created.txt'] },
+      RESULT(HANDOFF), STDIN_CLOSE,
+    ], 'code-reviewer');
+    await c.runner.start(c.task.id, []);
+    const f = await finished(c);
+    expect(f.outcome, f.reason).toBe('done');
+    const evs = events.list(c.db, c.missionId);
+    const warn = evs.find(e => e.type === 'read-only-changes-discarded');
+    expect(warn?.data.files.sort()).toEqual(['a.txt', 'new-dir/created.txt']);
+    expect(evs.some(e => e.type === 'no-changes')).toBe(true);
+    expect(evs.some(e => e.type === 'merged')).toBe(false);
+    expect(git(root, 'rev-parse', MISSION_BRANCH)).toBe(git(root, 'rev-parse', 'main'));
+    const wt = getTask(c).worktreePath!;
+    expect(git(wt, 'status', '--porcelain')).toBe('');
+    expect(readFileSync(join(wt, 'a.txt'), 'utf8').replace(/\r/g, '')).toBe('base\n');
+  }, 20000);
 
   it('merge conflict fails the task with reason conflict', async () => {
     const c = setup([INIT(), USER, USER, RESULT(HANDOFF), STDIN_CLOSE]);

@@ -4,6 +4,8 @@ import { createHash } from 'node:crypto';
 import { resolve, dirname, isAbsolute } from 'node:path';
 import { mkdirSync, existsSync, realpathSync, readFileSync, appendFileSync } from 'node:fs';
 
+import { gitSafeEnv } from './gitEnv.js';
+
 const execFileP = promisify(execFile);
 
 /** Worktree directories must stay shorter than this many characters (see the R5 Windows spike). */
@@ -11,9 +13,10 @@ export const MAX_WORKTREE_PATH = 200;
 
 const EXCLUDE_LINE = '.claude/worktrees/';
 
+/** Every git call here runs without the repo's hooks or fsmonitor (gitSafeEnv, spec §8.1). */
 async function git(cwd: string, args: string[]): Promise<string> {
   try {
-    const { stdout } = await execFileP('git', args, { cwd, windowsHide: true, maxBuffer: 64 * 1024 * 1024 });
+    const { stdout } = await execFileP('git', args, { cwd, windowsHide: true, maxBuffer: 64 * 1024 * 1024, env: gitSafeEnv() });
     return stdout.trim();
   } catch (e) {
     const err = e as Error & { stderr?: string };
@@ -168,8 +171,12 @@ export async function branchCommits(projectRoot: string, base: string, branch: s
   return out.split(/\r?\n/).filter(Boolean);
 }
 
-export async function removeWorktree(projectRoot: string, dir: string): Promise<void> {
-  await git(projectRoot, ['worktree', 'remove', '--force', dir]);
+/**
+ * Removes a worktree. With `force: false`, git's own check applies: a worktree with modified or untracked files is
+ * refused (the call throws) and kept.
+ */
+export async function removeWorktree(projectRoot: string, dir: string, opts: { force?: boolean } = {}): Promise<void> {
+  await git(projectRoot, ['worktree', 'remove', ...(opts.force === false ? [] : ['--force']), dir]);
 }
 
 export async function removeIntegrationWorktree(projectRoot: string, missionId: string): Promise<void> {

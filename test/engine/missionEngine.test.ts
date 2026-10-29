@@ -196,15 +196,16 @@ describe('MissionEngine', () => {
   it('stores the auto-allow setting in the mission settings (default on) and keeps it out of the conductor brief', async () => {
     const e = makeEngine(TASK_HANG);
     const m = await start(e);
-    expect(mission(m.id).settings).toEqual({ autoAllow: true });
+    expect(mission(m.id).settings).toEqual({ autoAllow: true, autoRunTests: false });
     const off = await e.startMission({
       projectId, title: 'Other', brief: 'b', depth: 'quick', baseBranch: 'main', missionBranch: '',
-      isolation: 'worktree', maxParallel: 1, quick: true, autoAllow: false, settings: { note: 'x' },
+      isolation: 'worktree', maxParallel: 1, quick: true, autoAllow: false, autoRunTests: true, settings: { note: 'x' },
     });
-    expect(mission(off.id).settings).toEqual({ note: 'x', autoAllow: false });
+    expect(mission(off.id).settings).toEqual({ note: 'x', autoAllow: false, autoRunTests: true });
     await until(() => existsSync(join(dir, 'conductor.jsonl')) && readFileSync(join(dir, 'conductor.jsonl'), 'utf8').includes('"type":"user"'));
     const brief = readFileSync(join(dir, 'conductor.jsonl'), 'utf8');
     expect(brief).not.toContain('autoAllow');
+    expect(brief).not.toContain('autoRunTests');
   }, T);
 
   it('the engine option autoAllow: false turns the safe list off for its missions', async () => {
@@ -213,11 +214,11 @@ describe('MissionEngine', () => {
     writeFileSync(taskScenario, JSON.stringify({ steps: TASK_HANG }));
     writeFileSync(condScenario, JSON.stringify({ steps: CONDUCTOR_IDLE }));
     engine = new MissionEngine({
-      db, logDir: join(dir, 'logs'), command, stopTimeoutMs: 1500, autoAllow: false,
+      db, logDir: join(dir, 'logs'), command, stopTimeoutMs: 1500, autoAllow: false, autoRunTests: true,
       env: { FAKE_CLAUDE_SCENARIO: taskScenario }, conductorEnv: { FAKE_CLAUDE_SCENARIO: condScenario },
     });
     const m = await start(engine);
-    expect(mission(m.id).settings).toEqual({ autoAllow: false });
+    expect(mission(m.id).settings).toEqual({ autoAllow: false, autoRunTests: true });
   }, T);
 
   it('submit_plan rejects invalid plans with errors and blocks valid ones until approve', async () => {

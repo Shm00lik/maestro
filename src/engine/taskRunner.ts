@@ -18,6 +18,8 @@ import {
   withRepoLock, worktreeDirFor, worktreeHead,
 } from '../git/worktrees.js';
 import type { InboxChanged, InboxService, SessionRegistry } from './inbox.js';
+import { gitSafeEnv } from '../git/gitEnv.js';
+import { hasEditTools, safeScopeFor } from './safeCommands.js';
 
 const execFileP = promisify(execFile);
 
@@ -119,15 +121,13 @@ export function loadRole(name: AgentRole, dir: string = DEFAULT_ROLES_DIR): Role
   return role;
 }
 
-const EDIT_TOOLS: readonly string[] = ['Edit', 'Write', 'NotebookEdit', 'MultiEdit'];
-
 /**
  * A role with an explicit tool list and no edit tool (researcher, spec-reviewer, code-reviewer). It runs in the
  * `default` permission mode: acceptEdits would also auto-approve filesystem shell commands (mkdir, mv, cp, ...) for a
  * role that has Bash, so every shell command not on the reviewer safe list (spec §9) goes to the user.
  */
 export function isReadOnlyRole(role: RoleConfig): boolean {
-  return role.tools !== undefined && !role.tools.some(t => EDIT_TOOLS.includes(t));
+  return !hasEditTools(role.tools);
 }
 
 /** claude args after BASE_ARGS (spec §8.1 with the R7 decision). The prompt itself is sent as the first user message. */
@@ -518,7 +518,9 @@ export class TaskRunner extends EventEmitter {
     run.logPath = logPath;
     const args = buildTaskArgs(role, systemPromptFile, this.deps.bridgeAskConfig(run.taskId), resumeSessionId);
     const command = this.deps.command ?? (this.deps.exe ? { exe: this.deps.exe, prefixArgs: [] } : undefined);
-    const session = ClaudeSession.start({ args, cwd, logPath, env: this.deps.env, command, ...this.deps.sessionHooks });
+    // The agent's own git calls run without the repo's hooks or fsmonitor (spec §8.1).
+    const env = gitSafeEnv({ ...process.env, ...this.deps.env });
+    const session = ClaudeSession.start({ args, cwd, logPath, env, command, ...this.deps.sessionHooks });
     run.session = session;
     session.on('event', (ev: StreamEvent) => this.onEvent(run, ev));
     session.on('error', (e: Error) => { run.lastError = e.message; });
@@ -583,7 +585,10 @@ export class TaskRunner extends EventEmitter {
         if (ev.parentToolUseId === null && ev.text.trim()) run.lastAssistantText = ev.text;
         return;
       case 'permission-request':
-        if (run.phase === 'running' && run.rowId) this.deps.inbox.onPermissionRequest(run.missionId, run.taskId, run.rowId, ev);
+        if (run.phase === 'running' && run.rowId) {
+          this.deps.inbox.onPermissionRequest(run.missionId, run.taskId, run.rowId, ev,
+            run.role ? { safeScope: safeScopeFor(run.role.tools) } : undefined);
+        }
         return;
       case 'permission-cancel':
         this.deps.inbox.onPermissionCancel(ev.requestId);
@@ -746,9 +751,19 @@ export class TaskRunner extends EventEmitter {
     this.endSessionRow(run, 'ended');
 
     const task = this.task(run.taskId);
-    let autoCommitted: string[];
-    try { autoCommitted = await this.commitLeftovers(task); }
-    catch (e) { return `commit: ${(e as Error).message}`; }
+    let autoCommitted: string[] = [];
+    if (run.role && isReadOnlyRole(run.role)) {
+      // A role without edit tools must not change the project: whatever it left is thrown away, never committed.
+      let discarded: string[];
+      try { discarded = await this.discardLeftovers(task); }
+      catch (e) { return `discard: ${(e as Error).message}`; }
+      if (discarded.length > 0) {
+        events.append(this.db, { missionId: task.missionId, taskId: task.id, type: 'read-only-changes-discarded', data: { files: discarded } });
+      }
+    } else {
+      try { autoCommitted = await this.commitLeftovers(task); }
+      catch (e) { return `commit: ${(e as Error).message}`; }
+    }
     let merged: Awaited<ReturnType<typeof mergeTaskBranch>> | null = null;
     try {
       // A read-only task has no commits beyond the mission branch: nothing to merge (no empty merge commit).
@@ -772,24 +787,45 @@ export class TaskRunner extends EventEmitter {
    * files it committed ([] when nothing was left). Each git command is bounded by commitTimeoutMs (default 60 s).
    */
   private async commitLeftovers(task: Task): Promise<string[]> {
-    const cwd = task.worktreePath!;
-    const timeout = this.deps.commitTimeoutMs ?? COMMIT_TIMEOUT_MS;
-    const git = async (args: string[]): Promise<string> => {
-      try {
-        const { stdout } = await execFileP('git', ['-c', 'core.quotepath=off', ...args],
-          { cwd, windowsHide: true, maxBuffer: 64 * 1024 * 1024, timeout });
-        return stdout;
-      } catch (e) {
-        const err = e as Error & { killed?: boolean; signal?: string | null };
-        if (err.killed || err.signal) throw new Error(`git ${args[0]} timed out after ${Math.round(timeout / 1000)} s`);
-        throw e;
-      }
-    };
-    if ((await git(['status', '--porcelain'])).trim() === '') return [];
+    const git = (args: string[]): Promise<string> => this.worktreeGit(task.worktreePath!, args);
+    if ((await git(['status', '--porcelain', '--ignore-submodules=all'])).trim() === '') return [];
     await git(['add', '-A']);
     const files = (await git(['diff', '--cached', '--name-only'])).split(/\r?\n/).filter(Boolean);
     if (files.length === 0) return [];
     await git(['commit', '-m', `maestro: uncommitted changes from ${task.taskKey}`]);
     return files;
+  }
+
+  /**
+   * A read-only role's worktree: unstages and throws away every change and untracked file (in this worktree only)
+   * and returns the files it discarded.
+   */
+  private async discardLeftovers(task: Task): Promise<string[]> {
+    const git = (args: string[]): Promise<string> => this.worktreeGit(task.worktreePath!, args);
+    const status = await git(['status', '--porcelain', '--untracked-files=all', '--ignore-submodules=all']);
+    const files = status.split(/\r?\n/).filter(l => l.trim() !== '').map(l => {
+      const name = l.slice(3);
+      const arrow = name.indexOf(' -> ');
+      return arrow >= 0 ? name.slice(arrow + 4) : name;
+    });
+    if (files.length === 0) return [];
+    await git(['reset', '-q']);
+    await git(['checkout', '--', '.']);
+    await git(['clean', '-fdq']);
+    return files;
+  }
+
+  /** git in a task worktree: no hooks, no fsmonitor, no quoted paths; bounded by commitTimeoutMs (default 60 s). */
+  private async worktreeGit(cwd: string, args: string[]): Promise<string> {
+    const timeout = this.deps.commitTimeoutMs ?? COMMIT_TIMEOUT_MS;
+    try {
+      const { stdout } = await execFileP('git', ['-c', 'core.quotepath=off', ...args],
+        { cwd, windowsHide: true, maxBuffer: 64 * 1024 * 1024, timeout, env: gitSafeEnv() });
+      return stdout;
+    } catch (e) {
+      const err = e as Error & { killed?: boolean; signal?: string | null };
+      if (err.killed || err.signal) throw new Error(`git ${args[0]} timed out after ${Math.round(timeout / 1000)} s`);
+      throw e;
+    }
   }
 }

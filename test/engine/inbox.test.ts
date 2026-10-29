@@ -1,4 +1,7 @@
 import { describe, it, expect } from 'vitest';
+import { mkdtempSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { openDb } from '../../src/store/db.js';
 import { projects, missions, planVersions, tasks, inbox, permissionRules, Expired, AlreadyAnswered } from '../../src/store/repos.js';
 import { buildGraph } from '../../src/core/plan/graph.js';
@@ -233,13 +236,26 @@ describe('InboxService', () => {
     const autoEvents = (db: any) =>
       (db.prepare("SELECT task_id, data_json FROM events WHERE type = 'auto-allowed' ORDER BY id").all() as any[])
         .map(r => ({ taskId: r.task_id, data: JSON.parse(r.data_json) }));
+    const TASK = { safeScope: 'task' as const };
+    const REVIEWER = { safeScope: 'reviewer' as const };
+
+    /** setup() plus a real worktree folder for the task (with a package.json unless told otherwise). */
+    function safeSetup(o: { settings?: unknown; packageJson?: boolean; session?: ReturnType<typeof fakeSession> } = {}) {
+      const s = setup(o.session ?? fakeSession(), { settings: o.settings ?? { autoAllow: true } });
+      const wt = mkdtempSync(join(tmpdir(), 'maestro-inbox-wt-'));
+      if (o.packageJson !== false) writeFileSync(join(wt, 'package.json'), '{}');
+      tasks.setRuntime(s.db, s.t.id, { worktreePath: wt });
+      return s;
+    }
+    const bash = (requestId: string, command: string, extra: Record<string, unknown> = {}) =>
+      req(requestId, 'Bash', { command, ...extra });
 
     it('auto-allows a safe task command, answers like the human path and records an auto-allowed event', () => {
-      const s = setup(fakeSession(), { settings: { autoAllow: true } });
+      const s = safeSetup();
       const auto: any[] = [];
       s.svc.on('auto-allowed', e => auto.push(e));
       const input = { command: 'mkdir -p src test', description: 'make dirs' };
-      s.svc.onPermissionRequest(s.m.id, s.t.id, 's1', req('r1', 'Bash', input));
+      s.svc.onPermissionRequest(s.m.id, s.t.id, 's1', req('r1', 'Bash', input), TASK);
       expect(s.session.calls).toEqual([{ requestId: 'r1', decision: { allow: true, input } }]);
       expect(inbox.listOpen(s.db, Date.now())).toHaveLength(0);
       expect(autoEvents(s.db)).toEqual([{ taskId: s.t.id, data: { taskId: s.t.id, command: 'mkdir -p src test' } }]);
@@ -248,57 +264,124 @@ describe('InboxService', () => {
     });
 
     it('covers PowerShell too', () => {
-      const s = setup(fakeSession(), { settings: { autoAllow: true } });
-      s.svc.onPermissionRequest(s.m.id, s.t.id, 's1', req('r1', 'PowerShell', { command: 'git status' }));
+      const s = safeSetup();
+      s.svc.onPermissionRequest(s.m.id, s.t.id, 's1', req('r1', 'PowerShell', { command: 'git status' }), TASK);
       expect(s.session.calls).toHaveLength(1);
       expect(inbox.listOpen(s.db, Date.now())).toHaveLength(0);
     });
 
     it('an unsafe command still goes to the inbox', () => {
-      const s = setup(fakeSession(), { settings: { autoAllow: true } });
-      s.svc.onPermissionRequest(s.m.id, s.t.id, 's1', req('r1', 'Bash', { command: 'npm test 2>&1 | tail -15' }));
+      const s = safeSetup({ settings: { autoAllow: true, autoRunTests: true } });
+      s.svc.onPermissionRequest(s.m.id, s.t.id, 's1', bash('r1', 'npm test 2>&1 | tail -15'), TASK);
       expect(s.session.calls).toHaveLength(0);
       expect(inbox.listOpen(s.db, Date.now())).toHaveLength(1);
       expect(autoEvents(s.db)).toEqual([]);
     });
 
     it('never auto-allows the conductor', () => {
-      const s = setup(fakeSession(), { settings: { autoAllow: true } });
-      s.svc.onPermissionRequest(s.m.id, null, 's1', req('r1', 'Bash', { command: 'npm test' }));
+      const s = safeSetup();
+      s.svc.onPermissionRequest(s.m.id, null, 's1', bash('r1', 'git status'), TASK);
+      expect(s.session.calls).toHaveLength(0);
+      expect(inbox.listOpen(s.db, Date.now())).toHaveLength(1);
+    });
+
+    it('nothing is auto-allowed without a scope from the runner', () => {
+      const s = safeSetup();
+      s.svc.onPermissionRequest(s.m.id, s.t.id, 's1', bash('r1', 'git status'));
       expect(s.session.calls).toHaveLength(0);
       expect(inbox.listOpen(s.db, Date.now())).toHaveLength(1);
     });
 
     it('only for shell tools: another tool with a command field is not covered', () => {
-      const s = setup(fakeSession(), { settings: { autoAllow: true } });
-      s.svc.onPermissionRequest(s.m.id, s.t.id, 's1', req('r1', 'Task', { command: 'npm test' }));
+      const s = safeSetup();
+      s.svc.onPermissionRequest(s.m.id, s.t.id, 's1', req('r1', 'Task', { command: 'git status' }), TASK);
       expect(s.session.calls).toHaveLength(0);
       expect(inbox.listOpen(s.db, Date.now())).toHaveLength(1);
     });
 
     it('is off unless the mission settings say autoAllow: true', () => {
-      for (const settings of [undefined, { autoAllow: false }, { autoAllow: 'yes' }, null]) {
-        const s = setup(fakeSession(), { settings });
-        s.svc.onPermissionRequest(s.m.id, s.t.id, 's1', req('r1', 'Bash', { command: 'npm test' }));
+      for (const settings of [{}, { autoAllow: false }, { autoAllow: 'yes' }, { autoRunTests: true }]) {
+        const s = safeSetup({ settings });
+        s.svc.onPermissionRequest(s.m.id, s.t.id, 's1', bash('r1', 'git status'), TASK);
         expect(s.session.calls).toHaveLength(0);
         expect(inbox.listOpen(s.db, Date.now())).toHaveLength(1);
       }
     });
 
-    it("a reviewer's npm test is auto-allowed but its git commit goes to the inbox", () => {
-      for (const agent of ['spec-reviewer', 'code-reviewer']) {
-        const s = setup(fakeSession(), { settings: { autoAllow: true }, agent });
-        s.svc.onPermissionRequest(s.m.id, s.t.id, 's1', req('r1', 'Bash', { command: 'npm test' }));
-        s.svc.onPermissionRequest(s.m.id, s.t.id, 's1', req('r2', 'Bash', { command: 'git commit -m "x"' }));
-        s.svc.onPermissionRequest(s.m.id, s.t.id, 's1', req('r3', 'Bash', { command: 'mkdir src' }));
-        expect(s.session.calls.map(c => c.requestId)).toEqual(['r1']);
-        expect(inbox.listOpen(s.db, Date.now()).map(e => e.requestId)).toEqual(['r2', 'r3']);
+    it('test runs are auto-allowed only with autoRunTests: true; git stays pre-approved either way', () => {
+      for (const [settings, testAllowed] of [[{ autoAllow: true }, false], [{ autoAllow: true, autoRunTests: false }, false],
+        [{ autoAllow: true, autoRunTests: 'yes' }, false], [{ autoAllow: true, autoRunTests: true }, true]] as const) {
+        const s = safeSetup({ settings });
+        s.svc.onPermissionRequest(s.m.id, s.t.id, 's1', bash('r1', 'npm test'), TASK);
+        s.svc.onPermissionRequest(s.m.id, s.t.id, 's1', bash('r2', 'node --test'), TASK);
+        s.svc.onPermissionRequest(s.m.id, s.t.id, 's1', bash('r3', 'git diff'), TASK);
+        expect(s.session.calls.map(c => c.requestId)).toEqual(testAllowed ? ['r1', 'r2', 'r3'] : ['r3']);
       }
     });
 
+    it('npm test is not auto-allowed in a worktree without a package.json', () => {
+      const s = safeSetup({ settings: { autoAllow: true, autoRunTests: true }, packageJson: false });
+      s.svc.onPermissionRequest(s.m.id, s.t.id, 's1', bash('r1', 'npm test'), TASK);
+      s.svc.onPermissionRequest(s.m.id, s.t.id, 's1', bash('r2', 'yarn test'), TASK);
+      s.svc.onPermissionRequest(s.m.id, s.t.id, 's1', bash('r3', 'node --test'), TASK);
+      expect(s.session.calls.map(c => c.requestId)).toEqual(['r3']);
+      expect(inbox.listOpen(s.db, Date.now()).map(e => e.requestId)).toEqual(['r1', 'r2']);
+    });
+
+    it('refuses inputs with keys other than command/description/timeout/run_in_background', () => {
+      const s = safeSetup();
+      s.svc.onPermissionRequest(s.m.id, s.t.id, 's1', bash('r1', 'git status', { description: 'd', timeout: 1000, run_in_background: false }), TASK);
+      s.svc.onPermissionRequest(s.m.id, s.t.id, 's1', bash('r2', 'git status', { dangerouslyDisableSandbox: true }), TASK);
+      s.svc.onPermissionRequest(s.m.id, s.t.id, 's1', bash('r3', 'git status', { cwd: '/' }), TASK);
+      expect(s.session.calls.map(c => c.requestId)).toEqual(['r1']);
+      expect(inbox.listOpen(s.db, Date.now()).map(e => e.requestId)).toEqual(['r2', 'r3']);
+    });
+
+    it('a reviewer scope auto-allows npm test (when opted in) but sends git commit, mkdir and test args to the inbox', () => {
+      const s = safeSetup({ settings: { autoAllow: true, autoRunTests: true } });
+      s.svc.onPermissionRequest(s.m.id, s.t.id, 's1', bash('r1', 'npm test'), REVIEWER);
+      s.svc.onPermissionRequest(s.m.id, s.t.id, 's1', bash('r2', 'git commit -m "x"'), REVIEWER);
+      s.svc.onPermissionRequest(s.m.id, s.t.id, 's1', bash('r3', 'mkdir src'), REVIEWER);
+      s.svc.onPermissionRequest(s.m.id, s.t.id, 's1', bash('r4', 'npm test -- --run'), REVIEWER);
+      expect(s.session.calls.map(c => c.requestId)).toEqual(['r1']);
+      expect(inbox.listOpen(s.db, Date.now()).map(e => e.requestId)).toEqual(['r2', 'r3', 'r4']);
+    });
+
+    it.each(['cd ..', 'cd /tmp && ls', 'Set-Location C:\\', 'pushd src', 'chdir x', 'sl ..', 'git status; cd x'])(
+      'after the user allows %j, that session gets no more auto-allows (other sessions still do)', cmd => {
+        const s = safeSetup();
+        s.reg.set('s2', s.session);
+        s.svc.onPermissionRequest(s.m.id, s.t.id, 's1', bash('r1', cmd), TASK);
+        const [e] = inbox.listOpen(s.db, Date.now());
+        s.svc.answerPermission(e.id, { allow: true });
+        s.svc.onPermissionRequest(s.m.id, s.t.id, 's1', bash('r2', 'git status'), TASK);
+        s.svc.onPermissionRequest(s.m.id, s.t.id, 's2', bash('r3', 'git status'), TASK);
+        expect(s.session.calls.map(c => c.requestId)).toEqual(['r1', 'r3']);
+        expect(inbox.listOpen(s.db, Date.now()).map(e2 => e2.requestId)).toEqual(['r2']);
+      });
+
+    it('a denied cd or a command that only mentions cd in a word does not stop auto-allow', () => {
+      const s = safeSetup();
+      s.svc.onPermissionRequest(s.m.id, s.t.id, 's1', bash('r1', 'cd ..'), TASK);
+      s.svc.answerPermission(inbox.listOpen(s.db, Date.now())[0].id, { allow: false });
+      s.svc.onPermissionRequest(s.m.id, s.t.id, 's1', bash('r2', 'npm install abcd'), TASK);
+      s.svc.answerPermission(inbox.listOpen(s.db, Date.now())[0].id, { allow: true });
+      s.svc.onPermissionRequest(s.m.id, s.t.id, 's1', bash('r3', 'git status'), TASK);
+      expect(s.session.calls.map(c => c.requestId)).toEqual(['r1', 'r2', 'r3']);
+    });
+
+    it('an always-allow rule that covers cd also stops auto-allow for the session', () => {
+      const s = safeSetup();
+      permissionRules.add(s.db, { missionId: s.m.id, toolName: 'Bash', inputPrefix: 'cd src' });
+      s.svc.onPermissionRequest(s.m.id, s.t.id, 's1', bash('r1', 'cd src'), TASK);
+      s.svc.onPermissionRequest(s.m.id, s.t.id, 's1', bash('r2', 'git status'), TASK);
+      expect(s.session.calls.map(c => c.requestId)).toEqual(['r1']);
+      expect(inbox.listOpen(s.db, Date.now()).map(e => e.requestId)).toEqual(['r2']);
+    });
+
     it('a session that is gone does not throw', () => {
-      const s = setup(fakeSession(true), { settings: { autoAllow: true } });
-      expect(() => s.svc.onPermissionRequest(s.m.id, s.t.id, 's1', req('r1', 'Bash', { command: 'npm test' }))).not.toThrow();
+      const s = safeSetup({ session: fakeSession(true) });
+      expect(() => s.svc.onPermissionRequest(s.m.id, s.t.id, 's1', bash('r1', 'git status'), TASK)).not.toThrow();
       expect(inbox.listOpen(s.db, Date.now())).toHaveLength(0);
     });
   });

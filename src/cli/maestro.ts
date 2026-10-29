@@ -1,7 +1,7 @@
 // `maestro run`: drives one mission from the terminal. Prints one line per engine event and turns every inbox entry
 // (permission, question, plan approval, merge decision) into a numbered prompt answered on stdin.
 //   npm run maestro -- run --project <path> --brief <file> [--title <t>] [--quick] [--base main] [--parallel 3] [--db <path>]
-//     [--no-auto-allow]
+//     [--no-auto-allow] [--auto-run-tests | --no-auto-run-tests]
 // Exit code: 0 when the mission ends done, 1 when it is stopped or failed (or cannot start).
 import { existsSync, mkdirSync, readFileSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
@@ -29,7 +29,9 @@ Options:
   --base <branch>    base branch (default: main)
   --parallel <n>     tasks running at the same time (default: 3)
   --db <path>        database file (default: %APPDATA%\\Maestro\\maestro.db; logs then go to <db folder>\\logs)
-  --no-auto-allow    ask about every task shell command, also those on the safe list (npm test, git status, ...)
+  --no-auto-allow    ask about every task shell command, also those on the safe list (git status, git commit, ...)
+  --auto-run-tests   let tasks run tests (npm test, node --test) without asking; skips the start-up question
+  --no-auto-run-tests  ask about every test run; skips the start-up question
 `;
 
 /** Conductor text lines are cut to this many characters. */
@@ -39,6 +41,8 @@ export interface RunArgs {
   project: string; brief: string; title?: string; quick: boolean; base: string; parallel: number; db?: string;
   /** Auto-allow task shell commands on the safe list (spec §9); false with --no-auto-allow. */
   autoAllow: boolean;
+  /** Also auto-allow test runs: true/false from the flags, undefined to ask at start-up. */
+  autoRunTests?: boolean;
   conductorScript?: string;
 }
 
@@ -51,20 +55,30 @@ export function parseRunArgs(argv: string[]): RunArgs {
       project: { type: 'string' }, brief: { type: 'string' }, title: { type: 'string' }, quick: { type: 'boolean' },
       base: { type: 'string' }, parallel: { type: 'string' }, db: { type: 'string' },
       'no-auto-allow': { type: 'boolean' },
+      'auto-run-tests': { type: 'boolean' },
+      'no-auto-run-tests': { type: 'boolean' },
       'conductor-script': { type: 'string' },
     },
   });
   if (positionals.length > 0) throw new Error(`Unexpected argument: ${positionals[0]}`);
   if (!values.project) throw new Error('--project is required');
   if (!values.brief) throw new Error('--brief is required');
+  if (values['auto-run-tests'] && values['no-auto-run-tests']) {
+    throw new Error('--auto-run-tests and --no-auto-run-tests cannot be used together');
+  }
   const parallel = values.parallel === undefined ? 3 : Number(values.parallel);
   if (!Number.isInteger(parallel) || parallel < 1 || parallel > 16) throw new Error('--parallel must be a whole number from 1 to 16');
   return {
     project: values.project, brief: values.brief, title: values.title, quick: values.quick ?? false,
     base: values.base ?? 'main', parallel, db: values.db, autoAllow: !values['no-auto-allow'],
+    autoRunTests: values['auto-run-tests'] ? true : values['no-auto-run-tests'] ? false : undefined,
     conductorScript: values['conductor-script'],
   };
 }
+
+export const RUN_TESTS_QUESTION = 'Running tests runs code, and a task that can edit files can change that code '
+  + '(test script, npm/yarn/pnpm config, test files), so it could run any program on this machine as you without a '
+  + 'prompt. Let tasks run tests unattended for this mission? (y/n) ';
 
 function defaultTitle(brief: string, file: string): string {
   const h = brief.split(/\r?\n/).map(l => /^#\s+(.+)$/.exec(l.trim())?.[1]?.trim()).find(Boolean);
@@ -165,6 +179,8 @@ export async function main(argv: string[], env: NodeJS.ProcessEnv = process.env)
 
   // ---- stopping ----
   let stopRequested = false;
+  let signalStop!: () => void;
+  const stopSignal = new Promise<void>(r => { signalStop = r; });
   /** Ctrl+C: stop the mission; a second Ctrl+C quits at once (the mission is recovered on the next start). */
   const requestStop = (why: string, escalate: boolean): void => {
     if (finished) return;
@@ -175,6 +191,7 @@ export async function main(argv: string[], env: NodeJS.ProcessEnv = process.env)
       return;
     }
     stopRequested = true;
+    signalStop();
     out(`${why}: stopping the mission… (press Ctrl+C again to quit at once)`);
     if (missionId) doStop(missionId);
   };
@@ -191,6 +208,11 @@ export async function main(argv: string[], env: NodeJS.ProcessEnv = process.env)
       out(`Recovered from an earlier run: ${report.conductorsResumed.length} conductors and ${report.resumed.length + report.restarted.length} tasks resumed, `
         + `${report.missionsFailed.length} missions failed.`);
     }
+    // Spec §9: test runs are auto-allowed only after the user's informed per-mission opt-in (default no).
+    let autoRunTests = args.autoAllow ? args.autoRunTests : false;
+    if (autoRunTests === undefined && !stopRequested) {
+      autoRunTests = await askRunTests(reader, stopSignal, !process.stdin.isTTY);
+    }
     if (stopRequested) { end(1); }
     else {
       const projectId = ensureProject(db, projectPath);
@@ -198,12 +220,14 @@ export async function main(argv: string[], env: NodeJS.ProcessEnv = process.env)
       const m = await engine.startMission({
         projectId, title, brief: briefText, depth: args.quick ? 'quick' : 'thorough', baseBranch: args.base,
         missionBranch: '', isolation: 'worktree', maxParallel: args.parallel, quick: args.quick,
+        autoAllow: args.autoAllow, autoRunTests: autoRunTests === true,
       });
       missionId = m.id;
       out(`Mission "${m.title}" (${m.id}) on branch ${m.missionBranch}, base ${m.baseBranch}, up to ${m.maxParallel} tasks at a time`);
       out(`Conductor log: ${join(logDir, 'missions', m.id, 'conductor.log')}`);
       out(args.autoAllow
-        ? 'Safe task commands (npm test, git status/diff/log/show, git add/commit, mkdir, ...) are allowed without asking; --no-auto-allow turns this off.'
+        ? `Safe task commands (git status/diff/log/show, git add/commit, mkdir, ...) are allowed without asking${
+          autoRunTests ? ', and so are test runs' : '; test runs are asked about'}. --no-auto-allow turns this off.`
         : 'Auto-allow is off: every task shell command is asked about.');
       for (const ev of buffered.splice(0)) printEvent(ev);
 
@@ -233,6 +257,21 @@ export async function main(argv: string[], env: NodeJS.ProcessEnv = process.env)
   await engine.shutdown().catch(e => out(`Shutdown: ${(e as Error).message}`));
   db.close();
   return code;
+}
+
+/** The start-up question: y or n (asked again otherwise); end of input or a stop counts as no. */
+async function askRunTests(reader: LineReader, stop: Promise<void>, echo: boolean): Promise<boolean> {
+  for (;;) {
+    showPrompt(RUN_TESTS_QUESTION);
+    const line = await reader.read(stop);
+    promptDone();
+    if (typeof line !== 'string') { out(''); return false; }
+    if (echo) out(line);
+    const a = line.trim().toLowerCase();
+    if (a === 'y' || a === 'yes') return true;
+    if (a === 'n' || a === 'no') return false;
+    out('Invalid answer: type y or n');
+  }
 }
 
 function printSummary(db: Db, m: Mission): void {

@@ -4,16 +4,32 @@
 // quoting, except the exact separator " && " and the inside of a quoted commit message.
 
 /**
- * 'task': every entry. 'reviewer' (spec-reviewer, code-reviewer): the test runners and git status/diff/log/show only,
- * no git add/commit, no mkdir, no ls/pwd.
+ * 'task': every entry. 'reviewer' (roles without edit tools, e.g. spec-reviewer, code-reviewer): the test runners
+ * (without any `--` arguments) and git status/diff/log/show only; no git add/commit, no mkdir, no ls/pwd.
  */
 export type SafeScope = 'task' | 'reviewer';
 
-/** Roles that may only run tests and read git history (spec §8.1). */
-export const REVIEWER_ROLES: ReadonlySet<string> = new Set(['spec-reviewer', 'code-reviewer']);
+export interface SafeOptions {
+  scope?: SafeScope;
+  /**
+   * Test runners (npm/pnpm/yarn test, node --test) are on the list only when the mission opted in (autoRunTests,
+   * default false): running tests runs code that an edit-capable task can change.
+   */
+  runTests?: boolean;
+  /** The worktree has its own package.json (else npm/pnpm/yarn would walk up to another project). */
+  packageJson?: boolean;
+}
 
-export function safeScopeFor(role: string): SafeScope {
-  return REVIEWER_ROLES.has(role) ? 'reviewer' : 'task';
+const EDIT_TOOLS: readonly string[] = ['Edit', 'Write', 'NotebookEdit', 'MultiEdit'];
+
+/** True for a role with no tool list (every tool) or a list with an edit tool. */
+export function hasEditTools(tools: readonly string[] | undefined): boolean {
+  return tools === undefined || tools.some(t => EDIT_TOOLS.includes(t));
+}
+
+/** The scope follows the role's tools: no edit tools means the reviewer scope. */
+export function safeScopeFor(tools: readonly string[] | undefined): SafeScope {
+  return hasEditTools(tools) ? 'task' : 'reviewer';
 }
 
 const MAX_LENGTH = 1000;
@@ -96,13 +112,21 @@ const TEST_RUNNERS: string[][] = [
   ['npm', 'test'], ['npm', 'run', 'test'], ['npm', 't'], ['pnpm', 'test'], ['yarn', 'test'],
 ];
 
-/** `npm test [--silent|-s] [-- <args>]`: no runner flags besides --silent (e.g. no --script-shell, --prefix). */
-function testRunnerArgs(rest: Token[]): boolean {
+/** Test-runner flags that hang (watch mode, a UI server) or write files (coverage). */
+const TEST_FLAG_DENY = /^(--watch|--ui|--coverage|-w$)/i;
+
+/**
+ * `npm test [--silent|-s] [-- <args>]`: no runner flags besides --silent (e.g. no --script-shell, --prefix). The
+ * reviewer scope allows no `--` arguments at all.
+ */
+function testRunnerArgs(rest: Token[], scope: SafeScope): boolean {
   let i = 0;
   while (i < rest.length && !rest[i].quoted && (rest[i].value === '--silent' || rest[i].value === '-s')) i++;
   if (i === rest.length) return true;
+  if (scope === 'reviewer') return false;
   if (rest[i].quoted || rest[i].value !== '--') return false;
-  return rest.slice(i + 1).every(t => !t.quoted && TEST_ARG_RE.test(t.value) && !escapesWorktree(t.value));
+  return rest.slice(i + 1).every(t =>
+    !t.quoted && TEST_ARG_RE.test(t.value) && !escapesWorktree(t.value) && !TEST_FLAG_DENY.test(t.value));
 }
 
 /** `node --test [relative test paths]`. */
@@ -187,11 +211,12 @@ function lsArgs(rest: Token[]): boolean {
   return rest.every(t => !t.quoted && (/^-[A-Za-z1]+$/.test(t.value) || (isPath(t) && !t.value.startsWith('-'))));
 }
 
-function segmentIsSafe(tokens: Token[], scope: SafeScope): boolean {
+function segmentIsSafe(tokens: Token[], o: Required<SafeOptions>): boolean {
+  const scope = o.scope;
   for (const words of TEST_RUNNERS) {
-    if (startsWith(tokens, words)) return testRunnerArgs(tokens.slice(words.length));
+    if (startsWith(tokens, words)) return o.runTests && o.packageJson && testRunnerArgs(tokens.slice(words.length), scope);
   }
-  if (startsWith(tokens, ['node', '--test'])) return nodeTestArgs(tokens.slice(2));
+  if (startsWith(tokens, ['node', '--test'])) return o.runTests && nodeTestArgs(tokens.slice(2));
   for (const sub of ['status', 'diff', 'log', 'show']) {
     if (startsWith(tokens, ['git', sub])) return gitReadArgs(tokens.slice(2));
   }
@@ -205,10 +230,11 @@ function segmentIsSafe(tokens: Token[], scope: SafeScope): boolean {
 }
 
 /**
- * True when every ` && `-separated segment of `cmd` is on the safe list for `scope`. Any doubt is false: the
- * request then goes to the user as before.
+ * True when every ` && `-separated segment of `cmd` is on the safe list for `opts` (default: task scope, no test
+ * runs). Any doubt is false: the request then goes to the user as before.
  */
-export function isSafeTaskCommand(cmd: unknown, scope: SafeScope = 'task'): boolean {
+export function isSafeTaskCommand(cmd: unknown, opts: SafeOptions = {}): boolean {
+  const o: Required<SafeOptions> = { scope: opts.scope ?? 'task', runTests: opts.runTests ?? false, packageJson: opts.packageJson ?? false };
   if (typeof cmd !== 'string' || cmd.length === 0 || cmd.length > MAX_LENGTH) return false;
   if (FORBIDDEN.test(cmd)) return false;
   const segments = cmd.split(SEPARATOR);
@@ -219,7 +245,7 @@ export function isSafeTaskCommand(cmd: unknown, scope: SafeScope = 'task'): bool
     if (seg === '') return false;
     const tokens = tokenize(seg);
     if (!tokens || tokens.length === 0) return false;
-    if (!segmentIsSafe(tokens, scope)) return false;
+    if (!segmentIsSafe(tokens, o)) return false;
   }
   return true;
 }

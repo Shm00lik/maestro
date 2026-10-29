@@ -77,45 +77,79 @@ const REJECTED: string[] = [
 ];
 
 describe('isSafeTaskCommand', () => {
+  /** Tests opted in for the mission and a package.json in the worktree. */
+  const FULL = { runTests: true, packageJson: true };
+
   it.each(ALLOWED)('allows %j', cmd => {
-    expect(isSafeTaskCommand(cmd)).toBe(true);
+    expect(isSafeTaskCommand(cmd, FULL)).toBe(true);
   });
 
   it.each(REJECTED)('rejects %j', cmd => {
-    expect(isSafeTaskCommand(cmd)).toBe(false);
+    expect(isSafeTaskCommand(cmd, FULL)).toBe(false);
   });
 
   it('rejects non-strings', () => {
-    for (const v of [undefined, null, 1, {}, ['npm test']]) expect(isSafeTaskCommand(v)).toBe(false);
+    for (const v of [undefined, null, 1, {}, ['npm test']]) expect(isSafeTaskCommand(v, FULL)).toBe(false);
   });
 
   it('accepts up to 8 segments', () => {
     expect(isSafeTaskCommand(Array.from({ length: 8 }, () => 'git status').join(' && '))).toBe(true);
   });
 
+  const RUNNERS = ['npm test', 'npm run test', 'npm t', 'pnpm test', 'yarn test', 'node --test', 'node --test test/a.test.js'];
+
+  it.each(RUNNERS)('test runs are off unless the mission opted in: %j', cmd => {
+    expect(isSafeTaskCommand(cmd)).toBe(false);
+    expect(isSafeTaskCommand(cmd, { packageJson: true })).toBe(false);
+    expect(isSafeTaskCommand(`git status && ${cmd}`, { packageJson: true })).toBe(false);
+    expect(isSafeTaskCommand(cmd, { scope: 'reviewer', packageJson: true })).toBe(false);
+    expect(isSafeTaskCommand(cmd, FULL)).toBe(true);
+  });
+
+  it('git, mkdir, ls and pwd stay allowed without the test opt-in', () => {
+    for (const cmd of ['git status', 'git add src/a.js && git commit -m "x"', 'mkdir -p src', 'ls', 'pwd']) {
+      expect(isSafeTaskCommand(cmd)).toBe(true);
+    }
+  });
+
+  it('npm, pnpm and yarn test need a package.json in the worktree; node --test does not', () => {
+    for (const cmd of ['npm test', 'npm run test', 'npm t', 'pnpm test', 'yarn test', 'npm test -- --run']) {
+      expect(isSafeTaskCommand(cmd, { runTests: true })).toBe(false);
+    }
+    expect(isSafeTaskCommand('node --test test/a.test.js', { runTests: true })).toBe(true);
+  });
+
+  it.each([
+    'npm test -- --watch', 'npm test -- --watchAll', 'npm test -- --watch=true', 'npm test -- -w', 'npm test -- --ui',
+    'npm test -- --coverage', 'npm test -- --coverage.enabled=true', 'yarn test -- --WATCH', 'npm test -- --run --watch',
+  ])('rejects test-runner flags that hang or write files: %j', cmd => {
+    expect(isSafeTaskCommand(cmd, FULL)).toBe(false);
+  });
+
   const REVIEWER_ALLOWED = [
-    'npm test', 'npm run test', 'npm t', 'pnpm test', 'yarn test', 'node --test test/a.test.js', 'npm test -- --run',
+    'npm test', 'npm run test', 'npm t', 'pnpm test', 'yarn test', 'node --test test/a.test.js', 'npm test --silent',
     'git status', 'git diff HEAD~1', 'git log --oneline -5', 'git show HEAD:src/a.js',
     'npm test && git status && git diff',
   ];
   const REVIEWER_REJECTED = [
     'git add .', 'git commit -m "x"', 'mkdir -p src', 'mkdir src', 'ls', 'pwd',
     'npm test && git commit -m "x"', 'git status && mkdir x', 'npm test 2>&1 | tail -15',
+    'npm test -- --run', 'npm test --', 'npm run test -- test/a.test.js', 'yarn test -- x',
   ];
 
   it.each(REVIEWER_ALLOWED)('reviewer scope allows %j', cmd => {
-    expect(isSafeTaskCommand(cmd, 'reviewer')).toBe(true);
+    expect(isSafeTaskCommand(cmd, { ...FULL, scope: 'reviewer' })).toBe(true);
   });
 
   it.each(REVIEWER_REJECTED)('reviewer scope rejects %j', cmd => {
-    expect(isSafeTaskCommand(cmd, 'reviewer')).toBe(false);
+    expect(isSafeTaskCommand(cmd, { ...FULL, scope: 'reviewer' })).toBe(false);
   });
 
-  it('reviewer roles get the reviewer scope, every other role the task scope', () => {
-    expect(safeScopeFor('spec-reviewer')).toBe('reviewer');
-    expect(safeScopeFor('code-reviewer')).toBe('reviewer');
-    for (const r of ['implementer', 'test-author', 'debugger', 'qa', 'architect', 'designer', 'researcher']) {
-      expect(safeScopeFor(r)).toBe('task');
-    }
+  it('the scope follows the role tools: no edit tools means the reviewer scope', () => {
+    expect(safeScopeFor(['Read', 'Glob', 'Grep', 'Bash'])).toBe('reviewer');
+    expect(safeScopeFor(['Read', 'Glob', 'Grep'])).toBe('reviewer');
+    expect(safeScopeFor([])).toBe('reviewer');
+    expect(safeScopeFor(undefined)).toBe('task');
+    for (const edit of ['Edit', 'Write', 'NotebookEdit', 'MultiEdit']) expect(safeScopeFor(['Read', 'Bash', edit])).toBe('task');
   });
 });

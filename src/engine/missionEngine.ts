@@ -24,6 +24,7 @@ import type { StreamEvent } from '../claude/protocol.js';
 import {
   branchCommits, branchExists, ensureMissionBranch, pruneWorktrees, removeIntegrationWorktree, removeWorktree, withRepoLock, worktreeDirFor,
 } from '../git/worktrees.js';
+import { gitSafeEnv } from '../git/gitEnv.js';
 import { startBridgeHttp, writeBridgeConfig, type BridgeHttp } from '../bridge/http.js';
 import type { BridgeHandlers, DispatchInput, TaskSummary } from '../bridge/tools.js';
 import { InboxService } from './inbox.js';
@@ -91,6 +92,11 @@ export interface MissionEngineOptions {
    * true). Stored per mission as settings.autoAllow; never read from the project repository.
    */
   autoAllow?: boolean;
+  /**
+   * Default for new missions: also auto-allow test runs (npm/pnpm/yarn test, node --test). Default false: running
+   * tests runs code an edit-capable task can change. Stored per mission as settings.autoRunTests.
+   */
+  autoRunTests?: boolean;
 }
 
 export type StartMissionInput = Omit<NewMission, 'missionBranch'> & {
@@ -99,6 +105,8 @@ export type StartMissionInput = Omit<NewMission, 'missionBranch'> & {
   quick?: boolean;
   /** Overrides the engine's autoAllow default for this mission. */
   autoAllow?: boolean;
+  /** Overrides the engine's autoRunTests default for this mission (the user's informed opt-in). */
+  autoRunTests?: boolean;
 };
 
 export type MergeDecisionResult =
@@ -239,7 +247,7 @@ const mission8 = (id: string): string => id.replace(/[^A-Za-z0-9]/g, '').slice(0
 
 async function git(cwd: string, args: string[]): Promise<string> {
   try {
-    const { stdout } = await execFileP('git', args, { cwd, windowsHide: true, maxBuffer: 64 * 1024 * 1024 });
+    const { stdout } = await execFileP('git', args, { cwd, windowsHide: true, maxBuffer: 64 * 1024 * 1024, env: gitSafeEnv() });
     return stdout.trim();
   } catch (e) {
     const err = e as Error & { stderr?: string };
@@ -405,11 +413,14 @@ export class MissionEngine extends EventEmitter implements BridgeHandlers {
 
   async startMission(input: StartMissionInput): Promise<Mission> {
     this.assertOpen();
-    const { quick, missionBranch: givenBranch, autoAllow, ...rest } = input;
+    const { quick, missionBranch: givenBranch, autoAllow, autoRunTests, ...rest } = input;
     if (rest.settings !== undefined && (typeof rest.settings !== 'object' || rest.settings === null || Array.isArray(rest.settings))) {
       throw new Error('Mission settings must be an object');
     }
-    rest.settings = { ...(rest.settings as Record<string, unknown> | undefined), autoAllow: autoAllow ?? this.o.autoAllow ?? true };
+    rest.settings = {
+      ...(rest.settings as Record<string, unknown> | undefined), autoAllow: autoAllow ?? this.o.autoAllow ?? true,
+      autoRunTests: autoRunTests ?? this.o.autoRunTests ?? false,
+    };
     const project = projects.list(this.db).find(p => p.id === input.projectId);
     if (!project) throw new Error(`Unknown project: ${input.projectId}`);
     const root = project.path;
@@ -507,9 +518,9 @@ export class MissionEngine extends EventEmitter implements BridgeHandlers {
       `- Isolation: ${m.isolation}`,
       `- Parallel tasks: up to ${m.maxParallel}`,
     ];
-    // autoAllow is Maestro's own permission setting (spec §9), not something the conductor plans with.
+    // autoAllow and autoRunTests are Maestro's own permission settings (spec §9), not something the conductor plans with.
     const other = typeof m.settings === 'object' && m.settings !== null && !Array.isArray(m.settings)
-      ? Object.fromEntries(Object.entries(m.settings).filter(([k]) => k !== 'autoAllow'))
+      ? Object.fromEntries(Object.entries(m.settings).filter(([k]) => k !== 'autoAllow' && k !== 'autoRunTests'))
       : m.settings;
     const hasOther = other !== null && other !== undefined && !(typeof other === 'object' && Object.keys(other).length === 0);
     if (hasOther) settings.push(`- Other settings: ${JSON.stringify(other)}`);
@@ -1081,7 +1092,7 @@ export class MissionEngine extends EventEmitter implements BridgeHandlers {
     if (h) return h;
     const head = await git(root, ['rev-parse', '--abbrev-ref', 'HEAD']).catch(() => '');
     // Untracked files do not block the merge (a merge that would overwrite one fails, and is asked again).
-    const clean = (await git(root, ['status', '--porcelain', '--untracked-files=no'])) === '';
+    const clean = (await git(root, ['status', '--porcelain', '--untracked-files=no', '--ignore-submodules=all'])) === '';
     if ((h = this.halt(c))) return h;
     if (head === m.baseBranch && clean) return this.mergeIn(root, m.missionBranch, msg);
 
@@ -1424,8 +1435,8 @@ export class MissionEngine extends EventEmitter implements BridgeHandlers {
   }
 
   /**
-   * Removes the worktree folders of the mission's done tasks (their branches stay). A task that is not done, or
-   * whose worktree has uncommitted changes, keeps its folder.
+   * Removes the worktree folders of the mission's done tasks (their branches stay). A task that is not done keeps its
+   * folder, and so does one git refuses to remove (modified or untracked files): no --force.
    */
   private async cleanupTaskWorktrees(c: MissionCtx): Promise<void> {
     const root = c.projectRoot;
@@ -1435,11 +1446,11 @@ export class MissionEngine extends EventEmitter implements BridgeHandlers {
       try {
         await withRepoLock(root, async () => {
           if (!existsSync(dir)) { await pruneWorktrees(root); return; }
-          if ((await git(dir, ['status', '--porcelain'])).trim() !== '') {
-            this.warn(`keeping the worktree of ${t.taskKey} (uncommitted changes): ${dir}`);
+          try { await removeWorktree(root, dir, { force: false }); }
+          catch (e) {
+            this.warn(`keeping the worktree of ${t.taskKey}: ${dir} (${(e as Error).message})`);
             return;
           }
-          await removeWorktree(root, dir);
           await pruneWorktrees(root);
         });
       } catch (e) { this.warn(`remove worktree of ${t.taskKey}: ${(e as Error).message}`); }

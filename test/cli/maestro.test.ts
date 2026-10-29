@@ -9,6 +9,7 @@ import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { openDb } from '../../src/store/db.js';
 import { missions } from '../../src/store/repos.js';
+import { parseRunArgs } from '../../src/cli/maestro.js';
 
 const FAKE = fileURLToPath(new URL('../fake-claude/fake-claude.ts', import.meta.url));
 const CLI = fileURLToPath(new URL('../../src/cli/maestro.ts', import.meta.url));
@@ -48,11 +49,17 @@ const TASK_PERMISSION = [
   { writeFile: 'out-$SESSION.txt', content: 'work\n' }, RESULT('Did it.\n\n## Handoff\nMade a file.'), { waitFor: 'stdin-close' },
 ];
 const TASK_HANG = [INIT, USER, ...UNTIL_INTERRUPT];
-/** Asks to run `npm test` (on the safe list), then finishes like TASK_PERMISSION. */
-const TASK_SAFE_COMMAND = [
+/** Asks to run `command`, then finishes like TASK_PERMISSION. */
+const TASK_COMMAND = (command: string) => [
   INIT, USER,
-  { ...PERMISSION, emit: { ...PERMISSION.emit, request: { ...PERMISSION.emit.request, input: { command: 'npm test', description: 'Run tests' } } } },
+  { ...PERMISSION, emit: { ...PERMISSION.emit, request: { ...PERMISSION.emit.request, input: { command, description: 'Run it' } } } },
   ...TASK_PERMISSION.slice(3),
+];
+const ONE_TASK_SCRIPT = [
+  { op: 'submit_plan', plan: 'plan.md' },
+  { op: 'dispatch', task_id: 'T1', owns: ['a/**'] },
+  { op: 'wait', tasks: ['T1'] },
+  { op: 'finish', summary: 'Done.' },
 ];
 
 const PLAN = `# Plan
@@ -111,7 +118,12 @@ afterEach(() => {
 
 interface CliResult { code: number | null; out: string; err: string }
 
-function runCli(o: { taskSteps: object[]; script: object[]; answers: string; extraArgs?: string[]; conductorSteps?: object[] }): Promise<CliResult> {
+/** Without askTests (and no test flag in extraArgs) the run passes --no-auto-run-tests, so nothing is asked at start-up. */
+function runCli(o: {
+  taskSteps: object[]; script: object[]; answers: string; extraArgs?: string[]; conductorSteps?: object[]; askTests?: boolean;
+}): Promise<CliResult> {
+  const extra = o.extraArgs ?? [];
+  const testFlag = o.askTests || extra.some(a => a === '--auto-run-tests' || a === '--no-auto-run-tests' || a === '--no-auto-allow');
   const taskScenario = join(dir, 'task-scenario.json');
   const condScenario = join(dir, 'conductor-scenario.json');
   const scriptPath = join(dir, 'conductor-script.json');
@@ -120,7 +132,8 @@ function runCli(o: { taskSteps: object[]; script: object[]; answers: string; ext
   writeFileSync(scriptPath, JSON.stringify(o.script));
   const args = [
     '--import', TSX, CLI, 'run', '--project', root, '--brief', join(dir, 'brief.md'), '--quick',
-    '--db', join(dir, 'maestro.db'), '--conductor-script', scriptPath, ...(o.extraArgs ?? []),
+    '--db', join(dir, 'maestro.db'), '--conductor-script', scriptPath, ...extra,
+    ...(testFlag ? [] : ['--no-auto-run-tests']),
   ];
   const child = spawn(process.execPath, args, {
     cwd: dir, windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'],
@@ -185,35 +198,69 @@ describe('maestro run', () => {
     expect(git(root, 'rev-parse', 'main')).not.toBe(git(root, 'rev-parse', m.missionBranch));
   }, T);
 
-  it('cli auto-allows a safe task command and prints it; --no-auto-allow asks instead', async () => {
-    const script = [
-      { op: 'submit_plan', plan: 'plan.md' },
-      { op: 'dispatch', task_id: 'T1', owns: ['a/**'] },
-      { op: 'wait', tasks: ['T1'] },
-      { op: 'finish', summary: 'Done.' },
-    ];
-    // Plan: y. Merge: k. No permission prompt.
-    const r = await runCli({ taskSteps: TASK_SAFE_COMMAND, script, answers: 'y\nk\n' });
+  it('cli auto-allows a safe git command and prints it; test runs are still asked about', async () => {
+    // Plan: y. npm test: y (asked). Merge: k.
+    const r = await runCli({ taskSteps: TASK_COMMAND('git status'), script: ONE_TASK_SCRIPT, answers: 'y\nk\n' });
     expect(r.code, r.out + r.err).toBe(0);
-    expect(r.out).toContain('[T1] auto-allowed: npm test');
+    expect(r.out).toContain('[T1] auto-allowed: git status');
     expect(r.out).not.toMatch(/Permission/);
-    expect(onlyMission().settings).toEqual({ autoAllow: true });
+    expect(r.out).toContain('test runs are asked about');
+    expect(onlyMission().settings).toEqual({ autoAllow: true, autoRunTests: false });
   }, T);
 
-  it('cli --no-auto-allow asks about a safe task command', async () => {
-    const script = [
-      { op: 'submit_plan', plan: 'plan.md' },
-      { op: 'dispatch', task_id: 'T1', owns: ['a/**'] },
-      { op: 'wait', tasks: ['T1'] },
-      { op: 'finish', summary: 'Done.' },
-    ];
-    const r = await runCli({ taskSteps: TASK_SAFE_COMMAND, script, answers: 'y\ny\nk\n', extraArgs: ['--no-auto-allow'] });
+  it('cli asks once whether tests may run unattended, explaining the risk; y auto-allows npm test', async () => {
+    writeFileSync(join(root, 'package.json'), '{"scripts":{"test":"node -e 0"}}\n');
+    git(root, 'add', 'package.json');
+    git(root, 'commit', '-m', 'package');
+    // Start-up: an invalid answer, then y. Plan: y. Merge: k.
+    const r = await runCli({ taskSteps: TASK_COMMAND('npm test'), script: ONE_TASK_SCRIPT, answers: 'maybe\ny\ny\nk\n', askTests: true });
+    expect(r.code, r.out + r.err).toBe(0);
+    expect(r.out).toContain('could run any program on this machine as you without a prompt');
+    expect(r.out).toContain('Invalid answer: type y or n');
+    expect(r.out).toContain('[T1] auto-allowed: npm test');
+    expect(onlyMission().settings).toEqual({ autoAllow: true, autoRunTests: true });
+  }, T);
+
+  it('cli: answering n at start-up keeps test runs asked about', async () => {
+    writeFileSync(join(root, 'package.json'), '{}\n');
+    git(root, 'add', 'package.json');
+    git(root, 'commit', '-m', 'package');
+    // Start-up: n. Plan: y. npm test: y. Merge: k.
+    const r = await runCli({ taskSteps: TASK_COMMAND('npm test'), script: ONE_TASK_SCRIPT, answers: 'n\ny\ny\nk\n', askTests: true });
     expect(r.code, r.out + r.err).toBe(0);
     expect(r.out).toMatch(/Bash: npm test/);
     expect(r.out).not.toContain('auto-allowed');
-    expect(r.out).toContain('Auto-allow is off');
-    expect(onlyMission().settings).toEqual({ autoAllow: false });
+    expect(onlyMission().settings).toEqual({ autoAllow: true, autoRunTests: false });
   }, T);
+
+  it('cli --auto-run-tests skips the question', async () => {
+    writeFileSync(join(root, 'package.json'), '{}\n');
+    git(root, 'add', 'package.json');
+    git(root, 'commit', '-m', 'package');
+    const r = await runCli({ taskSteps: TASK_COMMAND('npm test'), script: ONE_TASK_SCRIPT, answers: 'y\nk\n', extraArgs: ['--auto-run-tests'] });
+    expect(r.code, r.out + r.err).toBe(0);
+    expect(r.out).not.toContain('unattended');
+    expect(r.out).toContain('[T1] auto-allowed: npm test');
+    expect(onlyMission().settings).toEqual({ autoAllow: true, autoRunTests: true });
+  }, T);
+
+  it('cli --no-auto-allow asks about a safe task command and does not ask about tests', async () => {
+    const r = await runCli({ taskSteps: TASK_COMMAND('git status'), script: ONE_TASK_SCRIPT, answers: 'y\ny\nk\n', extraArgs: ['--no-auto-allow'] });
+    expect(r.code, r.out + r.err).toBe(0);
+    expect(r.out).toMatch(/Bash: git status/);
+    expect(r.out).not.toContain('auto-allowed');
+    expect(r.out).not.toContain('unattended');
+    expect(r.out).toContain('Auto-allow is off');
+    expect(onlyMission().settings).toEqual({ autoAllow: false, autoRunTests: false });
+  }, T);
+
+  it('parseRunArgs: the test flags', () => {
+    const base = ['run', '--project', 'p', '--brief', 'b'];
+    expect(parseRunArgs(base).autoRunTests).toBeUndefined();
+    expect(parseRunArgs([...base, '--auto-run-tests']).autoRunTests).toBe(true);
+    expect(parseRunArgs([...base, '--no-auto-run-tests']).autoRunTests).toBe(false);
+    expect(() => parseRunArgs([...base, '--auto-run-tests', '--no-auto-run-tests'])).toThrow(/together/);
+  });
 
   it('cli exits 1 when the mission is stopped', async () => {
     const script = [

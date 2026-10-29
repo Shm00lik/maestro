@@ -2,11 +2,13 @@
 // are on the pre-approved safe list or match mission "always allow" rules (never the conductor's), and delivers each
 // answer back to the right session once.
 import { EventEmitter } from 'node:events';
+import { existsSync } from 'node:fs';
+import { join } from 'node:path';
 import type { Db } from '../store/db.js';
 import { events, inbox, missions, permissionRules, tasks, Expired, SHELL_TOOLS, UNSAFE_SHELL, type InboxEntry } from '../store/repos.js';
 import { SessionClosed, type ClaudeSession } from '../claude/session.js';
 import type { StreamEvent } from '../claude/protocol.js';
-import { isSafeTaskCommand, safeScopeFor } from './safeCommands.js';
+import { isSafeTaskCommand, type SafeScope } from './safeCommands.js';
 
 export interface SessionRegistry { get(sessionRowId: string): ClaudeSession | undefined }
 
@@ -30,8 +32,21 @@ interface QuestionPayload { question: string; options?: string[] }
 
 interface Pending { resolve(answer: string): void; reject(err: Error): void; options?: string[] }
 
+/** What the task runner knows about the requesting session. */
+export interface TaskRequestContext {
+  /** Safe-list scope from the role's tools (no edit tools: 'reviewer'). Without it nothing is auto-allowed. */
+  safeScope?: SafeScope;
+}
+
+/** The only input keys a safe shell request may carry (e.g. never dangerouslyDisableSandbox). */
+const SAFE_INPUT_KEYS: ReadonlySet<string> = new Set(['command', 'description', 'timeout', 'run_in_background']);
+/** Commands that change the shell's directory (Bash and PowerShell, with aliases). */
+const CHANGES_DIR = /(^|[\s;&|(){}`])(cd|chdir|pushd|popd|set-location|push-location|pop-location|sl)(?=$|[\s;&|(){}`])/i;
+
 export class InboxService extends EventEmitter {
   private pending = new Map<string, Pending>();
+  /** Task session rows where a directory change was allowed: their cwd may have left the worktree. */
+  private movedSessions = new Set<string>();
 
   constructor(private db: Db, private sessions: SessionRegistry) { super(); }
 
@@ -45,11 +60,13 @@ export class InboxService extends EventEmitter {
     return e;
   }
 
-  onPermissionRequest(missionId: string, taskId: string | null, sessionRowId: string, ev: PermissionRequestEvent): void {
+  onPermissionRequest(
+    missionId: string, taskId: string | null, sessionRowId: string, ev: PermissionRequestEvent, ctx?: TaskRequestContext,
+  ): void {
     // The safe list and always-allow rules cover task sessions only: a conductor request (taskId null) always goes
     // to the user.
     if (taskId !== null) {
-      const safe = this.safeCommand(missionId, taskId, ev);
+      const safe = ctx?.safeScope ? this.safeCommand(missionId, taskId, sessionRowId, ev, ctx.safeScope) : null;
       if (safe !== null) {
         events.append(this.db, { missionId, taskId, type: 'auto-allowed', data: { taskId, command: safe } });
         this.allow(sessionRowId, ev);
@@ -57,6 +74,7 @@ export class InboxService extends EventEmitter {
         return;
       }
       if (permissionRules.match(this.db, missionId, ev.toolName, ev.input)) {
+        this.noteDirChange(sessionRowId, ev.toolName, ev.input);
         this.allow(sessionRowId, ev);
         return;
       }
@@ -77,19 +95,34 @@ export class InboxService extends EventEmitter {
     }
   }
 
+  /** An allowed shell command that changes directory ends auto-allow for that session (its cwd may have moved). */
+  private noteDirChange(sessionRowId: string, toolName: string, input: unknown): void {
+    if (!SHELL_TOOLS.has(toolName)) return;
+    const cmd = typeof input === 'object' && input !== null ? (input as Record<string, unknown>).command : undefined;
+    if (typeof cmd === 'string' && CHANGES_DIR.test(cmd)) this.movedSessions.add(sessionRowId);
+  }
+
   /**
-   * Spec §9: the command of a Bash/PowerShell request from a task session when it is on the safe list for the task's
-   * role and the mission has auto-allow on (settings.autoAllow === true, set by the engine); otherwise null.
+   * Spec §9: the command of a Bash/PowerShell request from a task session when it is on the safe list for the
+   * session's scope and the mission has auto-allow on (settings.autoAllow === true, set by the engine); otherwise
+   * null. Test runs also need settings.autoRunTests === true; npm/pnpm/yarn test also a package.json in the worktree.
    */
-  private safeCommand(missionId: string, taskId: string, ev: PermissionRequestEvent): string | null {
-    if (!SHELL_TOOLS.has(ev.toolName)) return null;
-    const settings = missions.get(this.db, missionId)?.settings;
-    if (typeof settings !== 'object' || settings === null || (settings as Record<string, unknown>).autoAllow !== true) return null;
+  private safeCommand(
+    missionId: string, taskId: string, sessionRowId: string, ev: PermissionRequestEvent, scope: SafeScope,
+  ): string | null {
+    if (!SHELL_TOOLS.has(ev.toolName) || this.movedSessions.has(sessionRowId)) return null;
+    const settings = missions.get(this.db, missionId)?.settings as Record<string, unknown> | null | undefined;
+    if (typeof settings !== 'object' || settings === null || settings.autoAllow !== true) return null;
     const task = tasks.get(this.db, taskId);
-    if (!task || task.missionId !== missionId) return null;
-    const cmd = typeof ev.input === 'object' && ev.input !== null ? (ev.input as Record<string, unknown>).command : undefined;
-    if (typeof cmd !== 'string' || !isSafeTaskCommand(cmd, safeScopeFor(task.agent))) return null;
-    return cmd;
+    if (!task || task.missionId !== missionId || !task.worktreePath) return null;
+    if (typeof ev.input !== 'object' || ev.input === null || Array.isArray(ev.input)) return null;
+    const input = ev.input as Record<string, unknown>;
+    if (Object.keys(input).some(k => !SAFE_INPUT_KEYS.has(k))) return null;
+    const cmd = input.command;
+    const ok = typeof cmd === 'string' && isSafeTaskCommand(cmd, {
+      scope, runTests: settings.autoRunTests === true, packageJson: existsSync(join(task.worktreePath, 'package.json')),
+    });
+    return ok ? cmd : null;
   }
 
   /** The CLI cancelled a pending request (e.g. after an interrupt): expire the entry, write nothing to the session. */
@@ -120,6 +153,7 @@ export class InboxService extends EventEmitter {
 
     // Store first: a second click gets AlreadyAnswered/Expired here and never reaches the session.
     inbox.answer(this.db, entryId, a);
+    if (a.allow && entry.taskId !== null) this.noteDirChange(p.sessionRowId, p.toolName, p.input);
 
     const result: PermissionAnswerResult = { delivered: false, ruleStored: false };
     if (a.allow && a.always) {

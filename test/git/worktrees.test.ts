@@ -208,3 +208,39 @@ describe('worktrees', () => {
     expect(await isRegisteredWorktree(root, dir)).toBe(true);
   });
 });
+
+describe('removeWorktree without force', () => {
+  it('refuses a worktree with a modified or untracked file and removes a clean one', async () => {
+    const root = makeRepo();
+    git(root, 'branch', 'm', 'main');
+    for (const [name, dirty] of [['mod', 'a.txt'], ['untracked', 'new.txt'], ['clean', '']] as const) {
+      const dir = worktreeDirFor(root, 'mission-1', name);
+      await createTaskWorktree(root, 'm', `m--${name}`, dir);
+      if (dirty) writeFileSync(join(dir, dirty), 'dirty\n');
+      if (dirty) {
+        await expect(removeWorktree(root, dir, { force: false })).rejects.toThrow();
+        expect(existsSync(join(dir, dirty))).toBe(true);
+      } else {
+        await removeWorktree(root, dir, { force: false });
+        expect(existsSync(dir)).toBe(false);
+      }
+    }
+  });
+});
+
+describe('git hooks', () => {
+  it("Maestro's merges in the integration worktree and worktree setup run no repo hooks", async () => {
+    const root = makeRepo();
+    const marker = join(root, '..', `hook-${Date.now()}.txt`).replace(/\\/g, '/');
+    for (const h of ['post-checkout', 'pre-merge-commit', 'post-merge', 'pre-commit', 'commit-msg']) {
+      writeFileSync(join(root, '.git', 'hooks', h), `#!/bin/sh\necho ${h} >> "${marker}"\n`, { mode: 0o755 });
+    }
+    await ensureMissionBranch(root, 'main', 'm');
+    const dir = worktreeDirFor(root, 'mission-2', 'T1');
+    await createTaskWorktree(root, 'm', 'm--T1', dir);
+    git(dir, '-c', 'core.hooksPath=/nonexistent', 'commit', '--allow-empty', '-m', 'task');
+    const res = await mergeTaskBranch(root, 'm', 'm--T1', 'Merge T1', 'mission-2');
+    expect(res.ok).toBe(true);
+    expect(existsSync(marker)).toBe(false);
+  });
+});

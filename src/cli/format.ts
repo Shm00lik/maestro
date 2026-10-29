@@ -41,6 +41,10 @@ export function formatEvent(db: Db, ev: EventRow): string | null {
     }
     case 'auto-allowed':
       return `[${key}] auto-allowed: ${short(String(d.command ?? ''), 160)}`;
+    case 'read-only-changes-discarded': {
+      const files: string[] = Array.isArray(d.files) ? d.files : [];
+      return `[${key}] WARNING: a read-only role left changes; discarded, not merged: ${short(files.join(', '), 400)}`;
+    }
     case 'no-changes':
       return `[${key}] no changes to merge`;
     case 'replan':

@@ -27,4 +27,10 @@ describe('formatEvent', () => {
     expect(long!.length).toBeLessThan(200);
     expect(long!.endsWith('…')).toBe(true);
   });
+
+  it('a discarded read-only change is a warning that lists the files', () => {
+    const db = openDb(':memory:');
+    expect(formatEvent(db, { id: 1, missionId: 'm', taskId: null, ts: 0, type: 'read-only-changes-discarded', data: { files: ['a.txt', 'b/c.txt'] } } as any))
+      .toBe('[?] WARNING: a read-only role left changes; discarded, not merged: a.txt, b/c.txt');
+  });
 });

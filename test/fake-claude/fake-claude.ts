@@ -4,7 +4,7 @@
 import { appendFileSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { randomUUID } from 'node:crypto';
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { createInterface } from 'node:readline';
 
 export type Step =
@@ -14,6 +14,8 @@ export type Step =
   | { spawnChild: 'ping' }
   /** Writes a file relative to the cwd; `$SESSION` in the path is replaced by the session id. */
   | { writeFile: string; content?: string }
+  /** Runs git with these args in the cwd and the session's env (like an approved Bash call); logs the exit code. */
+  | { git: string[] }
   | { exit: number };
 export interface Scenario { steps: Step[] }
 
@@ -141,6 +143,9 @@ async function run(): Promise<void> {
       mkdirSync(dirname(p), { recursive: true });
       writeFileSync(p, step.content ?? 'fake\n');
       log({ wroteFile: p });
+    } else if ('git' in step) {
+      const r = spawnSync('git', step.git, { cwd: process.cwd(), windowsHide: true, encoding: 'utf8' });
+      log({ git: step.git, status: r.status, stderr: r.stderr });
     } else if ('exit' in step) {
       return exit(step.exit);
     }
