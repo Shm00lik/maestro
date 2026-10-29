@@ -12,7 +12,7 @@ import { killTree } from '../../src/claude/processTree.js';
 import { createTaskWorktree, worktreeDirFor } from '../../src/git/worktrees.js';
 import { AGENT_ROLES } from '../../src/core/types.js';
 import {
-  LiveSessionRegistry, TaskRunner, buildTaskArgs, loadRole, type TaskFinished,
+  LiveSessionRegistry, TaskRunner, buildTaskArgs, loadRole, type TaskFinished, type TaskRunnerDeps,
 } from '../../src/engine/taskRunner.js';
 
 const FAKE = fileURLToPath(new URL('../fake-claude/fake-claude.ts', import.meta.url));
@@ -89,7 +89,7 @@ function fakeLogLines(): any[] {
 const argvs = (): string[][] => fakeLogLines().filter(l => Array.isArray(l.argv)).map(l => l.argv as string[]);
 const userTexts = (): string[] => fakeLogLines().filter(l => l?.type === 'user').map(l => l.message.content as string);
 
-function setup(steps: object[], agent = 'implementer'): Ctx {
+function setup(steps: object[], agent = 'implementer', extra: Partial<TaskRunnerDeps> = {}): Ctx {
   const db = openDb(':memory:');
   const p = projects.add(db, { name: 'demo', path: root });
   const m = missions.create(db, {
@@ -108,7 +108,7 @@ function setup(steps: object[], agent = 'implementer'): Ctx {
   const runner = new TaskRunner({
     db, inbox: inboxSvc, registry, projectRoot: root, missionBranch: MISSION_BRANCH,
     bridgeAskConfig: id => join(dir, `bridge-${id}.json`), logDir: join(dir, 'logs'), command,
-    env: { FAKE_CLAUDE_SCENARIO: scenario, FAKE_CLAUDE_LOG: fakeLog() }, stopTimeoutMs: 2000,
+    env: { FAKE_CLAUDE_SCENARIO: scenario, FAKE_CLAUDE_LOG: fakeLog() }, stopTimeoutMs: 2000, ...extra,
   });
   const c: Ctx = { db, runner, inboxSvc, registry, task, missionId: m.id, states: [], finished: [] };
   runner.on('state', (x: Task) => c.states.push(x.state));
@@ -202,6 +202,7 @@ describe('TaskRunner', () => {
     expect(git(root, 'show', `${MISSION_BRANCH}:b.txt`)).toBe('made by agent');
     expect(git(root, 'show', `${MISSION_BRANCH}:c.txt`)).toBe('left over');
     expect(git(root, 'log', '-1', '--format=%s', TASK_BRANCH)).toBe('maestro: uncommitted changes from T1');
+    expect(merged?.data.autoCommitted).toEqual(['c.txt']); // the auto-committed leftovers are listed
     expect(c.states).toEqual(['running', 'done']);
     const prompt = userTexts()[0];
     expect(prompt).toContain('Do the thing.');
@@ -215,6 +216,53 @@ describe('TaskRunner', () => {
     expect(argv).toContain('--strict-mcp-config');
     expect(argv.join(' ')).toContain(`--mcp-config ${join(dir, `bridge-${c.task.id}.json`)}`);
   }, 15000);
+
+  it('a task with nothing left over lists no auto-committed files', async () => {
+    const c = setup([INIT(), USER, RESULT(HANDOFF), STDIN_CLOSE]);
+    await c.runner.start(c.task.id, []);
+    expect((await finished(c)).outcome).toBe('done');
+    const merged = events.list(c.db, c.missionId, { taskId: c.task.id }).find(e => e.type === 'merged');
+    expect(merged?.data.autoCommitted).toEqual([]);
+  }, 15000);
+
+  it('a leftover commit that hangs is bounded by the commit timeout', async () => {
+    const c = setup([INIT(), USER, USER, RESULT(HANDOFF), STDIN_CLOSE], 'implementer', { commitTimeoutMs: 1000 });
+    await c.runner.start(c.task.id, []);
+    const wt = getTask(c).worktreePath!;
+    writeFileSync(join(wt, 'left.txt'), 'left over\n');
+    // A slow pre-commit hook (hooks live in the shared git dir).
+    const hooks = join(root, '.git', 'hooks');
+    mkdirSync(hooks, { recursive: true });
+    writeFileSync(join(hooks, 'pre-commit'), '#!/bin/sh\nsleep 8\n');
+    const missionTip = git(root, 'rev-parse', MISSION_BRANCH);
+    const t0 = Date.now();
+    c.runner.message(c.task.id, 'go');
+    const f = await finished(c);
+    expect(f.outcome).toBe('failed');
+    expect(f.reason).toMatch(/^commit: .*timed out/);
+    expect(Date.now() - t0).toBeLessThan(7000);
+    expect(git(root, 'rev-parse', MISSION_BRANCH)).toBe(missionTip);
+    rmSync(join(hooks, 'pre-commit'), { force: true });
+  }, 20000);
+
+  it('merges only after the process is confirmed exited: a process that never exits fails the task', async () => {
+    // The fake ignores stdin close for 60 s, and the injected killTree does nothing: the process never exits.
+    const c = setup([INIT(), USER, RESULT(HANDOFF), { sleepMs: 60_000 }], 'implementer', {
+      closeWaitMs: 300, sessionHooks: { killTree: async () => ({ ok: true, output: 'injected: not killed' }) },
+    });
+    const missionTip = git(root, 'rev-parse', MISSION_BRANCH);
+    await c.runner.start(c.task.id, []);
+    const [row] = sessions.listLive(c.db);
+    try {
+      const f = await finished(c);
+      expect(f).toEqual({ taskId: c.task.id, outcome: 'failed', reason: 'process-did-not-exit' });
+      expect(getTask(c).state).toBe('failed');
+      expect(git(root, 'rev-parse', MISSION_BRANCH)).toBe(missionTip);
+      expect(events.list(c.db, c.missionId).some(e => e.type === 'merged')).toBe(false);
+    } finally {
+      killTree(row.pid!);
+    }
+  }, 30000);
 
   it('sends one handoff reminder then fails with no-handoff', async () => {
     const c = setup([INIT(), USER, RESULT('I did stuff.'), USER, RESULT('Still no section.'), STDIN_CLOSE]);

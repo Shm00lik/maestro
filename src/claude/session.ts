@@ -53,6 +53,8 @@ export class ClaudeSession extends EventEmitter {
   private weKilled = false;
   private exitCode: number | null = null;
   private finalized = false;
+  /** The OS process really exited (exit/close seen), unlike a finalize forced after a kill that got no exit. */
+  private processExited = false;
   private stopping = false;
   private readonly listTreeFn: (pid: number) => Promise<number[]>;
   private readonly killTreeFn: (pid: number) => Promise<{ ok: boolean; output: string }>;
@@ -62,6 +64,12 @@ export class ClaudeSession extends EventEmitter {
   private stopPromise: Promise<'exited' | 'killed'> | null = null;
 
   static start(opts: SessionOptions): ClaudeSession { return new ClaudeSession(opts); }
+
+  /**
+   * True once the OS reported the process exit. False while it runs, and also when kill() gave up waiting and
+   * finalized the session anyway (status 'exited', but the process may still be alive).
+   */
+  get exitConfirmed(): boolean { return this.processExited || this.pid <= 0; }
 
   private constructor(opts: SessionOptions) {
     super();
@@ -91,11 +99,12 @@ export class ClaudeSession extends EventEmitter {
       if (this.child.pid === undefined) { this.status = 'exited'; this.finalize(null); }
     });
     this.child.on('exit', (code: number | null) => {
+      this.processExited = true;
       this.status = 'exited';
       this.exitCode = code;
       setTimeout(() => this.finalize(code), 500).unref(); // fallback if inherited pipes keep 'close' from firing
     });
-    this.child.on('close', (code: number | null) => this.finalize(code ?? this.exitCode));
+    this.child.on('close', (code: number | null) => { this.processExited = true; this.finalize(code ?? this.exitCode); });
   }
 
   private emitErrorOnce(e: Error): void {

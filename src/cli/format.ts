@@ -34,8 +34,11 @@ export function formatEvent(db: Db, ev: EventRow): string | null {
       }
       return line;
     }
-    case 'merged':
-      return `[${key} merged] into the mission branch${d.commit ? ` (${String(d.commit).slice(0, 7)})` : ''}`;
+    case 'merged': {
+      const auto: string[] = Array.isArray(d.autoCommitted) ? d.autoCommitted : [];
+      return `[${key} merged] into the mission branch${d.commit ? ` (${String(d.commit).slice(0, 7)})` : ''}`
+        + (auto.length > 0 ? `; auto-committed leftovers: ${short(auto.join(', '), 400)}` : '');
+    }
     case 'replan':
       return `[${key} replan] changed by the new plan`;
     case 'resume-failed':

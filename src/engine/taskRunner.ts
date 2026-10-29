@@ -11,7 +11,7 @@ import type { Db } from '../store/db.js';
 import { events, inbox as inboxRepo, sessions, tasks, type Task } from '../store/repos.js';
 import type { TaskEvent } from '../core/state/taskMachine.js';
 import { AGENT_ROLES, type AgentRole } from '../core/types.js';
-import { ClaudeSession, SessionClosed } from '../claude/session.js';
+import { ClaudeSession, SessionClosed, type SessionOptions } from '../claude/session.js';
 import { lastHandoff, type StreamEvent } from '../claude/protocol.js';
 import {
   addExistingBranchWorktree, branchExists, createTaskWorktree, isRegisteredWorktree, mergeTaskBranch, pruneWorktrees,
@@ -28,6 +28,10 @@ export const RESUME_MESSAGE =
 /** Tools of Maestro's own bridge MCP server (named `maestro` in the bridge config). Any other mcp__* tool is unsafe. */
 export const BRIDGE_TOOL_PREFIX = 'mcp__maestro__';
 const CLOSE_WAIT_MS = 10_000;
+/** Each git command that commits a task's leftovers is bounded by this (spec §8.1). */
+const COMMIT_TIMEOUT_MS = 60_000;
+/** failureReason when the task's process could not be confirmed exited, so its branch was not merged. */
+export const PROCESS_DID_NOT_EXIT = 'process-did-not-exit';
 const DETACHED = '\u0000detached';
 const CRASH_LOG_LINES = 50;
 const CRASH_LOG_MAX = 4096;
@@ -67,6 +71,12 @@ export interface TaskRunnerDeps {
   stopTimeoutMs?: number;
   /** Minimum gap between 'activity' events of one task (default 60 s). */
   activityEveryMs?: number;
+  /** Bound on each git command that commits a task's leftovers (default 60 s). */
+  commitTimeoutMs?: number;
+  /** After a handoff, how long to wait for the process to exit once stdin is closed (default 10 s). */
+  closeWaitMs?: number;
+  /** Test hooks passed to every ClaudeSession (e.g. a killTree that does nothing). */
+  sessionHooks?: Pick<SessionOptions, 'killTree' | 'killPid' | 'listTree'>;
 }
 
 export interface TaskFinished { taskId: string; outcome: 'done' | 'failed' | 'cancelled'; reason?: string }
@@ -495,7 +505,7 @@ export class TaskRunner extends EventEmitter {
     run.logPath = logPath;
     const args = buildTaskArgs(role, systemPromptFile, this.deps.bridgeAskConfig(run.taskId), resumeSessionId);
     const command = this.deps.command ?? (this.deps.exe ? { exe: this.deps.exe, prefixArgs: [] } : undefined);
-    const session = ClaudeSession.start({ args, cwd, logPath, env: this.deps.env, command });
+    const session = ClaudeSession.start({ args, cwd, logPath, env: this.deps.env, command, ...this.deps.sessionHooks });
     run.session = session;
     session.on('event', (ev: StreamEvent) => this.onEvent(run, ev));
     session.on('error', (e: Error) => { run.lastError = e.message; });
@@ -708,7 +718,7 @@ export class TaskRunner extends EventEmitter {
     const session = run.session!;
     const exited = new Promise<boolean>(res => {
       if (session.status === 'exited') { res(true); return; }
-      const timer = setTimeout(() => res(false), CLOSE_WAIT_MS);
+      const timer = setTimeout(() => res(false), this.deps.closeWaitMs ?? CLOSE_WAIT_MS);
       session.once('exit', () => { clearTimeout(timer); res(true); });
     });
     let closed = false;
@@ -718,10 +728,13 @@ export class TaskRunner extends EventEmitter {
       catch (e) { this.warn(`session stop: ${(e as Error).message}`); }
     }
     if (run.detached) return DETACHED;
+    // Merge only once the process is confirmed gone: a live agent could still be writing to the worktree.
+    if (!session.exitConfirmed) return PROCESS_DID_NOT_EXIT;
     this.endSessionRow(run, 'ended');
 
     const task = this.task(run.taskId);
-    try { await this.commitLeftovers(task); }
+    let autoCommitted: string[];
+    try { autoCommitted = await this.commitLeftovers(task); }
     catch (e) { return `commit: ${(e as Error).message}`; }
     let merged: Awaited<ReturnType<typeof mergeTaskBranch>>;
     try {
@@ -729,7 +742,7 @@ export class TaskRunner extends EventEmitter {
         `Merge ${task.taskKey}: ${task.title}`, task.missionId);
     } catch (e) { return `merge: ${(e as Error).message}`; }
     if (!merged.ok) return `conflict: ${merged.files.join(', ')}`;
-    events.append(this.db, { missionId: task.missionId, taskId: task.id, type: 'merged', data: { commit: merged.commit, branch: task.branch } });
+    events.append(this.db, { missionId: task.missionId, taskId: task.id, type: 'merged', data: { commit: merged.commit, branch: task.branch, autoCommitted } });
     // Leftover entries expire; a task in needs_you returns to running so that `complete` is legal.
     this.deps.inbox.expireForTask(run.taskId);
     if (this.task(run.taskId).state === 'needs_you') this.transition(run.taskId, 'answered');
@@ -737,13 +750,29 @@ export class TaskRunner extends EventEmitter {
     return null;
   }
 
-  /** Commits anything the agent left uncommitted in its worktree, so the merge carries all of its work. */
-  private async commitLeftovers(task: Task): Promise<void> {
+  /**
+   * Commits anything the agent left uncommitted in its worktree, so the merge carries all of its work. Returns the
+   * files it committed ([] when nothing was left). Each git command is bounded by commitTimeoutMs (default 60 s).
+   */
+  private async commitLeftovers(task: Task): Promise<string[]> {
     const cwd = task.worktreePath!;
-    const git = (args: string[]) => execFileP('git', args, { cwd, windowsHide: true, maxBuffer: 64 * 1024 * 1024 });
-    const { stdout } = await git(['status', '--porcelain']);
-    if (stdout.trim() === '') return;
+    const timeout = this.deps.commitTimeoutMs ?? COMMIT_TIMEOUT_MS;
+    const git = async (args: string[]): Promise<string> => {
+      try {
+        const { stdout } = await execFileP('git', ['-c', 'core.quotepath=off', ...args],
+          { cwd, windowsHide: true, maxBuffer: 64 * 1024 * 1024, timeout });
+        return stdout;
+      } catch (e) {
+        const err = e as Error & { killed?: boolean; signal?: string | null };
+        if (err.killed || err.signal) throw new Error(`git ${args[0]} timed out after ${Math.round(timeout / 1000)} s`);
+        throw e;
+      }
+    };
+    if ((await git(['status', '--porcelain'])).trim() === '') return [];
     await git(['add', '-A']);
+    const files = (await git(['diff', '--cached', '--name-only'])).split(/\r?\n/).filter(Boolean);
+    if (files.length === 0) return [];
     await git(['commit', '-m', `maestro: uncommitted changes from ${task.taskKey}`]);
+    return files;
   }
 }
