@@ -119,6 +119,17 @@ export function loadRole(name: AgentRole, dir: string = DEFAULT_ROLES_DIR): Role
   return role;
 }
 
+const EDIT_TOOLS: readonly string[] = ['Edit', 'Write', 'NotebookEdit', 'MultiEdit'];
+
+/**
+ * A role with an explicit tool list and no edit tool (researcher, spec-reviewer, code-reviewer). It runs in the
+ * `default` permission mode: acceptEdits would also auto-approve filesystem shell commands (mkdir, mv, cp, ...) for a
+ * role that has Bash, so every shell command not on the reviewer safe list (spec §9) goes to the user.
+ */
+export function isReadOnlyRole(role: RoleConfig): boolean {
+  return role.tools !== undefined && !role.tools.some(t => EDIT_TOOLS.includes(t));
+}
+
 /** claude args after BASE_ARGS (spec §8.1 with the R7 decision). The prompt itself is sent as the first user message. */
 export function buildTaskArgs(role: RoleConfig, systemPromptFile: string, bridgeConfigPath: string, resumeSessionId?: string): string[] {
   const args = ['--model', role.model];
@@ -127,7 +138,7 @@ export function buildTaskArgs(role: RoleConfig, systemPromptFile: string, bridge
   args.push(
     '--append-system-prompt-file', systemPromptFile,
     '--strict-mcp-config', '--mcp-config', bridgeConfigPath,
-    '--permission-mode', 'acceptEdits',
+    '--permission-mode', isReadOnlyRole(role) ? 'default' : 'acceptEdits',
   );
   if (resumeSessionId) args.push('--resume', resumeSessionId);
   return args;
@@ -145,13 +156,15 @@ export function unsafeTools(role: RoleConfig, tools: string[]): string[] {
   });
 }
 
-export function buildTaskPrompt(task: Task, upstream: { key: string; handoff: string }[]): string {
+/** The first user message of a task. A read-only role (no edit tools) is told not to change or commit anything. */
+export function buildTaskPrompt(task: Task, upstream: { key: string; handoff: string }[], role?: RoleConfig): string {
   const parts = [task.prompt.trim()];
   if (upstream.length > 0) {
     parts.push('## Upstream handoffs\n\n' + upstream.map(u => `### ${u.key} handoff\n${u.handoff.trim()}`).join('\n\n'));
   }
   if (task.acceptance.trim()) parts.push(`## Acceptance criteria\n\n${task.acceptance.trim()}`);
-  parts.push('## When you finish\n\nCommit your work on this branch. End your final message with a `## Handoff` section '
+  const finish = role && isReadOnlyRole(role) ? 'Do not change, stage or commit any file.' : 'Commit your work on this branch.';
+  parts.push(`## When you finish\n\n${finish} End your final message with a \`## Handoff\` section `
     + 'listing what you made, the decisions you took, and your test evidence.');
   return parts.join('\n\n');
 }
@@ -270,7 +283,7 @@ export class TaskRunner extends EventEmitter {
       tasks.setRuntime(this.db, taskId, { worktreePath: dir, branch });
       if (run.stopRequested) return; // stop() cancels it once ready settles
       this.spawn(run, role, dir);
-      this.sendOwn(run, buildTaskPrompt(task, upstreamHandoffs));
+      this.sendOwn(run, buildTaskPrompt(task, upstreamHandoffs, role));
     } catch (e) {
       if (run.phase === 'starting' || run.phase === 'running') await this.fail(run, `start: ${(e as Error).message}`);
       else this.warn(`start ${task.taskKey}: ${(e as Error).message}`);

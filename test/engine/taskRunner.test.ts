@@ -12,7 +12,7 @@ import { killTree } from '../../src/claude/processTree.js';
 import { createTaskWorktree, worktreeDirFor } from '../../src/git/worktrees.js';
 import { AGENT_ROLES } from '../../src/core/types.js';
 import {
-  LiveSessionRegistry, TaskRunner, buildTaskArgs, loadRole, type TaskFinished, type TaskRunnerDeps,
+  LiveSessionRegistry, TaskRunner, buildTaskArgs, buildTaskPrompt, loadRole, type TaskFinished, type TaskRunnerDeps,
 } from '../../src/engine/taskRunner.js';
 
 const FAKE = fileURLToPath(new URL('../fake-claude/fake-claude.ts', import.meta.url));
@@ -145,7 +145,12 @@ describe('roles', () => {
       expect(r.model).toBe(models[name]);
       expect(r.body).toContain('## Handoff');
     }
-    for (const name of ['researcher', 'spec-reviewer', 'code-reviewer'] as const) expect(loadRole(name).tools).toEqual(['Read', 'Glob', 'Grep']);
+    expect(loadRole('researcher').tools).toEqual(['Read', 'Glob', 'Grep']);
+    for (const name of ['spec-reviewer', 'code-reviewer'] as const) {
+      expect(loadRole(name).tools).toEqual(['Read', 'Glob', 'Grep', 'Bash']);
+      expect(loadRole(name).body).toMatch(/run the project's tests/i);
+      expect(loadRole(name).body).toMatch(/never modify files/i);
+    }
     expect(loadRole('implementer').tools).toBeUndefined();
     expect(loadRole('implementer').body).toContain('superpowers:test-driven-development');
   });
@@ -158,12 +163,18 @@ describe('roles', () => {
     expect(() => loadRole('qa', dir)).toThrow(/model/);
   });
 
-  it('read-only roles get --tools Read,Glob,Grep and --strict-mcp-config', () => {
+  it('reviewer roles get --tools Read,Glob,Grep,Bash, --strict-mcp-config and the default permission mode', () => {
     const args = buildTaskArgs(loadRole('code-reviewer'), 'sys.md', 'bridge.json');
-    expect(args.join(' ')).toContain('--tools Read,Glob,Grep');
+    expect(args.join(' ')).toContain('--tools Read,Glob,Grep,Bash');
     expect(args).toContain('--strict-mcp-config');
     expect(args.join(' ')).toContain('--mcp-config bridge.json');
-    expect(args.join(' ')).toContain('--permission-mode acceptEdits');
+    // No edit tools: acceptEdits would also auto-approve filesystem shell commands (mkdir, mv, cp, ...).
+    expect(args.join(' ')).toContain('--permission-mode default');
+    expect(buildTaskArgs(loadRole('spec-reviewer'), 's', 'b').join(' ')).toMatch(/--tools Read,Glob,Grep,Bash .*--permission-mode default/);
+    expect(buildTaskArgs(loadRole('researcher'), 's', 'b').join(' ')).toMatch(/--tools Read,Glob,Grep .*--permission-mode default/);
+    expect(buildTaskArgs(loadRole('implementer'), 's', 'b').join(' ')).toContain('--permission-mode acceptEdits');
+    expect(buildTaskArgs({ name: 'qa', model: 'sonnet', tools: ['Read', 'Edit'], deniedTools: [], body: '' }, 's', 'b').join(' '))
+      .toContain('--permission-mode acceptEdits');
     expect(args.join(' ')).toContain('--model opus');
     expect(args.join(' ')).toContain('--append-system-prompt-file sys.md');
     expect(args).not.toContain('--resume');
@@ -173,6 +184,17 @@ describe('roles', () => {
     expect(impl.join(' ')).toContain('--resume S9');
     const denied = buildTaskArgs({ name: 'qa', model: 'sonnet', deniedTools: ['WebFetch'], body: '' }, 's', 'b');
     expect(denied.join(' ')).toContain('--disallowedTools WebFetch');
+  });
+
+  it('the task prompt tells edit roles to commit and read-only roles not to change or commit anything', () => {
+    const t = (agent: string) => ({ prompt: 'Do it.', acceptance: 'ok', agent } as Task);
+    expect(buildTaskPrompt(t('implementer'), [], loadRole('implementer'))).toContain('Commit your work on this branch.');
+    for (const agent of ['spec-reviewer', 'code-reviewer', 'researcher'] as const) {
+      const text = buildTaskPrompt(t(agent), [], loadRole(agent));
+      expect(text).not.toContain('Commit your work');
+      expect(text).toContain('Do not change, stage or commit any file.');
+      expect(text).toContain('## Handoff');
+    }
   });
 });
 
@@ -299,8 +321,14 @@ describe('TaskRunner', () => {
     expect(f.outcome).toBe('failed');
     expect(f.reason).toMatch(/^unsafe-tools: Edit/);
     expect(getTask(c).state).toBe('failed');
-    expect(argvs()[0].join(' ')).toContain('--tools Read,Glob,Grep');
+    expect(argvs()[0].join(' ')).toContain('--tools Read,Glob,Grep,Bash');
     expect(sessions.listLive(c.db)).toHaveLength(0);
+  }, 15000);
+
+  it.each(['PowerShell', 'Write', 'NotebookEdit'])('a reviewer may have Bash but not %s', async extra => {
+    const c = setup([INIT(['Read', 'Glob', 'Grep', 'Bash', extra]), STDIN_CLOSE], 'spec-reviewer');
+    await c.runner.start(c.task.id, []);
+    expect((await finished(c)).reason).toBe(`unsafe-tools: ${extra}`);
   }, 15000);
 
   it('any foreign MCP tool fails the task with unsafe-tools', async () => {
