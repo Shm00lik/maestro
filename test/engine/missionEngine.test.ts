@@ -3,7 +3,7 @@
 // scenarios that write a file and end with a `## Handoff`.
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -387,6 +387,12 @@ describe('MissionEngine', () => {
     const files = git(root, 'ls-tree', '--name-only', 'main').split('\n').filter(f => f.startsWith('out-'));
     expect(files).toHaveLength(3);
     expect(git(root, 'worktree', 'list')).not.toMatch(/integration/);
+    // Done tasks' worktree folders are removed; their branches stay.
+    for (const t of tasks.listByMission(db, m.id)) {
+      expect(existsSync(t.worktreePath!), t.taskKey).toBe(false);
+      expect(git(root, 'branch', '--list', t.branch!)).toContain(t.branch!);
+    }
+    expect(git(root, 'worktree', 'list')).not.toMatch(/\.claude[\\/]worktrees/);
     expect(progress).toBeGreaterThan(0);
     // Conductor per spec §7.1; task bridges carry only ask_user.
     const condArgv: string[] = JSON.parse(readFileSync(join(dir, 'conductor.jsonl'), 'utf8').split('\n')[0]).argv;
@@ -419,6 +425,22 @@ describe('MissionEngine', () => {
     expect(git(root, 'worktree', 'list')).not.toMatch(/integration/);
     git(root, 'checkout', 'maestro/fix-login');
     expect(git(root, 'rev-parse', '--abbrev-ref', 'HEAD')).toBe('maestro/fix-login');
+  }, T);
+
+  it('keeps a done task worktree that has uncommitted changes', async () => {
+    const e = makeEngine(TASK_DONE);
+    const m = await start(e);
+    await approved(e, m, PLAN_SRC);
+    const r = ref(await e.dispatchTask(m.id, { task_id: 'T1', agent: 'implementer', prompt: 'Do it.', depends_on: [], owns: ['src/**'] }));
+    await e.waitForTasks(m.id, [r], 'all', () => {});
+    const t = tasks.listByMission(db, m.id)[0];
+    writeFileSync(join(t.worktreePath!, 'scratch.txt'), 'dirty\n');
+    const fin = e.finishMission(m.id, 'Done.');
+    const entry = await until(() => openEntry(m.id, 'merge_decision'));
+    await e.answerMergeDecision(entry.id, 'Merge');
+    await fin;
+    expect(existsSync(t.worktreePath!)).toBe(true);
+    expect(existsSync(join(t.worktreePath!, 'scratch.txt'))).toBe(true);
   }, T);
 
   it('an untracked file in the main checkout does not block the base merge', async () => {

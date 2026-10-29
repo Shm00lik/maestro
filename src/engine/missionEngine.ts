@@ -5,7 +5,7 @@ import { EventEmitter } from 'node:events';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { createHash, randomUUID } from 'node:crypto';
-import { mkdirSync, readFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync } from 'node:fs';
 import { isAbsolute, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type { Db } from '../store/db.js';
@@ -22,7 +22,7 @@ import type { PlanTask } from '../core/types.js';
 import { ClaudeSession } from '../claude/session.js';
 import type { StreamEvent } from '../claude/protocol.js';
 import {
-  branchCommits, branchExists, ensureMissionBranch, removeIntegrationWorktree, removeWorktree, worktreeDirFor,
+  branchCommits, branchExists, ensureMissionBranch, pruneWorktrees, removeIntegrationWorktree, removeWorktree, withRepoLock, worktreeDirFor,
 } from '../git/worktrees.js';
 import { startBridgeHttp, writeBridgeConfig, type BridgeHttp } from '../bridge/http.js';
 import type { BridgeHandlers, DispatchInput, TaskSummary } from '../bridge/tools.js';
@@ -996,6 +996,7 @@ export class MissionEngine extends EventEmitter implements BridgeHandlers {
       // The integration worktree holds the mission branch: remove it, so the user can check the kept branch out.
       try { await removeIntegrationWorktree(c.projectRoot, c.id); }
       catch (e) { this.warn(`remove integration worktree: ${(e as Error).message}`); }
+      await this.cleanupTaskWorktrees(c);
       return { outcome: 'kept' };
     }
 
@@ -1021,6 +1022,7 @@ export class MissionEngine extends EventEmitter implements BridgeHandlers {
       }
       try { await removeIntegrationWorktree(c.projectRoot, c.id); }
       catch (e) { this.warn(`remove integration worktree: ${(e as Error).message}`); }
+      await this.cleanupTaskWorktrees(c);
       this.endMission(c);
       w.d.resolve('merge');
       return { outcome: 'merged' };
@@ -1222,6 +1224,7 @@ export class MissionEngine extends EventEmitter implements BridgeHandlers {
       this.inbox.expireForMission(c.id);
       try { await removeIntegrationWorktree(root, c.id); }
       catch (e) { this.warn(`remove integration worktree: ${(e as Error).message}`); }
+      await this.cleanupTaskWorktrees(c);
       return;
     }
     await this.abortHalfMerges(c, m);
@@ -1398,8 +1401,32 @@ export class MissionEngine extends EventEmitter implements BridgeHandlers {
       this.transition(c.id, ev);
       if (ev === 'fail') this.appendEvent(c.id, 'mission-failed', { reason });
     }
+    if (ev === 'stop') await this.cleanupTaskWorktrees(c);
     for (const w of [...this.waiters]) w.check();
     this.flushEvents();
+  }
+
+  /**
+   * Removes the worktree folders of the mission's done tasks (their branches stay). A task that is not done, or
+   * whose worktree has uncommitted changes, keeps its folder.
+   */
+  private async cleanupTaskWorktrees(c: MissionCtx): Promise<void> {
+    const root = c.projectRoot;
+    for (const t of tasks.listByMission(this.db, c.id)) {
+      if (t.state !== 'done' || !t.worktreePath) continue;
+      const dir = t.worktreePath;
+      try {
+        await withRepoLock(root, async () => {
+          if (!existsSync(dir)) { await pruneWorktrees(root); return; }
+          if ((await git(dir, ['status', '--porcelain'])).trim() !== '') {
+            this.warn(`keeping the worktree of ${t.taskKey} (uncommitted changes): ${dir}`);
+            return;
+          }
+          await removeWorktree(root, dir);
+          await pruneWorktrees(root);
+        });
+      } catch (e) { this.warn(`remove worktree of ${t.taskKey}: ${(e as Error).message}`); }
+    }
   }
 
   /** Stops every mission that has not ended (e.g. for tests). Unlike shutdown(), this changes states. */
