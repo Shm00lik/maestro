@@ -233,7 +233,7 @@ claude.exe -p --model <role.model> [--tools <role.tools>] [--disallowedTools <ro
   --append-system-prompt-file <logDir>/missions/<id>/tasks/<key>-<8>.system.md   (the role body)
   --strict-mcp-config --mcp-config <logDir>/tasks/<taskId>/bridge.json
   --input-format stream-json --output-format stream-json --verbose --replay-user-messages
-  --permission-prompt-tool stdio --permission-mode acceptEdits
+  --permission-prompt-tool stdio --permission-mode <acceptEdits, or default for roles without edit tools>
 cwd = <project>/.claude/worktrees/<mission8>-<key>   env MCP_TOOL_TIMEOUT=86400000
 ```
 - **The prompt** (task prompt, upstream handoff notes, acceptance criteria, handoff instructions) is the **first stdin message**, not a `-p` argument.
@@ -241,7 +241,11 @@ cwd = <project>/.claude/worktrees/<mission8>-<key>   env MCP_TOOL_TIMEOUT=864000
   - The worktree folder is `<first 8 chars of mission id>-<key>`.
   - Before `git worktree add`, the full path is checked against a 200-character limit. If it is longer, the folder becomes a short hash.
   - `core.longpaths=true` is set in the project repo only. It is never set globally.
-- **Read-only roles** (researcher, spec-reviewer, code-reviewer) run with `--tools Read,Glob,Grep` (an allow-list, R7). Every task runs with `--strict-mcp-config`. If `system/init` lists any tool outside the role's allow-list, or any `mcp__*` tool not from Maestro's bridge, the task fails at once with reason `unsafe-tools: <tools>`.
+- **Roles without edit tools** run with an explicit allow-list (`--tools`, R7) and `--permission-mode default`, because acceptEdits would also auto-approve filesystem shell commands such as mkdir, mv or cp:
+  - **researcher:** `Read,Glob,Grep`.
+  - **spec-reviewer, code-reviewer:** `Read,Glob,Grep,Bash`, so they can run the project's tests and read git history (decided by user, 2026-10-29). PowerShell is not included: claude used the Bash tool for all shell work on Windows (R5, the 2026-10-29 run), and one shell keeps the surface small. Their role text says to run the tests and never modify files, and their task prompt says not to change, stage or commit any file (other roles are told to commit). Only the reviewer safe list (§9) is auto-allowed for them. Any other command goes to the user.
+  - Every task runs with `--strict-mcp-config`. If `system/init` lists any tool outside the role's allow-list (for a reviewer, e.g. PowerShell, Edit or Write), or any `mcp__*` tool not from Maestro's bridge, the task fails at once with reason `unsafe-tools: <tools>`.
+- **Edit-capable roles** (implementer, test-author, debugger) are told in their role text to create and edit files with the Edit and Write tools (auto-approved in their worktree by acceptEdits), not with shell redirection or heredocs. They are also told to run tests and git as simple commands without pipes, so that the commands stay on the safe list (§9).
 - **Completion.** When a turn ends with `result.subtype = success`:
   1. If the last assistant message has a `## Handoff` section, Maestro closes stdin and waits for the process to exit (else stops it). **It merges only after the exit is confirmed**; if the process cannot be confirmed gone, the task fails with reason `process-did-not-exit` and nothing is merged.
   2. Anything the agent left uncommitted in its worktree is **auto-committed** (`git add -A`, each git command bounded by 60 s); the committed files are listed in the task's `merged` event and the CLI line. Then Maestro merges the task branch into the mission branch with `--no-ff` (in the mission's integration worktree) and the task becomes `done`.
@@ -282,7 +286,14 @@ cwd = <project>/.claude/worktrees/<mission8>-<key>   env MCP_TOOL_TIMEOUT=864000
 - **"Always allow for this mission"** (decided by user, 2026-10-28) stores a rule in Maestro and auto-answers matching requests in that mission. **Task sessions only:** the conductor's requests are never auto-answered and offer only allow once / deny.
   - **Bash and PowerShell:** the rule is the command's first two words, matched as a word prefix. A command with shell operators (`;`, `&`, `|`, `` ` ``, `>`, `$(`, `<(`, `>(`, a newline) never gets a rule and never matches one.
   - **Other tools:** the rule allows any input for that tool.
-  - There is no auto-approve mode: every other request is answered by the user. Maestro never answers with `permission_suggestions`, because that could write settings files into a worktree, which would then be merged.
+- **Pre-approved safe list** (decided by user, 2026-10-29; `src/engine/safeCommands.ts`). It is checked first, before rules and before prompting. It covers **task sessions only, never the conductor**, and only the Bash and PowerShell tools. A safe command is allowed exactly as a user's "allow once" would allow it (`updatedInput` = the input). No inbox entry is made, and an `auto-allowed` event `{taskId, command}` is recorded. The CLI prints `[T1] auto-allowed: <command>`. A command is safe only if all of these hold:
+  - It is printable ASCII. It has no newline and none of `;` `|` `` ` `` `>` `<` `(` `)` `$` `\` `{` `}`, and no `&` except in the exact separator ` && ` (so no `||`). This holds inside quotes too. Non-ASCII is rejected because PowerShell treats smart quotes and Unicode spaces as syntax.
+  - Every ` && `-separated segment matches one entry by whole leading words: `npm test`, `npm run test`, `npm t`, `pnpm test`, `yarn test` (optionally `--silent`, then `-- <args>`); `node --test [relative paths]`; `git status|diff|log|show [flags, revisions, relative paths]`; `git add <relative paths, -A or -u>`; `git commit [-q -a -s -n -v ...] -m "<message>"` (or `'<message>'`, repeatable); `mkdir [-p] <relative paths>`; `ls [flags] [relative paths]`; `pwd`.
+  - No argument is absolute (`/`, `\`, `C:`, `~`), contains `..`, is a glob, or is a git global option (`-C`, `-c`, `--git-dir`, `--work-tree`). No git long option that writes files or runs configured programs (`--output`, `--ext-diff`, `--textconv`, `--no-index` and others, including their abbreviations). No `push`, `pull`, `fetch`, `checkout`, `reset`, `rebase`, `merge`, `branch`, `remote`, `config` or `clean`. Commit flags such as `--amend`, `-F` and `--author`, and add flags such as `-p` and `-f`, are not on the list.
+  - **Reviewer roles** (spec-reviewer, code-reviewer) get only the test runners and `git status/diff/log/show`. They get no `git add`, `git commit`, `mkdir`, `ls` or `pwd`.
+  - Anything else, or any doubt, goes to the user as before. `npm test` runs the project's test script, which an edit-capable agent can change; the user accepted this.
+  - **Off switch:** `maestro run --no-auto-allow` (engine option `autoAllow`, default true). The value is stored per mission in `settings_json` as `autoAllow`, and commands are auto-allowed only when it is `true`. Per-project defaults are for the future UI. Maestro never reads this setting from a file inside the project repository, because an agent could edit it.
+- Apart from the safe list and "always allow" rules there is no auto-approve mode: every other request is answered by the user. Maestro never answers with `permission_suggestions`, because that could write settings files into a worktree, which would then be merged.
 - **Inbox entry types:** `question`, `plan_approval`, `permission`, `review_decision`, `merge_decision`.
 - **Inbox states:** `open`, `answered`, `expired`. An entry expires when its task is cancelled or its process dies, or when its request no longer applies.
 - **Answering:** an answer applies exactly once (a second click gets `AlreadyAnswered`). A task can have several open entries at once, for example parallel tool calls.
@@ -404,10 +415,15 @@ The Stats page is out of scope for v1.
 **Technical calls (Claude, for later review):**
 8. **The interrupt fallback is 5 s**, then a forced kill. In the spike the interrupt answered in about 0.1 s.
 9. **A missing handoff gets one reminder**, then the task fails with reason `no-handoff`.
-10. **No auto-approve mode.** Every permission request not covered by an "always allow" rule is answered by the user; "always allow" applies to task sessions only, never to the conductor.
+10. **No auto-approve mode.** Every permission request not covered by the safe list (decision 17) or an "always allow" rule is answered by the user. Both apply to task sessions only, never to the conductor.
 11. **Keep branch** ends the mission `done` (outcome `kept`) and removes the integration worktree, so the user can check the branch out.
 12. **`finish_mission` is refused while dispatched tasks are active**; blocked tasks (§5.2) do not count and are cancelled when the mission ends.
 13. **Leftovers are auto-committed** before a task's merge, and the files are listed; the merge waits for the process's confirmed exit.
 14. **Usage** is read from `model_usage_since_last_result`, else `usage` (R8).
 15. **Re-plans are applied on approval**; keys are case-insensitive and `integration` / `*-integration` are reserved.
 16. **Plain-text conductor turns become inbox questions**, and claude sessions run in their own hidden console on Windows (own process group elsewhere), so Ctrl+C reaches Maestro only.
+
+**Made by the user (2026-10-29, after the first real run, where 7 of 10 prompts were routine task commands):**
+
+17. **Pre-approve a safe list** of task-session shell commands: test runs, read-only git, `git add`, `git commit -m`, `mkdir`, `ls` and `pwd` (§9). Task sessions only, never the conductor. `--no-auto-allow` turns it off for a mission.
+18. **Reviewers run tests.** spec-reviewer and code-reviewer get Bash (not PowerShell, no edit tools) and run in the default permission mode. Only test runs and read-only git are auto-allowed for them (§8.1, §9).
