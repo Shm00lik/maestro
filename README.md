@@ -39,6 +39,44 @@ Full log: [`docs/superpowers/runs/2026-10-29-e2e.md`](docs/superpowers/runs/2026
 
 ---
 
+## 🖥️ The web UI — design concepts
+
+The engine and CLI above work today. The web UI on top of the same engine is designed but not built yet; these
+are the design concepts for it.
+
+**Home: what needs you, what's running**
+<img src="docs/readme/ui/home.png" alt="Home screen: a Needs-you inbox, running missions with progress bars, recently finished missions" width="100%">
+
+<table>
+<tr>
+<td width="50%" valign="top"><b>1 · New mission</b>: describe the goal, not the steps<br/><img src="docs/readme/ui/new-mission.png" alt="New mission screen: pick a project, write a brief, choose planning depth and parallelism" width="100%"></td>
+<td width="50%" valign="top"><b>2 · Plan review</b>: tasks by wave, roles, skills, quality gates<br/><img src="docs/readme/ui/plan-review.png" alt="Plan review screen: 12 tasks in 6 waves with roles and skills, planner notes, approve and launch" width="100%"></td>
+</tr>
+<tr>
+<td width="50%" valign="top"><b>3 · Task graph</b>: dependencies and the critical path<br/><img src="docs/readme/ui/task-graph.png" alt="Task graph screen: tasks as nodes across waves with dependency lines; the selected task is on the critical path" width="100%"></td>
+<td width="50%" valign="top"><b>4 · Mission live</b>: watch any task, message it, see its tests go red → green<br/><img src="docs/readme/ui/mission-live.png" alt="Mission live view: task columns by phase and a live activity log for the selected task" width="100%"></td>
+</tr>
+<tr>
+<td width="50%" valign="top"><b>5 · Tasks board</b>: every task across every mission<br/><img src="docs/readme/ui/tasks-board.png" alt="Tasks board: Waiting, Ready, Running, Needs you and Done columns" width="100%"></td>
+<td width="50%" valign="top"><b>6 · Team & skills</b>: which agents and skills Maestro uses<br/><img src="docs/readme/ui/agents-skills.png" alt="Team and skills page: the conductor's workflow and the agents it can dispatch" width="100%"></td>
+</tr>
+</table>
+
+<details>
+<summary>Earlier hand-drawn wireframes</summary>
+
+<table>
+<tr>
+<td align="center"><img src="mockups/projects.png" alt="Projects screen wireframe" width="100%"><br/><sub><b>Projects</b></sub></td>
+<td align="center"><img src="mockups/missions.png" alt="Missions screen wireframe" width="100%"><br/><sub><b>Missions</b></sub></td>
+<td align="center"><img src="mockups/tasks.png" alt="Tasks screen wireframe" width="100%"><br/><sub><b>Tasks</b></sub></td>
+</tr>
+</table>
+
+</details>
+
+---
+
 ## 🧭 How it works
 
 ```mermaid
@@ -342,20 +380,6 @@ npm run maestro -- run --project C:\path\to\repo --brief brief.md --parallel 3
 
 Exit code `0` when the mission finishes, `1` if it is stopped or fails. A step-by-step first run is in
 [`HOW-TO-RUN-E2E.md`](docs/superpowers/runs/HOW-TO-RUN-E2E.md).
-
----
-
-## 🗺️ Roadmap: the web UI
-
-The engine and CLI work today. Next is a local web UI on top of the same engine. Early wireframes:
-
-<table>
-<tr>
-<td align="center"><img src="mockups/projects.png" alt="Projects screen wireframe" width="100%"><br/><sub><b>Projects</b> — your repos, start a mission</sub></td>
-<td align="center"><img src="mockups/missions.png" alt="Missions screen wireframe" width="100%"><br/><sub><b>Missions</b> — running and finished</sub></td>
-<td align="center"><img src="mockups/tasks.png" alt="Tasks screen wireframe" width="100%"><br/><sub><b>Tasks</b> — Ready · Running · Needs You · Finished</sub></td>
-</tr>
-</table>
 
 ---
 
