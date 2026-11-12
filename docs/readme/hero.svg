@@ -1,0 +1,65 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 320" width="960" height="320" font-family="Segoe UI, Helvetica, Arial, sans-serif">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#0f1f17"/>
+      <stop offset="1" stop-color="#132b20"/>
+    </linearGradient>
+    <linearGradient id="title" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#3ddc84"/>
+      <stop offset="1" stop-color="#a7f3c8"/>
+    </linearGradient>
+    <style>
+      .edge { fill: none; stroke: #2f6b4c; stroke-width: 2; }
+      .pulse { fill: none; stroke: #3ddc84; stroke-width: 3; stroke-linecap: round;
+               stroke-dasharray: 14 400; animation: flow 3s linear infinite; }
+      .d1 { animation-delay: 0s; } .d2 { animation-delay: .4s; } .d3 { animation-delay: 1.4s; }
+      .d4 { animation-delay: 1.8s; } .d5 { animation-delay: 2.2s; }
+      @keyframes flow { from { stroke-dashoffset: 414; } to { stroke-dashoffset: 0; } }
+      .node { fill: #183a2a; stroke: #3ddc84; stroke-width: 1.5; }
+      .lbl { fill: #e8fff2; font-size: 15px; font-weight: 600; text-anchor: middle; }
+      .sub { fill: #8fbfa5; font-size: 11px; text-anchor: middle; }
+      .run { animation: glow 1.6s ease-in-out infinite alternate; }
+      @keyframes glow { from { stroke: #3ddc84; } to { stroke: #b6ffd6; } }
+    </style>
+  </defs>
+
+  <rect width="960" height="320" rx="18" fill="url(#bg)"/>
+
+  <!-- left: name + tagline -->
+  <text x="48" y="128" font-size="64" font-weight="800" fill="url(#title)">Maestro</text>
+  <text x="50" y="168" font-size="20" fill="#d4f5e2">Mission control for Claude Code.</text>
+  <text x="50" y="200" font-size="15" fill="#8fbfa5">One brief in → a planned team of Claude sessions,</text>
+  <text x="50" y="222" font-size="15" fill="#8fbfa5">each in its own git worktree, running in parallel,</text>
+  <text x="50" y="244" font-size="15" fill="#8fbfa5">merged back when you say so.</text>
+
+  <!-- right: brief -> conductor -> tasks -> main -->
+  <path class="edge" d="M520 160 H580"/>
+  <path class="edge" d="M660 160 C700 160 700 95 735 95"/>
+  <path class="edge" d="M660 160 C700 160 700 225 735 225"/>
+  <path class="edge" d="M805 95 C840 95 830 160 855 160"/>
+  <path class="edge" d="M805 225 C840 225 830 160 855 160"/>
+
+  <path class="pulse d1" d="M520 160 H580"/>
+  <path class="pulse d2" d="M660 160 C700 160 700 95 735 95"/>
+  <path class="pulse d2" d="M660 160 C700 160 700 225 735 225"/>
+  <path class="pulse d4" d="M805 95 C840 95 830 160 855 160"/>
+  <path class="pulse d4" d="M805 225 C840 225 830 160 855 160"/>
+
+  <rect class="node" x="460" y="138" width="60" height="44" rx="8"/>
+  <text class="lbl" x="490" y="165">brief</text>
+
+  <rect class="node run" x="580" y="128" width="80" height="64" rx="12"/>
+  <text class="lbl" x="620" y="158">Claude</text>
+  <text class="sub" x="620" y="180">conductor</text>
+
+  <rect class="node run" x="735" y="70" width="70" height="50" rx="10"/>
+  <text class="lbl" x="770" y="95">T1</text>
+  <text class="sub" x="770" y="111">worktree</text>
+
+  <rect class="node run" x="735" y="200" width="70" height="50" rx="10"/>
+  <text class="lbl" x="770" y="225">T2</text>
+  <text class="sub" x="770" y="241">worktree</text>
+
+  <rect class="node" x="855" y="138" width="70" height="44" rx="8"/>
+  <text class="lbl" x="890" y="165">main</text>
+</svg>

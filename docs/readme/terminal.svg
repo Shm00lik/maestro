@@ -1,0 +1,41 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 653" width="960" height="653">
+<style>
+text{font-family:"Cascadia Code",Consolas,"DejaVu Sans Mono",monospace;font-size:13.5px;white-space:pre}
+.cmd{fill:#ffffff;font-weight:700}.mis{fill:#5fd7ff}.con{fill:#d7a6ff}.pln{fill:#ffd75f;font-weight:700}
+.ask{fill:#ffd75f}.dim{fill:#9fb3a8}.ans{fill:#ffffff}.ok{fill:#3ddc84}.fin{fill:#3ddc84;font-weight:700}
+@keyframes reveal{0%{transform:translateY(0);animation-timing-function:steps(27,end)}80%{transform:translateY(567px)}100%{transform:translateY(567px)}}
+.cover{animation:reveal 22s infinite}
+</style>
+<rect width="960" height="653" rx="12" fill="#0d1117"/>
+<rect width="960" height="34" rx="12" fill="#1f2630"/><rect y="22" width="960" height="12" fill="#1f2630"/>
+<circle cx="22" cy="17" r="6" fill="#ff5f57"/><circle cx="42" cy="17" r="6" fill="#febc2e"/><circle cx="62" cy="17" r="6" fill="#28c840"/>
+<text x="480.0" y="22" text-anchor="middle" style="fill:#8b949e;font-size:12px">maestro run — Tiny utils</text>
+<text class="cmd" x="20" y="62">PS&gt; npm run maestro -- run --project ./tiny-utils --brief brief.md --quick --parallel 2</text>
+<text class="mis" x="20" y="83">[mission] draft -&gt; planning</text>
+<text class="con" x="20" y="104">[conductor] I&#x27;m using the writing-plans skill to create the implementation plan.</text>
+<text class="mis" x="20" y="125">[mission] planning -&gt; awaiting_approval</text>
+<text class="pln" x="20" y="146">[plan] 3 tasks in 2 waves</text>
+<text class="ask" x="20" y="167">#1 Plan approval (version 1)</text>
+<text class="dim" x="20" y="188">   T1  capitalize()       [implementer]  depends on: none     owns: src/strings.js</text>
+<text class="dim" x="20" y="209">   T2  clamp()            [implementer]  depends on: none     owns: src/numbers.js</text>
+<text class="dim" x="20" y="230">   T3  index + README     [implementer]  depends on: T1, T2   owns: src/index.js</text>
+<text class="dim" x="20" y="251">   Wave 1: T1, T2      Wave 2: T3      Critical path: T1 -&gt; T3</text>
+<text class="ans" x="20" y="272">Approve? [y] approve, or type a note to re-plan: y</text>
+<text class="mis" x="20" y="293">[mission] awaiting_approval -&gt; running</text>
+<text class="con" x="20" y="314">[conductor] dispatched T1 (implementer)</text>
+<text class="con" x="20" y="335">[conductor] dispatched T2 (implementer)</text>
+<text class="ask" x="20" y="356">#2 Permission request from T2 — Bash: npm test</text>
+<text class="ans" x="20" y="377">Allow? [y] once, [a] always for this mission, [n] deny: y</text>
+<text class="ok" x="20" y="398">[T1 merged] into the mission branch (52fdac0)</text>
+<text class="ok" x="20" y="419">[T2 merged] into the mission branch (41dc3ed)</text>
+<text class="con" x="20" y="440">[conductor] dispatched T1-review (spec-reviewer, after T1)</text>
+<text class="con" x="20" y="461">[conductor] dispatched T2-review (spec-reviewer, after T2)</text>
+<text class="con" x="20" y="482">[conductor] dispatched T3 (implementer, after T1, T2)</text>
+<text class="ok" x="20" y="503">[T3 merged] into the mission branch (a2bb0c5)</text>
+<text class="con" x="20" y="524">[conductor] All 7 tests pass on the integration branch. Finishing the mission.</text>
+<text class="ask" x="20" y="545">#10 Mission finished — merge decision</text>
+<text class="ans" x="20" y="566">[m] Merge maestro/tiny-utils into main, [k] Keep branch: m</text>
+<text class="ok" x="20" y="587">  Merged.</text>
+<text class="fin" x="20" y="608">[mission] finishing -&gt; done        ✔ Mission done (merged): Tiny utils</text>
+<rect class="cover" x="0" y="47" width="960" height="577" fill="#0d1117"/>
+</svg>
